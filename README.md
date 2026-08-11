@@ -43,7 +43,8 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and w
 | `ToolboxStorage` | The storage contract and its record types |
 | `ToolboxStorageClient` | Remote storage over JSON-RPC |
 | `ToolboxServices` | Broadcast, output status, block headers, exchange rate |
-| `ToolboxActions` | Building, funding and signing transactions; BRC-29 |
+| `ToolboxBRC29` | BRC-29 payment derivation |
+| `ToolboxActions` | Building, funding and signing transactions |
 | `ToolboxWallet` | The concrete BRC-100 wallet |
 | `ToolboxMonitor` | Scheduled background work |
 | `WalletToolbox` | Umbrella, re-exporting all of the above |

@@ -11,7 +11,8 @@ import PackageDescription
 let publicModules = [
     "ToolboxCore",
     "ToolboxAuth",
-    "ToolboxStorage",
+    "ToolboxBRC29",
+                "ToolboxStorage",
     "ToolboxStorageClient",
     "ToolboxServices",
     "ToolboxActions",
@@ -66,6 +67,17 @@ let package = Package(
             ]
         ),
 
+        // BRC-29 payment derivation. Its own module because a receiving screen and the change
+        // generator both need it without needing each other, mirroring Go's top-level `pkg/brc29`.
+        .target(
+            name: "ToolboxBRC29",
+            dependencies: [
+                "ToolboxCore",
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVScript", package: "swift-sdk"),
+            ]
+        ),
+
         // The storage contract and its record types. No implementation lives here, so an engine
         // and a client can be written against the same protocol without seeing each other.
         .target(
@@ -101,6 +113,7 @@ let package = Package(
             name: "ToolboxActions",
             dependencies: [
                 "ToolboxCore",
+                "ToolboxBRC29",
                 "ToolboxStorage",
                 "ToolboxServices",
                 .product(name: "BSVScript", package: "swift-sdk"),
@@ -114,6 +127,7 @@ let package = Package(
             name: "ToolboxWallet",
             dependencies: [
                 "ToolboxCore",
+                "ToolboxBRC29",
                 "ToolboxStorage",
                 "ToolboxServices",
                 "ToolboxActions",
@@ -130,6 +144,7 @@ let package = Package(
 
         .testTarget(name: "ToolboxCoreTests", dependencies: ["ToolboxCore"]),
         .testTarget(name: "ToolboxAuthTests", dependencies: ["ToolboxAuth"]),
+        .testTarget(name: "ToolboxBRC29Tests", dependencies: ["ToolboxBRC29"]),
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(
             name: "ToolboxStorageClientTests",

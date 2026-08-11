@@ -33,17 +33,52 @@ Go enforces its internal boundaries with `pkg/X/internal/`, which the compiler c
 path-based equivalent, so a separate target is the only way to make a boundary real. Each module
 below is a boundary we intend to keep.
 
-| Module | Responsibility |
+The Go toolbox is the reference for the split, because it is the only other port and its package
+list is the answer to "what belongs where".
+
+| Go toolbox | This library | Responsibility |
+|---|---|---|
+| `pkg/wdk`, `pkg/errors`, `pkg/defs` | `ToolboxCore` | Shared vocabulary: the wire error taxonomy, decode limits |
+| — | `ToolboxAuth` | BRC-103 mutual authentication over HTTP |
+| `pkg/brc29` | `ToolboxBRC29` | BRC-29 payment derivation |
+| `pkg/storage`, `pkg/entity` | `ToolboxStorage` | The storage contract and its record types — no implementation |
+| `pkg/storage` (RPC client) | `ToolboxStorageClient` | Remote storage over JSON-RPC |
+| `pkg/services` | `ToolboxServices` | Chain access, ordered across providers |
+| `pkg/wallet` | `ToolboxActions` | Building, funding and signing transactions |
+| `pkg/wallet` | `ToolboxWallet` | The concrete BRC-100 wallet |
+| `pkg/monitor` | `ToolboxMonitor` | Scheduled background work |
+| — | `WalletToolbox` | Umbrella, re-exporting all of the above |
+
+Two entries need a note.
+
+`ToolboxAuth` has no Go counterpart because the Go toolbox does not have one: its storage server's
+`/.well-known/auth` handler is labelled a workaround in its own source, and mutual authentication
+for the storage wire protocol is unimplemented there. The servers this library talks to require it,
+so it is built here.
+
+`pkg/wallet` maps to two modules. TypeScript separates the same code into `signer/`, and the
+separation earns its keep: the output check in §6 must sit on the signing path where no caller can
+route around it.
+
+### Where the line with the SDK falls
+
+The same rule decides both sides: whatever `go-sdk` owns, `swift-sdk` owns.
+
+| Belongs to the SDK | Belongs here |
 |---|---|
-| `ToolboxCore` | Shared vocabulary: the wire error taxonomy, decode limits |
-| `ToolboxAuth` | BRC-103 mutual authentication over HTTP |
-| `ToolboxStorage` | The storage contract and its record types — no implementation |
-| `ToolboxStorageClient` | Remote storage over JSON-RPC |
-| `ToolboxServices` | Broadcast, output status, block headers, exchange rate |
-| `ToolboxActions` | Building, funding and signing transactions; BRC-29 |
-| `ToolboxWallet` | The concrete BRC-100 wallet |
-| `ToolboxMonitor` | Scheduled background work |
-| `WalletToolbox` | Umbrella, re-exporting all of the above |
+| Provider clients — ARC, WhatsOnChain, block headers | Ordering providers and falling back between them |
+| BRC-42 and BRC-43 derivation | BRC-29, a payment convention built on them |
+| The BRC-100 ABI: requests, results, protocols | A type that conforms to it |
+| BEEF, SPV proof verification, transaction primitives | Deciding which transaction to build |
+
+`swift-sdk` already ships ARC, WhatsOnChain broadcast and chain tracking, and a block-headers
+client, mirroring `go-sdk`'s `transaction/broadcaster` and `transaction/chaintracker`.
+`ToolboxServices` adapts and orders those. It writes a new provider only where the SDK has none,
+and the first question then is whether the provider belongs upstream instead.
+
+`swift-sdk` also has a retired, deliberately empty `Sources/BSVServices/` path, protected by a
+conformance test. It is not reserved for this library, and its note is explicit that future
+service modules each take their own product and target.
 
 ## 3. Conventions
 
