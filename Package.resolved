@@ -1,5 +1,5 @@
 {
-  "originHash" : "caa2e525c534d1094b7903bab208654359d3e96ceaab73250bc0f3ad551c54c5",
+  "originHash" : "9ac269ade77374d67829255332e4815a886f545d4714df4e6a773fabdbeaee13",
   "pins" : [
     {
       "identity" : "bigint",
@@ -33,7 +33,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/opldotdev/swift-sdk.git",
       "state" : {
-        "revision" : "6ac2e92947ef5e594460073c33250fcfb4dde407"
+        "revision" : "72d8b164a092b85986ee4cf709650739db331102"
       }
     },
     {
