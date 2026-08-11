@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Swift ${{ matrix.swift }} / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+        swift: ["6.1"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Swift
+        uses: swift-actions/setup-swift@7591e4f04c00624cb043783da51a7fd6ee0a6bf6
+        with:
+          swift-version: ${{ matrix.swift }}
+      - name: Test
+        run: swift test --disable-sandbox
