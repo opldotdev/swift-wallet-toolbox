@@ -5,6 +5,9 @@ does. It is written from a survey of the three existing implementations: the Typ
 (`bsv-blockchain/ts-stack`), the Go toolbox (`bsv-blockchain/go-wallet-toolbox`), and the Swift SDK
 this library sits on (`opldotdev/swift-sdk`).
 
+The surveys are in [`research/`](research/), with a `file:line` reference for every claim. This
+document states decisions; those state the evidence.
+
 ## 1. What this library is
 
 `swift-sdk` already carries the BRC-100 **contract**: `WalletActionOperations`,
