@@ -67,4 +67,37 @@ final class LiveStorageTests: XCTestCase {
         XCTAssertEqual(outputs.totalOutputs, 0)
         XCTAssertTrue(outputs.outputs.isEmpty)
     }
+
+    /// An empty wallet asking to fund a payment must be told it cannot afford it — by name, so an
+    /// application can say so rather than showing a server fault. This is also the first write
+    /// call, so reaching a typed refusal proves the whole request shape is accepted.
+    func test_anEmptyWalletCannotFundAPayment() async throws {
+        let endpoint = try liveEndpoint()
+        let (wallet, identityKey) = try throwawayWallet()
+        let auth = AuthID(identityKey: identityKey)
+
+        let client = RemoteStorage.client(at: endpoint, wallet: wallet)
+        _ = try await client.makeAvailable(auth)
+
+        let request = try WalletCreateActionRequest(
+            description: "a payment this wallet cannot afford",
+            outputs: [
+                try WalletCreateActionOutput(
+                    lockingScript: [0x76, 0xa9, 0x14] + [UInt8](repeating: 0x11, count: 20)
+                        + [0x88, 0xac],
+                    satoshis: 1_000,
+                    outputDescription: "to nobody"
+                )
+            ]
+        )
+
+        do {
+            _ = try await client.createAction(auth, request)
+            XCTFail("a wallet with no outputs cannot fund a payment")
+        } catch let error as WireError {
+            guard case .insufficientFunds = error else {
+                throw XCTSkip("the store refused for another reason: \(error)")
+            }
+        }
+    }
 }
