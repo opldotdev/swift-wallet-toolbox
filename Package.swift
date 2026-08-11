@@ -96,6 +96,8 @@ let package = Package(
             dependencies: [
                 "ToolboxCore", "ToolboxAuth", "ToolboxStorage",
                 .product(name: "BSVAuth", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
+                .product(name: "BSVWallet", package: "swift-sdk"),
             ]
         ),
 

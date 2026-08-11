@@ -2,8 +2,10 @@ import XCTest
 import BSVKeys
 import BSVWallet
 import ToolboxCore
+import BSVWallet
 import ToolboxStorage
-@testable import ToolboxStorageClient
+@testable import BSVWallet
+import ToolboxStorageClient
 
 /// The whole stack against a real storage server.
 ///
@@ -45,5 +47,24 @@ final class LiveStorageTests: XCTestCase {
 
         let available = await client.isAvailable
         XCTAssertTrue(available)
+    }
+
+    /// A brand new identity owns nothing, and the store should say so rather than fail. An empty
+    /// wallet is the first state every wallet is in, so it has to be a working answer.
+    func test_aNewIdentityOwnsNothing() async throws {
+        let endpoint = try liveEndpoint()
+        let (wallet, identityKey) = try throwawayWallet()
+        let auth = AuthID(identityKey: identityKey)
+
+        let client = RemoteStorage.client(at: endpoint, wallet: wallet)
+        _ = try await client.makeAvailable(auth)
+
+        let outputs = try await client.listOutputs(
+            auth,
+            try WalletListOutputsRequest(basket: "default")
+        )
+
+        XCTAssertEqual(outputs.totalOutputs, 0)
+        XCTAssertTrue(outputs.outputs.isEmpty)
     }
 }
