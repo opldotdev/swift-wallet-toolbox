@@ -93,7 +93,10 @@ let package = Package(
         // mobile build, which ships no on-device engine at all.
         .target(
             name: "ToolboxStorageClient",
-            dependencies: ["ToolboxCore", "ToolboxAuth", "ToolboxStorage"]
+            dependencies: [
+                "ToolboxCore", "ToolboxAuth", "ToolboxStorage",
+                .product(name: "BSVAuth", package: "swift-sdk"),
+            ]
         ),
 
         // The chain-facing layer: broadcast, output status, block headers, exchange rate. Each
@@ -155,7 +158,11 @@ let package = Package(
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(
             name: "ToolboxStorageClientTests",
-            dependencies: ["ToolboxStorageClient", "ToolboxStorage", "ToolboxAuth", "ToolboxCore"]
+            dependencies: [
+                "ToolboxStorageClient", "ToolboxStorage", "ToolboxAuth", "ToolboxCore",
+                .product(name: "BSVWallet", package: "swift-sdk"),
+                .product(name: "BSVKeys", package: "swift-sdk"),
+            ]
         ),
         .testTarget(name: "ToolboxServicesTests", dependencies: ["ToolboxServices"]),
         .testTarget(
