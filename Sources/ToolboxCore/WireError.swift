@@ -68,10 +68,14 @@ public enum WireError: Error, Equatable, Sendable {
     ///
     /// An absent or unreadable name does not throw. This runs on a path that is already reporting
     /// a failure, and losing the original failure to a parse error would be the worse outcome.
-    public static func decode(_ payload: [String: Any]) -> WireError {
-        let message = payload["message"] as? String ?? ""
-        let name = payload["name"] as? String ?? ""
-        let parameter = payload["parameter"] as? String ?? ""
+    public static func decode(jsonObject: JSONValue) -> WireError {
+        decode(jsonObject.objectValue ?? [:])
+    }
+
+    public static func decode(_ payload: [String: JSONValue]) -> WireError {
+        let message = payload["message"]?.stringValue ?? ""
+        let name = payload["name"]?.stringValue ?? ""
+        let parameter = payload["parameter"]?.stringValue ?? ""
 
         switch name {
         case "WERR_BAD_REQUEST": return .badRequest(message)

@@ -24,7 +24,7 @@ final class WireErrorTests: XCTestCase {
         ]
 
         for (name, error) in expected {
-            XCTAssertEqual(WireError.decode(["name": name, "message": "m"]), error, name)
+            XCTAssertEqual(WireError.decode(["name": .string(name), "message": "m"]), error, name)
         }
     }
 
@@ -57,7 +57,7 @@ final class WireErrorTests: XCTestCase {
     func test_aMalformedPayloadStillProducesAnError() {
         XCTAssertEqual(WireError.decode([:]), .unrecognized(name: "", message: ""))
         XCTAssertEqual(
-            WireError.decode(["name": 42, "message": ["nested"]]),
+            WireError.decode(["name": 42, "message": .array(["nested"])]),
             .unrecognized(name: "", message: "")
         )
     }

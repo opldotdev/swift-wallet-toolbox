@@ -155,7 +155,7 @@ let package = Package(
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(
             name: "ToolboxStorageClientTests",
-            dependencies: ["ToolboxStorageClient", "ToolboxStorage"]
+            dependencies: ["ToolboxStorageClient", "ToolboxStorage", "ToolboxAuth", "ToolboxCore"]
         ),
         .testTarget(name: "ToolboxServicesTests", dependencies: ["ToolboxServices"]),
         .testTarget(
