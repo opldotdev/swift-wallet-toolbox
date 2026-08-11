@@ -143,7 +143,14 @@ let package = Package(
         ),
 
         .testTarget(name: "ToolboxCoreTests", dependencies: ["ToolboxCore"]),
-        .testTarget(name: "ToolboxAuthTests", dependencies: ["ToolboxAuth"]),
+        .testTarget(
+            name: "ToolboxAuthTests",
+            dependencies: [
+                "ToolboxAuth",
+                .product(name: "BSVWallet", package: "swift-sdk"),
+                .product(name: "BSVAuth", package: "swift-sdk"),
+            ]
+        ),
         .testTarget(name: "ToolboxBRC29Tests", dependencies: ["ToolboxBRC29"]),
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(

@@ -54,7 +54,11 @@ Two entries need a note.
 `ToolboxAuth` has no Go counterpart because the Go toolbox does not have one: its storage server's
 `/.well-known/auth` handler is labelled a workaround in its own source, and mutual authentication
 for the storage wire protocol is unimplemented there. The servers this library talks to require it,
-so it is built here.
+so it is built here — the one place in the toolbox with nothing to port from.
+
+Its error type is `AuthTransportError`, not `AuthError`, because `BSVAuth` already exports
+`AuthError` for BRC-103 protocol failures. A consumer imports both, and two types of the same name
+in one file is a trap laid for somebody else.
 
 `pkg/wallet` maps to two modules. TypeScript separates the same code into `signer/`, and the
 separation earns its keep: the output check in §6 must sit on the signing path where no caller can
