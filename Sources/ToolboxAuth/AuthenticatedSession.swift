@@ -151,7 +151,11 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         do {
             message = try BRC104HTTPFrameCodec.decodeResponse(frame, expectedRequestID: requestID)
         } catch {
-            throw AuthTransportError.responseNotAuthenticated("the reply carried no valid auth frame")
+            // The underlying reason travels with it. "Not authenticated" alone cannot be acted
+            // on; knowing which header or field failed can.
+            throw AuthTransportError.responseNotAuthenticated(
+                "the reply carried no valid auth frame: \(error)"
+            )
         }
 
         let actions = try await authenticator.receive(message)

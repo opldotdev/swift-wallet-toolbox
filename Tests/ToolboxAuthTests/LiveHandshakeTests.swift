@@ -40,7 +40,11 @@ final class LiveHandshakeTests: XCTestCase {
         // outcome — it means the envelope was accepted and the server answered inside it. What
         // must not happen is an authentication failure.
         do {
-            let response = try await session.send(method: "POST", path: "/", body: [])
+            let response = try await session.send(
+                method: "POST", path: "/",
+                headers: ["Content-Type": "application/json"],
+                body: Array(#"{"jsonrpc":"2.0","method":"makeAvailable","params":[],"id":1}"#.utf8)
+            )
             XCTAssertGreaterThan(response.statusCode, 0)
         } catch let error as AuthTransportError {
             XCTFail("the live server did not authenticate: \(error)")
