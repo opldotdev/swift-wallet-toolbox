@@ -62,9 +62,9 @@ extension StorageClient {
                 lockingScript: row["lockingScript"]?.stringValue.flatMap(Self.hexBytes),
                 spendable: spendable,
                 customInstructions: row["customInstructions"]?.stringValue,
-                tags: row["tags"]?.arrayValue?.compactMap(\.stringValue),
+                tags: try Self.stringArray(row["tags"], method: "listOutputs"),
                 outpoint: try Outpoint(outpointText),
-                labels: row["labels"]?.arrayValue?.compactMap(\.stringValue)
+                labels: try Self.stringArray(row["labels"], method: "listOutputs")
             )
         }
 
@@ -73,6 +73,22 @@ extension StorageClient {
             beef: nil,
             outputs: outputs
         )
+    }
+
+    /// A JSON array of strings, or nil when absent. A non-string element is a refusal, not a value
+    /// to drop: `compactMap` would turn `["a", 7]` into `["a"]` and quietly change what a tag
+    /// filter or a label matches.
+    static func stringArray(_ value: JSONValue?, method: String) throws -> [String]? {
+        guard let value, value != .null else { return nil }
+        guard let elements = value.arrayValue else {
+            throw StorageClientError.unreadableResponse(method: method)
+        }
+        return try elements.map { element in
+            guard let string = element.stringValue else {
+                throw StorageClientError.unreadableResponse(method: method)
+            }
+            return string
+        }
     }
 
     static func hexBytes(_ text: String) -> [UInt8]? {

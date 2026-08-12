@@ -178,7 +178,8 @@ extension StorageClient {
                 sourceLockingScript: script,
                 unlockingScriptLength: unlockingLength,
                 derivationPrefix: row["derivationPrefix"]?.stringValue,
-                derivationSuffix: row["derivationSuffix"]?.stringValue
+                derivationSuffix: row["derivationSuffix"]?.stringValue,
+                senderIdentityKey: row["senderIdentityKey"]?.stringValue
             )
         }
 

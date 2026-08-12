@@ -39,8 +39,10 @@ public extension JSONValue {
     }
 
     var intValue: Int? {
-        guard case .number(let value) = self, value.rounded() == value else { return nil }
-        return Int(value)
+        // `Int(exactly:)`, not `Int(_:)`. An integral but enormous value such as `1e308` passes a
+        // `rounded() == value` check and then traps the process on conversion.
+        guard case .number(let value) = self else { return nil }
+        return Int(exactly: value)
     }
 
     var boolValue: Bool? {

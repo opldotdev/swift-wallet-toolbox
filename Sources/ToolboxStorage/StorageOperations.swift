@@ -49,10 +49,15 @@ public struct StorageActionInput: Equatable, Sendable {
     /// supplied and will unlock itself.
     public let derivationPrefix: String?
     public let derivationSuffix: String?
+    /// Who paid this output, when it was paid by someone else. The spending key is derived against
+    /// this counterparty, so two inputs from different senders derive different keys. Absent means
+    /// the wallet paid itself — change — and its own key is the counterparty.
+    public let senderIdentityKey: String?
 
     public init(sourceTXID: String, sourceVout: UInt32, sourceSatoshis: Int64,
                 sourceLockingScript: [UInt8], unlockingScriptLength: UInt32,
-                derivationPrefix: String?, derivationSuffix: String?) {
+                derivationPrefix: String?, derivationSuffix: String?,
+                senderIdentityKey: String? = nil) {
         self.sourceTXID = sourceTXID
         self.sourceVout = sourceVout
         self.sourceSatoshis = sourceSatoshis
@@ -60,6 +65,7 @@ public struct StorageActionInput: Equatable, Sendable {
         self.unlockingScriptLength = unlockingScriptLength
         self.derivationPrefix = derivationPrefix
         self.derivationSuffix = derivationSuffix
+        self.senderIdentityKey = senderIdentityKey
     }
 }
 

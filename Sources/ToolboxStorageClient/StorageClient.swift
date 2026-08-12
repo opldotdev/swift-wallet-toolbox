@@ -22,6 +22,10 @@ public actor StorageClient {
     private let transport: any AuthenticatedTransport
     private var nextID = 1
     private var settings: StorageSettings?
+    /// The in-flight settings read, so concurrent first callers share one request rather than each
+    /// issuing their own. Actor reentrancy across the `await` otherwise lets two callers both see
+    /// no cached settings and both go to the network.
+    private var settingsTask: Task<StorageSettings, Error>?
 
     public init(endpoint: URL, transport: any AuthenticatedTransport) {
         self.endpoint = endpoint
@@ -70,6 +74,14 @@ public actor StorageClient {
             throw StorageClientError.unreadableResponse(method: method)
         }
 
+        // A well-formed JSON-RPC reply names its version and echoes the request's id. The
+        // transport already prevents a reply reaching the wrong request, so this is not an
+        // authentication check — but an authenticated yet malformed envelope is still not one to
+        // read a result out of.
+        guard envelope["jsonrpc"]?.stringValue == "2.0", envelope["id"]?.intValue == id else {
+            throw StorageClientError.unreadableResponse(method: method)
+        }
+
         // The error member wins over the result member. A server that sent both is malformed, and
         // preferring the result would turn a reported failure into a silent success.
         if let failure = envelope["error"], failure != .null {
@@ -99,7 +111,18 @@ public actor StorageClient {
     @discardableResult
     public func makeAvailable(_ auth: AuthID) async throws -> StorageSettings {
         if let settings { return settings }
+        if let settingsTask { return try await settingsTask.value }
 
+        let task = Task { try await readSettings(auth) }
+        settingsTask = task
+        defer { settingsTask = nil }
+
+        let read = try await task.value
+        settings = read
+        return read
+    }
+
+    private func readSettings(_ auth: AuthID) async throws -> StorageSettings {
         let result = try await call("makeAvailable", [.object(auth.jsonObject)])
         guard let identityKey = result["storageIdentityKey"]?.stringValue,
               let name = result["storageName"]?.stringValue,
@@ -107,11 +130,9 @@ public actor StorageClient {
               let chain = Chain(rawValue: chainName) else {
             throw StorageClientError.unreadableResponse(method: "makeAvailable")
         }
-        let read = StorageSettings(
+        return StorageSettings(
             storageIdentityKey: identityKey, storageName: name, chain: chain
         )
-        settings = read
-        return read
     }
 }
 

@@ -50,9 +50,25 @@ public enum ActionSigner {
                 )
             }
 
+            // Each input is derived against whoever paid it. Two inputs from different senders
+            // produce different spending keys, so a single sender for all of them would sign at
+            // most one. An input with no recorded sender is change the wallet paid itself, and its
+            // counterparty is the fallback — normally the wallet's own key.
+            let sender: PublicKey
+            if let senderHex = input.senderIdentityKey {
+                guard let bytes = hexBytes(senderHex), let key = try? PublicKey(bytes) else {
+                    throw ActionError.unusableInput(
+                        "input \(index) names a sender key that cannot be read"
+                    )
+                }
+                sender = key
+            } else {
+                sender = senderPublicKey
+            }
+
             let spendingKey = try BRC29.receivingPrivateKey(
                 recipient: identityKey,
-                sender: senderPublicKey,
+                sender: sender,
                 prefix: prefix,
                 suffix: suffix
             )
@@ -72,5 +88,18 @@ public enum ActionSigner {
         }
 
         return transaction
+    }
+
+    private static func hexBytes(_ text: String) -> [UInt8]? {
+        guard text.count.isMultiple(of: 2) else { return nil }
+        var bytes: [UInt8] = []
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        return bytes
     }
 }

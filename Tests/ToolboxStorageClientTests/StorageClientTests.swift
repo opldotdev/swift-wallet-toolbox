@@ -36,7 +36,30 @@ final class StorageClientTests: XCTestCase {
             guard !answers.isEmpty else {
                 return AuthenticatedResponse(statusCode: 500, headers: [:], body: [])
             }
-            return answers.removeFirst()
+            let answer = answers.removeFirst()
+            return withEnvelope(answer, echoing: body)
+        }
+
+        /// A real server stamps `jsonrpc` and echoes the request `id`. The fixtures carry only the
+        /// meaningful part (result or error), so the double adds the envelope the client now
+        /// requires — including the id it read from the request.
+        private func withEnvelope(
+            _ answer: AuthenticatedResponse, echoing requestBody: [UInt8]?
+        ) -> AuthenticatedResponse {
+            guard var object = (try? JSONDecoder().decode(
+                JSONValue.self, from: Data(answer.body)
+            ))?.objectValue else {
+                return answer
+            }
+            let id = (try? JSONDecoder().decode(
+                JSONValue.self, from: Data(requestBody ?? [])
+            ))?["id"] ?? .number(1)
+            object["jsonrpc"] = .string("2.0")
+            object["id"] = id
+            let body = (try? JSONEncoder().encode(JSONValue.object(object))).map(Array.init) ?? []
+            return AuthenticatedResponse(
+                statusCode: answer.statusCode, headers: answer.headers, body: body
+            )
         }
 
         /// The request bodies, decoded, so a test can assert the envelope rather than a string.
