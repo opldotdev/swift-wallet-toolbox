@@ -37,6 +37,9 @@ public struct RemoteWallet: Sendable {
         self.maximumFee = maximumFee
     }
 
+    /// The offline BRC-100 kernel shares this wallet's identity key for every crypto operation.
+    public var protoWallet: ProtoWallet { ProtoWallet(rootKey: identityKey) }
+
     /// Restores a wallet from its recovery phrase, using the BSV Association reference scheme
     /// (`MnemonicRestore`, matching `bsv-desktop`).
     ///
