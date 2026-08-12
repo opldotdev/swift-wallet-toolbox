@@ -34,10 +34,11 @@ derivation (cross-checked against the Go toolbox's vectors), transaction assembl
 Atomic BEEF packaging. An adversarial review of 2026-08-11 raised 20 findings; all are resolved —
 see [`docs/reviews/2026-08-11-adversarial.md`](docs/reviews/2026-08-11-adversarial.md).
 
-`RemoteWallet` composes the whole send path: `connect`, `balance`, `history`, `pay`, `abort`.
+`RemoteWallet` composes the whole wallet: `restore(fromPhrase:)`, `connect`, `balance`,
+`history`, `receiveAddress`, `pay`, `abort`. Recovery-phrase restore and receive-address
+derivation match Yours Wallet's paths, checked against vectors from the reference libraries.
 
-Not yet built: receive/deposit-address derivation (held until a cross-implementation vector pins
-it — a wrong derivation loses funds), the `Services` provider chains, and the monitor tasks. See
+Not yet built: the `Services` provider chains and the monitor tasks. See
 [`docs/DESIGN.md`](docs/DESIGN.md) §4.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and why.

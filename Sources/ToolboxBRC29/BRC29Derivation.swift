@@ -68,4 +68,39 @@ public extension BRC29 {
             maximumByteCount: maximumByteCount
         )
     }
+
+    // MARK: - Receive addresses
+
+    /// The fixed derivation prefix Yours Wallet uses for a receiving address.
+    ///
+    /// It is `"yours receive"` exactly, and it is not ours to change: a wallet restored from a
+    /// Yours backup must derive the same addresses, or the money that was received there becomes
+    /// invisible. The suffix is the address index written as a decimal string.
+    static let receivePrefix = "yours receive"
+
+    /// The key that receives at a given index.
+    ///
+    /// A receiving address is derived self-referentially: the wallet is both the recipient and the
+    /// sender, so it can rebuild the same address set on any device from the identity key alone.
+    /// That is what makes these addresses recoverable — no counterparty has to be remembered.
+    static func receivingKey(
+        identity: PrivateKey,
+        index: Int
+    ) throws -> PrivateKey {
+        try receivingPrivateKey(
+            recipient: identity,
+            sender: identity.publicKey,
+            prefix: receivePrefix,
+            suffix: String(index)
+        )
+    }
+
+    /// The receiving address at a given index.
+    static func receivingAddress(
+        identity: PrivateKey,
+        index: Int,
+        network: BitcoinNetwork = .mainnet
+    ) throws -> Address {
+        address(for: try receivingKey(identity: identity, index: index).publicKey, network: network)
+    }
 }

@@ -57,4 +57,18 @@ final class RemoteWalletTests: XCTestCase {
             }
         }
     }
+
+    /// A wallet restored from a phrase authenticates and reads its (empty) state. This is the whole
+    /// restore path — phrase to identity key to handshake — end to end.
+    func test_arestoredWalletConnects() async throws {
+        let endpoint = try liveEndpoint()
+        let phrase =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        let wallet = try RemoteWallet.restore(fromPhrase: phrase, endpoint: endpoint)
+
+        let settings = try await wallet.connect()
+
+        XCTAssertEqual(settings.chain, .main)
+        XCTAssertEqual(try wallet.receiveAddress(), "1MaNmyMfDuBSt2Mr4eFXFTxMib6HFYA41p")
+    }
 }

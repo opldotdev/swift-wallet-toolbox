@@ -144,6 +144,7 @@ let package = Package(
                 .product(name: "BSVCore", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVCompat", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),
             ]
         ),
@@ -192,7 +193,7 @@ let package = Package(
         .testTarget(
             name: "ToolboxWalletTests",
             dependencies: [
-                "ToolboxWallet", "ToolboxStorage", "ToolboxStorageClient",
+                "ToolboxWallet", "ToolboxStorage", "ToolboxStorageClient", "ToolboxBRC29",
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
             ]

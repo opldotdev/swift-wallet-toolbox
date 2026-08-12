@@ -128,7 +128,10 @@ reached the same cut, with certificates rated as having no Swift consumer today.
   transaction assembly, BRC-29 signing, Atomic BEEF packaging
 - BRC-29 key derivation (`ToolboxBRC29`), cross-checked against the Go toolbox's vectors
 - The composed wallet (`ToolboxWallet.RemoteWallet`): `connect`, `balance`, `history`, `pay`,
-  `abort`
+  `abort`, `receiveAddress`, and `restore(fromPhrase:)`
+- Recovery-phrase restore (`ToolboxWallet.MnemonicRestore`) and receive-address derivation
+  (`ToolboxBRC29`), both matching Yours Wallet's paths and both checked against vectors from the
+  reference libraries
 
 `createAction`, `listOutputs`, `processAction` and the whole `pay` flow are exercised against
 `https://wallet.1sat.app` in gated live tests.
@@ -137,7 +140,6 @@ reached the same cut, with certificates rated as having no Swift consumer today.
 
 | Missing | Why it waits |
 |---|---|
-| Receive/deposit-address derivation | It must match what a payer computes, and that derivation needs a pinned cross-implementation vector before it is written. A guessed derivation makes funds unrecoverable — the exact risk the BRC-29 vectors guard against. |
 | `Services` provider chains (broadcast, status, rate) | The send path already broadcasts through storage's `processAction`, so a second broadcast path is not on the critical path. The SDK already ships ARC/WhatsOnChain clients to adapt when a consumer needs status or rate directly. |
 | Monitor tasks | Rebroadcast and proof collection serve a store that broadcasts on its own behalf. With storage broadcasting, they are a later addition, and Go defers most of them too. |
 | Formal `WalletStorageProvider` conformance | The client implements the methods; wiring them to the protocol adds the sync surface, which is deferred below. |
