@@ -109,6 +109,8 @@ let package = Package(
             name: "ToolboxServices",
             dependencies: [
                 "ToolboxCore",
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVScript", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVSPV", package: "swift-sdk"),
             ]

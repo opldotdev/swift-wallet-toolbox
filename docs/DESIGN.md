@@ -140,7 +140,7 @@ reached the same cut, with certificates rated as having no Swift consumer today.
 
 | Missing | Why it waits |
 |---|---|
-| `Services` provider chains (broadcast, status, rate) | The send path already broadcasts through storage's `processAction`, so a second broadcast path is not on the critical path. The SDK already ships ARC/WhatsOnChain clients to adapt when a consumer needs status or rate directly. |
+| `Services` broadcast/status/rate chains | The send path already broadcasts through storage's `processAction`. A `UTXOSource` provider (WhatsOnChain, P2PKH) is built — it feeds balance-from-chain and sweep; more providers (GorillaPool, Banana Blocks) and the broadcast/rate chains follow on demand. |
 | Monitor tasks | Rebroadcast and proof collection serve a store that broadcasts on its own behalf. With storage broadcasting, they are a later addition, and Go defers most of them too. |
 | Formal `WalletStorageProvider` conformance | The client implements the methods; wiring them to the protocol adds the sync surface, which is deferred below. |
 
