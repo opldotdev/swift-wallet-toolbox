@@ -157,7 +157,13 @@ let package = Package(
                 .product(name: "BSVAuth", package: "swift-sdk"),
             ]
         ),
-        .testTarget(name: "ToolboxBRC29Tests", dependencies: ["ToolboxBRC29"]),
+        .testTarget(
+            name: "ToolboxBRC29Tests",
+            dependencies: [
+                "ToolboxBRC29",
+                .product(name: "BSVKeys", package: "swift-sdk"),
+            ]
+        ),
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(
             name: "ToolboxStorageClientTests",
