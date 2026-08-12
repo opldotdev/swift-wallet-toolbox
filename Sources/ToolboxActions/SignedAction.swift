@@ -77,30 +77,7 @@ public struct SignedAction: Sendable {
     }
 }
 
-/// The bounds this library reads and writes BEEF within.
-///
-/// As with `WalletTransactionLimits`, the SDK offers no default on purpose. A wallet does have an
-/// opinion: an envelope for one payment is small, and one large enough to exhaust memory is not a
-/// payment.
+/// The bounds this library reads and writes BEEF within, aliased to the shared `StorageLimits`.
 public enum WalletBEEFLimits {
-    /// A megabyte of merkle path, with leaf counts a real proof never approaches.
-    public static let merklePath: MerklePathLimits = {
-        try! MerklePathLimits(
-            maximumByteCount: 1 << 20,
-            maximumLeavesPerLevel: 100_000,
-            maximumTotalLeaves: 1_000_000
-        )
-    }()
-
-    /// Eight megabytes of envelope holding at most ten thousand transactions and proofs.
-    public static let standard: BEEFLimits = {
-        // Constants that satisfy every check the initialiser makes.
-        try! BEEFLimits(
-            maximumByteCount: 8 << 20,
-            maximumMerklePathCount: 10_000,
-            maximumTransactionCount: 10_000,
-            transactionLimits: WalletTransactionLimits.standard,
-            merklePathLimits: merklePath
-        )
-    }()
+    public static let standard: BEEFLimits = StorageLimits.beef
 }

@@ -118,16 +118,29 @@ methods as `panic("implement me")` — the entire certificate and identity surfa
 implementing the storage and action core completely. Our own consumer analysis independently
 reached the same cut, with certificates rated as having no Swift consumer today.
 
-### In v1
+### Built and verified against a real server
 
-- BRC-103 authenticated HTTP transport
-- Remote storage client over JSON-RPC
-- The action lifecycle: `createAction`, `signAction`, `internalizeAction`, `abortAction`,
-  `listActions`, `listOutputs`, `relinquishOutput`
-- Change generation and input selection
-- BRC-29 deposit-address derivation and script template
-- Broadcast and output status, with ordered provider fallback
-- The crypto operations the SDK's offline wallet kernel already answers
+- BRC-103 authenticated HTTP transport (`ToolboxAuth`)
+- Remote storage client over JSON-RPC (`ToolboxStorageClient`): `makeAvailable`, `listOutputs`,
+  `createAction`, `processAction`, `listActions`, `abortAction`, `relinquishOutput`,
+  `internalizeAction`
+- The signing path (`ToolboxActions`): output verification, fee ceiling, change re-derivation,
+  transaction assembly, BRC-29 signing, Atomic BEEF packaging
+- BRC-29 key derivation (`ToolboxBRC29`), cross-checked against the Go toolbox's vectors
+- The composed wallet (`ToolboxWallet.RemoteWallet`): `connect`, `balance`, `history`, `pay`,
+  `abort`
+
+`createAction`, `listOutputs`, `processAction` and the whole `pay` flow are exercised against
+`https://wallet.1sat.app` in gated live tests.
+
+### Not built yet
+
+| Missing | Why it waits |
+|---|---|
+| Receive/deposit-address derivation | It must match what a payer computes, and that derivation needs a pinned cross-implementation vector before it is written. A guessed derivation makes funds unrecoverable — the exact risk the BRC-29 vectors guard against. |
+| `Services` provider chains (broadcast, status, rate) | The send path already broadcasts through storage's `processAction`, so a second broadcast path is not on the critical path. The SDK already ships ARC/WhatsOnChain clients to adapt when a consumer needs status or rate directly. |
+| Monitor tasks | Rebroadcast and proof collection serve a store that broadcasts on its own behalf. With storage broadcasting, they are a later addition, and Go defers most of them too. |
+| Formal `WalletStorageProvider` conformance | The client implements the methods; wiring them to the protocol adds the sync surface, which is deferred below. |
 
 ### Deferred, with reasons
 
@@ -136,7 +149,6 @@ reached the same cut, with certificates rated as having no Swift consumer today.
 | Certificates, key linkage, identity discovery | No consumer; Go ships without them |
 | Privileged key manager | No Go equivalent exists at all |
 | On-device storage engine | See §5 — no implementation has one on mobile |
-| Monitor beyond rebroadcast and proof collection | The remaining tasks serve a server deployment |
 | Multi-store sync and backup topology | One store cannot disagree with itself |
 | UMP and Argon2 key derivation | Key custody is the platform Keychain |
 
