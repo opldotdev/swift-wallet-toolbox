@@ -22,15 +22,15 @@ final class ReceiveAddressTests: XCTestCase {
 
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 0).description,
-            "15GGYFFPptmvYr3h76TA42hP11Y95S3r5t"
+            "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc"
         )
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 1).description,
-            "1EUvFFaYkTy9mCrHYpi7FTzrfCQsj7a8oD"
+            "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz"
         )
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 2).description,
-            "1M8bX6XG2hE6Es5fyYhLWF7w2fmiamvK8y"
+            "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y"
         )
     }
 
@@ -39,13 +39,13 @@ final class ReceiveAddressTests: XCTestCase {
     func test_aRestoredWalletRegeneratesTheSameAddresses() throws {
         let wallet = try RemoteWallet.restore(fromPhrase: phrase)
 
-        XCTAssertEqual(try wallet.receiveAddress(index: 0), "15GGYFFPptmvYr3h76TA42hP11Y95S3r5t")
+        XCTAssertEqual(try wallet.receiveAddress(index: 0), "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc")
         XCTAssertEqual(
             try wallet.receiveAddresses(startIndex: 0, count: 3),
             [
-                "15GGYFFPptmvYr3h76TA42hP11Y95S3r5t",
-                "1EUvFFaYkTy9mCrHYpi7FTzrfCQsj7a8oD",
-                "1M8bX6XG2hE6Es5fyYhLWF7w2fmiamvK8y",
+                "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc",
+                "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz",
+                "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y",
             ]
         )
     }

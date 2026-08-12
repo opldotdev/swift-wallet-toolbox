@@ -69,6 +69,6 @@ final class RemoteWalletTests: XCTestCase {
         let settings = try await wallet.connect()
 
         XCTAssertEqual(settings.chain, .main)
-        XCTAssertEqual(try wallet.receiveAddress(), "15GGYFFPptmvYr3h76TA42hP11Y95S3r5t")
+        XCTAssertEqual(try wallet.receiveAddress(), "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc")
     }
 }

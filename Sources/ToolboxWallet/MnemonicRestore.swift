@@ -1,71 +1,35 @@
 import BSVCompat
 import BSVKeys
 
-/// Recovering a wallet's keys from its recovery phrase.
+/// Recovering a wallet's identity key from its recovery phrase.
 ///
-/// The phrase is the whole backup. Turning it into keys is the same sequence Yours Wallet uses, to
-/// the exact derivation path, so a phrase written down in one wallet restores the same addresses in
-/// this one. Getting the path wrong would produce a valid-looking wallet holding none of the
-/// original money — so the paths are constants, checked against a cross-implementation vector.
+/// This is the BSV Association's reference scheme, matching `bsv-desktop` exactly: the identity key
+/// **is** the mnemonic's key material, with no BIP-32 path, no hashing, and no per-account
+/// derivation function. It is the most authoritative choice because `bsv-desktop` is the official
+/// BRC-100 wallet built on the same `wallet-toolbox` + storage stack this library targets.
+///
+/// Two cases, branching on the entropy size, both from `bsv-desktop/src/lib/utils/keyMaterial.ts`:
+///
+/// - **24-word phrase** (256-bit / 32-byte entropy): the entropy itself is the private key. This is
+///   reversible — the phrase can be regenerated from the key — which is why the reference prefers
+///   it when available.
+/// - **12-word phrase** (128-bit entropy): the first 32 bytes of the BIP-39 seed.
+///
+/// There is deliberately no BIP-39 passphrase here. The reference keeps the wallet password as a
+/// separate encryption layer (UMP), never mixed into the identity key.
 public enum MnemonicRestore {
 
-    /// BIP-44 style paths, matching `yours-wallet/src/utils/constants.ts`. Coin type 236 is BSV.
-    public enum Path {
-        /// The identity key, from which the BRC-100 wallet and its receiving addresses derive.
-        public static let identity = "m/0'/236'/0'/0/0"
-        /// The legacy funding key. Kept for a full restore of an older wallet's coins.
-        public static let wallet = "m/44'/236'/0'/1/0"
-        /// The legacy ordinals key.
-        public static let ord = "m/44'/236'/1'/0/0"
-    }
-
-    /// Every key a restore recovers.
-    public struct Keys: Sendable {
-        public let identity: PrivateKey
-        public let wallet: PrivateKey
-        public let ord: PrivateKey
-
-        public init(identity: PrivateKey, wallet: PrivateKey, ord: PrivateKey) {
-            self.identity = identity
-            self.wallet = wallet
-            self.ord = ord
+    /// The identity key a phrase recovers. This key both authenticates to storage and signs.
+    public static func identityKey(fromPhrase phrase: String) throws -> PrivateKey {
+        let mnemonic = try Mnemonic(phrase)
+        let keyBytes: [UInt8]
+        if mnemonic.entropy.count == 32 {
+            // 24-word: the entropy is the key, reversibly.
+            keyBytes = mnemonic.entropy
+        } else {
+            // 12-word: the first 32 bytes of the seed.
+            keyBytes = Array(try mnemonic.seed().bytes.prefix(32))
         }
-    }
-
-    /// The identity key alone — what a BRC-100 wallet is built from.
-    ///
-    /// `passphrase` is the optional BIP-39 twenty-fifth word, empty by default as Yours leaves it.
-    public static func identityKey(
-        fromPhrase phrase: String,
-        passphrase: String = ""
-    ) throws -> PrivateKey {
-        try key(fromPhrase: phrase, passphrase: passphrase, path: Path.identity)
-    }
-
-    /// All three keys, for restoring an older wallet's funding and ordinals coins as well as its
-    /// identity.
-    public static func keys(
-        fromPhrase phrase: String,
-        passphrase: String = ""
-    ) throws -> Keys {
-        let root = try rootKey(fromPhrase: phrase, passphrase: passphrase)
-        return Keys(
-            identity: try root.derived(path: Path.identity).key,
-            wallet: try root.derived(path: Path.wallet).key,
-            ord: try root.derived(path: Path.ord).key
-        )
-    }
-
-    private static func key(
-        fromPhrase phrase: String, passphrase: String, path: String
-    ) throws -> PrivateKey {
-        try rootKey(fromPhrase: phrase, passphrase: passphrase).derived(path: path).key
-    }
-
-    private static func rootKey(
-        fromPhrase phrase: String, passphrase: String
-    ) throws -> ExtendedPrivateKey {
-        let seed = try Mnemonic(phrase).seed(passphrase: passphrase)
-        return try ExtendedPrivateKey(seed: seed.bytes, network: .mainnet)
+        return try PrivateKey(keyBytes)
     }
 }

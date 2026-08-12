@@ -37,23 +37,19 @@ public struct RemoteWallet: Sendable {
         self.maximumFee = maximumFee
     }
 
-    /// Restores a wallet from its recovery phrase.
+    /// Restores a wallet from its recovery phrase, using the BSV Association reference scheme
+    /// (`MnemonicRestore`, matching `bsv-desktop`).
     ///
     /// The phrase is the whole backup: it produces the identity key, which both authenticates to
-    /// storage and signs. The derivation matches Yours Wallet exactly (`MnemonicRestore`), so a
-    /// phrase written down there restores the same wallet here — same addresses, same coins.
+    /// storage and signs. A phrase written down in `bsv-desktop` restores the same wallet here.
     ///
-    /// `nothing reaches the network`; the handshake waits for the first call, like every other
-    /// path into `RemoteWallet`.
+    /// Nothing reaches the network; the handshake waits for the first call.
     public static func restore(
         fromPhrase phrase: String,
-        passphrase: String = "",
         endpoint: URL = RemoteStorage.defaultEndpoint,
         maximumFee: Int64 = 100_000
     ) throws -> RemoteWallet {
-        let identityKey = try MnemonicRestore.identityKey(
-            fromPhrase: phrase, passphrase: passphrase
-        )
+        let identityKey = try MnemonicRestore.identityKey(fromPhrase: phrase)
         let identityHex = identityKey.publicKey.compressedBytes
             .map { String(format: "%02x", $0) }.joined()
         let storage = try RemoteStorage.client(
