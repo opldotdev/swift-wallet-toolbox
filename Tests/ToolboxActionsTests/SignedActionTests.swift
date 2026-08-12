@@ -7,28 +7,12 @@ import ToolboxStorage
 @testable import ToolboxActions
 
 /// Packaging a signed transaction for storage to broadcast.
+///
+/// The action is built the way a real one is: storage funds it and returns the ancestor graph as
+/// `inputBEEF`, the signer signs, and `SignedAction` turns the pair into the Atomic BEEF storage
+/// finalises. The graph is required — an envelope missing an ancestor is invalid — so these tests
+/// carry a real one rather than an empty placeholder.
 final class SignedActionTests: XCTestCase {
-
-    /// An output as storage returns it: the caller's own, echoed back.
-    private func storageOutput(
-        _ requested: WalletCreateActionOutput, vout: UInt32 = 0
-    ) -> StorageActionOutput {
-        StorageActionOutput(
-            vout: vout, satoshis: requested.satoshis,
-            lockingScript: requested.lockingScript, providedBy: .you,
-            purpose: nil, derivationSuffix: nil
-        )
-    }
-
-    /// A change output, which the assembler re-derives rather than trusts.
-    private func changeOutput(
-        satoshis: UInt64, vout: UInt32, suffix: String = "Su=="
-    ) -> StorageActionOutput {
-        StorageActionOutput(
-            vout: vout, satoshis: satoshis, lockingScript: [0x00],
-            providedBy: .storage, purpose: .change, derivationSuffix: suffix
-        )
-    }
 
     private let prefix = "Pr=="
     private let suffix = "Su=="
@@ -57,8 +41,16 @@ final class SignedActionTests: XCTestCase {
         )
     }
 
-    /// A real signed transaction, built the way the signer builds one.
-    private func signedTransaction() throws -> Transaction {
+    /// The proof graph storage returns, holding the source transaction.
+    private func inputBEEF() throws -> [UInt8] {
+        try BEEF(
+            merklePaths: [], transactions: [.raw(try sourceTransaction())],
+            limits: WalletBEEFLimits.standard
+        ).serialized(limits: WalletBEEFLimits.standard)
+    }
+
+    /// A funded action with its proof graph, signed.
+    private func signed(reference: String = "ref") throws -> SignedAction {
         let identity = try key(1)
         let sender = try key(2).publicKey
         let spending = try BRC29.receivingPrivateKey(
@@ -72,45 +64,52 @@ final class SignedActionTests: XCTestCase {
                 lockingScript: [0x76, 0xa9], satoshis: 1_000, outputDescription: "payment"
             )
         ]
-        let action = StorageCreateActionResult(
-            reference: "ref", version: 1, lockTime: 0,
-            outputs: requested.map { storageOutput($0) },
+        let funded = StorageCreateActionResult(
+            reference: reference, version: 1, lockTime: 0,
+            outputs: [
+                StorageActionOutput(
+                    vout: 0, satoshis: 1_000, lockingScript: [0x76, 0xa9],
+                    providedBy: .you, purpose: nil, derivationSuffix: nil
+                )
+            ],
             inputs: [
                 StorageActionInput(
-                    sourceTXID: sourceID.displayHex,
-                    sourceVout: 0, sourceSatoshis: 5_000,
+                    sourceTXID: sourceID.displayHex, sourceVout: 0, sourceSatoshis: 5_000,
                     sourceLockingScript: script.bytes, unlockingScriptLength: 108,
                     derivationPrefix: prefix, derivationSuffix: suffix
                 )
             ],
-            inputBEEF: nil, derivationPrefix: prefix
+            inputBEEF: try inputBEEF(), derivationPrefix: prefix
         )
-        return try ActionSigner.sign(
-            action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
+        let transaction = try ActionSigner.sign(
+            funded, requested: requested, identityKey: identity, senderPublicKey: sender,
+            maximumFee: 1_000_000
         )
+        return try SignedAction(funded: funded, transaction: transaction)
     }
 
     func test_aSignedActionKnowsItsTransactionID() throws {
-        let action = try SignedAction(reference: "ref", transaction: try signedTransaction())
+        let action = try signed()
 
         XCTAssertFalse(action.transactionID.displayHex.isEmpty)
         XCTAssertEqual(action.reference, "ref")
     }
 
-    /// Storage matches a signed transaction to the inputs it reserved by reference. Losing it
-    /// would leave those inputs reserved and the transaction unattributable.
-    func test_theReferenceTravelsWithTheRequest() throws {
-        let action = try SignedAction(reference: "abc123", transaction: try signedTransaction())
+    // MARK: - Finalization
 
-        XCTAssertEqual(action.processRequest().reference, "abc123")
-        XCTAssertTrue(action.processRequest().isNewTx)
-        XCTAssertFalse(action.processRequest().isSendWith)
+    /// The finding this fixes: storage cannot commit or broadcast without the signed transaction,
+    /// and its inputs stay reserved. The request must carry it as Atomic BEEF.
+    func test_theRequestCarriesTheSignedTransaction() throws {
+        let request = try signed(reference: "abc123").processRequest()
+
+        XCTAssertEqual(request.reference, "abc123")
+        XCTAssertTrue(request.isNewTx)
+        XCTAssertNotNil(request.rawTX)
+        XCTAssertEqual(Array(request.rawTX!.prefix(4)), [0x01, 0x01, 0x01, 0x01])
     }
 
     func test_sendWithMarksTheRequestAsABatch() throws {
-        let action = try SignedAction(reference: "r", transaction: try signedTransaction())
-
-        let request = action.processRequest(sendWith: ["aa", "bb"])
+        let request = try signed().processRequest(sendWith: ["aa", "bb"])
 
         XCTAssertTrue(request.isSendWith)
         XCTAssertEqual(request.sendWith, ["aa", "bb"])
@@ -118,40 +117,15 @@ final class SignedActionTests: XCTestCase {
 
     // MARK: - The envelope
 
-    /// BRC-95 names the subject transaction in a prefix, so a reader knows which of the
-    /// transactions inside is the one being presented.
-    func test_theEnvelopeIsAtomicBEEF() throws {
-        let action = try SignedAction(reference: "r", transaction: try signedTransaction())
-
-        let envelope = try action.atomicBEEF(sourceTransactions: [try sourceTransaction()])
-
-        XCTAssertEqual(
-            Array(envelope.prefix(4)), [0x01, 0x01, 0x01, 0x01],
-            "the BRC-95 atomic prefix"
-        )
-    }
-
-    /// The envelope must round-trip through the SDK's own reader, and name our transaction as its
-    /// subject. Producing bytes nobody can read back would fail only at the far end.
+    /// The envelope round-trips through the SDK's own reader and names our transaction as its
+    /// subject, carrying the ancestor from the funded graph.
     func test_theEnvelopeReadsBackNamingOurTransaction() throws {
-        let transaction = try signedTransaction()
-        let action = try SignedAction(reference: "r", transaction: transaction)
+        let action = try signed()
 
-        let envelope = try action.atomicBEEF(sourceTransactions: [try sourceTransaction()])
+        let envelope = try action.atomicBEEF()
         let parsed = try AtomicBEEF(bytes: envelope, limits: WalletBEEFLimits.standard)
 
         XCTAssertEqual(parsed.subjectTransactionID, action.transactionID)
-    }
-
-    /// A verifier cannot check an input it cannot see, so supplied source transactions travel
-    /// inside the envelope alongside the subject.
-    func test_sourceTransactionsAreCarried() throws {
-        let transaction = try signedTransaction()
-        let action = try SignedAction(reference: "r", transaction: transaction)
-        let envelope = try action.atomicBEEF(sourceTransactions: [try sourceTransaction()])
-        let parsed = try AtomicBEEF(bytes: envelope, limits: WalletBEEFLimits.standard)
-
-        XCTAssertEqual(parsed.beef.transactions.count, 2)
-        XCTAssertEqual(parsed.subjectTransactionID, action.transactionID)
+        XCTAssertEqual(parsed.beef.transactions.count, 2, "the ancestor and the subject")
     }
 }

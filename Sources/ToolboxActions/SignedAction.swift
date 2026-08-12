@@ -14,48 +14,64 @@ public struct SignedAction: Sendable {
     public let reference: String
     public let transaction: Transaction
     public let transactionID: TransactionID
+    /// The ancestor transactions this one spends, taken from the funded action's proof graph. The
+    /// envelope must carry them, because a verifier cannot check an input it cannot see.
+    let sourceTransactions: [Transaction]
+    private let beefLimits: BEEFLimits
+    private let transactionLimits: TransactionLimits
 
+    /// Packages a signed transaction using the proof graph from the action that funded it.
+    ///
+    /// `funded.inputBEEF` is the graph storage returned. It is parsed here and its transactions
+    /// become the ancestors of the outgoing envelope. When storage returned none, the envelope
+    /// carries the subject transaction alone — valid only when the transaction has no inputs, which
+    /// is why the graph is normally present.
     public init(
-        reference: String,
+        funded: StorageCreateActionResult,
         transaction: Transaction,
-        limits: TransactionLimits = WalletTransactionLimits.standard
+        transactionLimits: TransactionLimits = WalletTransactionLimits.standard,
+        beefLimits: BEEFLimits = WalletBEEFLimits.standard
     ) throws {
-        self.reference = reference
+        self.reference = funded.reference
         self.transaction = transaction
-        self.transactionID = try transaction.transactionID(limits: limits)
+        self.transactionID = try transaction.transactionID(limits: transactionLimits)
+        self.transactionLimits = transactionLimits
+        self.beefLimits = beefLimits
+        if let graph = funded.inputBEEF {
+            let parsed = try BEEF(bytes: graph, limits: beefLimits)
+            self.sourceTransactions = parsed.transactions.compactMap { $0.transaction }
+        } else {
+            self.sourceTransactions = []
+        }
     }
 
     /// The BRC-95 envelope to hand back.
     ///
-    /// `sourceTransactions` is required, not optional, because an Atomic BEEF must carry the whole
-    /// proof graph: every transaction this one spends has to be inside it or the envelope is
-    /// invalid. A verifier cannot check an input it cannot see, and the SDK refuses to build one
-    /// with a missing ancestor rather than producing bytes that fail at the far end.
-    ///
-    /// Storage supplies these as `inputBEEF` on the funded action.
-    public func atomicBEEF(
-        sourceTransactions: [Transaction],
-        limits: BEEFLimits = WalletBEEFLimits.standard
-    ) throws -> [UInt8] {
+    /// Atomic BEEF must carry the whole proof graph: every transaction this one spends has to be
+    /// inside it or the envelope is invalid. The SDK refuses to build one with a missing ancestor
+    /// rather than producing bytes that fail at the far end.
+    public func atomicBEEF() throws -> [UInt8] {
         let beef = try BEEF(
             merklePaths: [],
             transactions: sourceTransactions.map { .raw($0) } + [.raw(transaction)],
-            limits: limits
+            limits: beefLimits
         )
         return try AtomicBEEF(
             subjectTransactionID: transactionID,
             beef: beef,
-            limits: limits
-        ).serialized(limits: limits)
+            limits: beefLimits
+        ).serialized(limits: beefLimits)
     }
 
-    /// What storage needs to finalise and send this.
-    public func processRequest(sendWith: [String] = []) -> StorageProcessActionRequest {
+    /// What storage needs to finalise and send this: the reference, and the signed transaction as
+    /// Atomic BEEF. Without the transaction storage cannot commit or broadcast it, and the inputs
+    /// it reserved stay reserved.
+    public func processRequest(sendWith: [String] = []) throws -> StorageProcessActionRequest {
         StorageProcessActionRequest(
             reference: reference,
             isNewTx: true,
             isSendWith: !sendWith.isEmpty,
-            rawTX: nil,
+            rawTX: try atomicBEEF(),
             sendWith: sendWith
         )
     }

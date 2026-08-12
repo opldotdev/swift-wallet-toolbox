@@ -23,6 +23,45 @@ extension StorageClient {
         return try Self.decodeCreateAction(result)
     }
 
+    /// Hands a signed transaction back for finalisation and broadcast.
+    ///
+    /// This is the call that actually sends money. It carries the reference the inputs were
+    /// reserved under and the signed transaction as Atomic BEEF; storage commits its records and,
+    /// unless the action was `noSend`, broadcasts.
+    public func processAction(
+        _ auth: AuthID, _ request: StorageProcessActionRequest
+    ) async throws -> StorageProcessActionResult {
+        var arguments: [String: JSONValue] = [
+            "reference": .string(request.reference),
+            "isNewTx": .bool(request.isNewTx),
+            "isSendWith": .bool(request.isSendWith),
+            "isNoSend": .bool(false),
+            "isDelayed": .bool(false),
+            "sendWith": .array(request.sendWith.map { .string($0) }),
+        ]
+        // The signed transaction travels as a JSON byte array, the same shape storage sends BEEF
+        // in. Absent means there is no new transaction, only a batch to send.
+        if let rawTX = request.rawTX {
+            arguments["rawTx"] = .array(rawTX.map { .number(Double($0)) })
+        }
+
+        let result = try await call("processAction", [.object(auth.jsonObject), .object(arguments)])
+        return try Self.decodeProcessAction(result)
+    }
+
+    static func decodeProcessAction(_ result: JSONValue) throws -> StorageProcessActionResult {
+        let rows = result["sendWithResults"]?.arrayValue ?? []
+        let sendWith = try rows.map { row -> SendWithResult in
+            guard let txid = row["txid"]?.stringValue,
+                  let statusText = row["status"]?.stringValue,
+                  let status = SendWithResult.Status(rawValue: statusText) else {
+                throw StorageClientError.unreadableResponse(method: "processAction")
+            }
+            return SendWithResult(txid: txid, status: status)
+        }
+        return StorageProcessActionResult(sendWithResults: sendWith)
+    }
+
     /// The validated argument shape the storage protocol expects.
     ///
     /// Fields the reference client always sends are always sent, including empty collections. The
