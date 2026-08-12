@@ -1,5 +1,6 @@
 import Foundation
 import BSVAuth
+import BSVKeys
 import ToolboxAuth
 import ToolboxStorage
 
@@ -25,13 +26,36 @@ public enum RemoteStorage {
     ///
     /// Nothing reaches the network here. The handshake happens on the first call, which keeps
     /// construction cheap and failure attributable to the call that caused it.
+    ///
+    /// - Parameters:
+    ///   - endpoint: where the store is. Must be HTTPS unless `allowInsecureTransport` is set.
+    ///     BRC-103 authenticates the peer, but over plain HTTP an active intermediary can complete
+    ///     the handshake with its own key and become the peer — authentication proves *a* key, not
+    ///     the right one, unless the channel is also confidential or the peer is pinned.
+    ///   - expectedPeer: the store's identity key, when known. Pinning it makes the handshake
+    ///     refuse any other peer, which closes the gap above even on a hostile network.
+    ///   - allowInsecureTransport: opt in to a non-HTTPS endpoint, for a local test server. Off by
+    ///     default, because the safe case should be the effortless one.
     public static func client(
         at endpoint: URL = defaultEndpoint,
-        wallet: any AuthenticationWallet
-    ) -> StorageClient {
-        StorageClient(
+        wallet: any AuthenticationWallet,
+        expectedPeer: PublicKey? = nil,
+        allowInsecureTransport: Bool = false
+    ) throws -> StorageClient {
+        let scheme = endpoint.scheme?.lowercased()
+        guard scheme == "https" || (allowInsecureTransport && scheme == "http") else {
+            throw RemoteStorageError.insecureEndpoint(endpoint.absoluteString)
+        }
+        return StorageClient(
             endpoint: endpoint,
-            transport: AuthenticatedSession(baseURL: endpoint, wallet: wallet)
+            transport: AuthenticatedSession(
+                baseURL: endpoint, wallet: wallet, expectedPeer: expectedPeer
+            )
         )
     }
+}
+
+public enum RemoteStorageError: Error, Equatable, Sendable {
+    /// The endpoint is not HTTPS and insecure transport was not allowed.
+    case insecureEndpoint(String)
 }

@@ -47,6 +47,24 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         method: String, path: String, query: String? = nil,
         headers: [String: String] = [:], body: [UInt8]? = nil
     ) async throws -> AuthenticatedResponse {
+        do {
+            return try await attemptSend(
+                method: method, path: path, query: query, headers: headers, body: body
+            )
+        } catch AuthTransportError.sessionExpired {
+            // The SDK evicts a session at its message limit. One controlled re-handshake recovers
+            // rather than failing a call the peer would have answered. A second failure is real.
+            forgetSession()
+            return try await attemptSend(
+                method: method, path: path, query: query, headers: headers, body: body
+            )
+        }
+    }
+
+    private func attemptSend(
+        method: String, path: String, query: String?,
+        headers: [String: String], body: [UInt8]?
+    ) async throws -> AuthenticatedResponse {
         let session = try await establishedSession()
         let requestID = randomRequestID()
 
@@ -56,10 +74,18 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         )
         let payload = try BRC104Codec.encode(inner)
 
-        guard case .send(let message) = try await authenticator.makeGeneralMessage(
-            payload: payload, using: session
-        ) else {
-            throw AuthTransportError.handshakeFailed("the authenticator produced no message to send")
+        let message: AuthMessage
+        do {
+            guard case .send(let produced) = try await authenticator.makeGeneralMessage(
+                payload: payload, using: session
+            ) else {
+                throw AuthTransportError.handshakeFailed(
+                    "the authenticator produced no message to send"
+                )
+            }
+            message = produced
+        } catch let error where isMissingSession(error) {
+            throw AuthTransportError.sessionExpired
         }
 
         let frame = try BRC104HTTPFrameCodec.encodeRequest(message)
@@ -75,6 +101,16 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         )
 
         return try await unwrap(response, expecting: requestID)
+    }
+
+    private func forgetSession() {
+        sessionID = nil
+    }
+
+    /// True when the authenticator refused because the session is gone rather than because the
+    /// request was bad. The distinction decides whether a re-handshake can recover.
+    private nonisolated func isMissingSession(_ error: Error) -> Bool {
+        "\(error)".localizedCaseInsensitiveContains("session")
     }
 
     // MARK: - Handshake
@@ -190,8 +226,10 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         guard var parts = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             return baseURL
         }
-        let base = parts.path.hasSuffix("/") ? String(parts.path.dropLast()) : parts.path
-        parts.path = base + (path.hasPrefix("/") ? path : "/" + path)
+        // The frame's path is the whole request path from the host root, so it replaces the base
+        // URL's path rather than extending it. Appending produced `https://host/api/api` when the
+        // endpoint already had a path and the caller passed the same one.
+        parts.path = path.hasPrefix("/") ? path : "/" + path
         if let query, !query.isEmpty {
             // The frame carries the `?`; `URLComponents` writes its own.
             parts.query = query.hasPrefix("?") ? String(query.dropFirst()) : query

@@ -38,7 +38,7 @@ final class LiveStorageTests: XCTestCase {
         let endpoint = try liveEndpoint()
         let (wallet, identityKey) = try throwawayWallet()
 
-        let client = RemoteStorage.client(at: endpoint, wallet: wallet)
+        let client = try RemoteStorage.client(at: endpoint, wallet: wallet)
         let settings = try await client.makeAvailable(AuthID(identityKey: identityKey))
 
         XCTAssertFalse(settings.storageIdentityKey.isEmpty)
@@ -56,7 +56,7 @@ final class LiveStorageTests: XCTestCase {
         let (wallet, identityKey) = try throwawayWallet()
         let auth = AuthID(identityKey: identityKey)
 
-        let client = RemoteStorage.client(at: endpoint, wallet: wallet)
+        let client = try RemoteStorage.client(at: endpoint, wallet: wallet)
         _ = try await client.makeAvailable(auth)
 
         let outputs = try await client.listOutputs(
@@ -76,7 +76,7 @@ final class LiveStorageTests: XCTestCase {
         let (wallet, identityKey) = try throwawayWallet()
         let auth = AuthID(identityKey: identityKey)
 
-        let client = RemoteStorage.client(at: endpoint, wallet: wallet)
+        let client = try RemoteStorage.client(at: endpoint, wallet: wallet)
         _ = try await client.makeAvailable(auth)
 
         let request = try WalletCreateActionRequest(

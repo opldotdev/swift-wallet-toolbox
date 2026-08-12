@@ -47,6 +47,8 @@ public enum AuthTransportError: Error, Equatable, Sendable {
     /// A reply arrived for a request other than the one being awaited.
     case requestMismatch
     case transportFailed(String)
+    /// The authenticated session was evicted by the peer. Recoverable by one re-handshake.
+    case sessionExpired
     /// The peer is not the one expected. Raised only when a caller named the peer up front, which
     /// is the case worth failing loudly for.
     case unexpectedPeer

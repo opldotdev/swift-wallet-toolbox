@@ -53,9 +53,15 @@ public struct HTTPResponse: Equatable, Sendable {
 /// The real transport.
 public struct URLSessionHTTPTransport: HTTPTransport {
     private let session: URLSession
+    private let maximumResponseBytes: Int
 
-    public init(session: URLSession = .shared) {
+    /// - Parameter maximumResponseBytes: the response body is refused once it exceeds this. A
+    ///   hostile or broken server can otherwise stream gigabytes, and the decoder's own limit
+    ///   only applies after the whole thing has been buffered. Eight megabytes is far above any
+    ///   real wallet response and far below a memory problem.
+    public init(session: URLSession = .shared, maximumResponseBytes: Int = 8 << 20) {
         self.session = session
+        self.maximumResponseBytes = maximumResponseBytes
     }
 
     public func send(_ request: HTTPRequest) async throws -> HTTPResponse {
@@ -68,16 +74,32 @@ public struct URLSessionHTTPTransport: HTTPTransport {
             urlRequest.httpBody = Data(body)
         }
 
-        let (data, response) = try await session.data(for: urlRequest)
+        // Streamed rather than buffered whole, so an oversized body is cut off as it arrives
+        // instead of after it has all been held in memory.
+        let (stream, response) = try await session.bytes(for: urlRequest)
         guard let http = response as? HTTPURLResponse else {
             throw AuthTransportError.transportFailed("the response was not HTTP")
         }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(min(maximumResponseBytes, 64 << 10))
+        do {
+            for try await byte in stream {
+                bytes.append(byte)
+                if bytes.count > maximumResponseBytes {
+                    throw AuthTransportError.transportFailed(
+                        "the response exceeded \(maximumResponseBytes) bytes"
+                    )
+                }
+            }
+        }
+
         var headers: [String: String] = [:]
         for (name, value) in http.allHeaderFields {
             if let name = name as? String, let value = value as? String {
                 headers[name] = value
             }
         }
-        return HTTPResponse(statusCode: http.statusCode, headers: headers, body: Array(data))
+        return HTTPResponse(statusCode: http.statusCode, headers: headers, body: bytes)
     }
 }
