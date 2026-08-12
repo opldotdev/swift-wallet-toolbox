@@ -250,8 +250,10 @@ final class PaymailTests: XCTestCase {
         XCTAssertNil(notPosted)
     }
 
-    func test_deliverFallsBackToReceiveTransactionCapability() async throws {
-        let transactionURL = "https://pay.example.com/alice/example.com/transaction"
+    func test_deliverRefusesAReceiveTransactionOnlyHost() async throws {
+        // The receive-transaction capability takes a raw transaction under `hex`, not the BEEF this
+        // method holds, so a host advertising only it must be refused rather than sent a BEEF body it
+        // cannot accept.
         let capabilities = """
             {"capabilities":{
               "\(Self.receiveTransactionCapability)":"https://pay.example.com/{alias}/{domain.tld}/transaction"
@@ -260,18 +262,18 @@ final class PaymailTests: XCTestCase {
         let stub = StubHTTP(getResponses: [
             dnsURL: StubResponse(body: #"{"Status":3}"#),
             fallbackCapabilitiesURL: StubResponse(body: capabilities),
-        ], postResponses: [
-            transactionURL: StubResponse(body: "")
-        ])
+        ], postResponses: [:])
 
-        try await Paymail(http: stub).deliver(
-            beef: [0x01],
-            to: paymail,
-            reference: "payment-reference"
-        )
-
-        let posted = await stub.postedBody(to: transactionURL)
-        XCTAssertNotNil(posted)
+        do {
+            try await Paymail(http: stub).deliver(
+                beef: [0x01], to: paymail, reference: "payment-reference"
+            )
+            XCTFail("a receive-transaction-only host must be refused")
+        } catch let error as PaymailError {
+            XCTAssertEqual(
+                error, .capabilityUnsupported(domain: "example.com", capability: Self.receiveBEEFCapability)
+            )
+        }
     }
 
     func test_deliveryHTTPFailureUsesDeliveryError() async throws {

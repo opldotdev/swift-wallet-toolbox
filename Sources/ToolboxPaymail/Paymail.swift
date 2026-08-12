@@ -12,7 +12,6 @@ import ToolboxCore
 public struct Paymail: Sendable {
     private static let destinationCapability = "2a40af698840"
     private static let receiveBEEFCapability = "5c55a7fdb7bb"
-    private static let receiveTransactionCapability = "5f1323cddf31"
     private static let maximumJSONBytes = 16 << 20
     private static let maximumHexCharacters = 32 << 20
 
@@ -55,13 +54,17 @@ public struct Paymail: Sendable {
         return try Self.decodeDestination(response.body)
     }
 
-    /// Delivers an Atomic BEEF or raw BEEF transaction to the recipient's paymail host.
+    /// Delivers an Atomic BEEF transaction to the recipient's paymail host.
+    ///
+    /// Only the receive-BEEF capability is used. The older receive-transaction capability
+    /// (`5f1323cddf31`) takes a different request — the raw transaction under `hex`, with a metadata
+    /// object — not the BEEF this method holds, so sending the BEEF body there always fails. A host
+    /// that does not advertise receive-BEEF is refused here rather than sent a request it cannot
+    /// accept.
     public func deliver(beef: [UInt8], to paymail: String, reference: String) async throws {
         let address = try Self.parse(paymail)
         let capabilities = try await capabilities(for: address)
-        let template = capabilities[Self.receiveBEEFCapability]
-            ?? capabilities[Self.receiveTransactionCapability]
-        guard let template else {
+        guard let template = capabilities[Self.receiveBEEFCapability] else {
             throw PaymailError.capabilityUnsupported(
                 domain: address.domain,
                 capability: Self.receiveBEEFCapability
