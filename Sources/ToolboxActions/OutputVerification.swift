@@ -39,4 +39,6 @@ public enum ActionError: Error, Equatable, Sendable {
     /// safe response is to sign nothing.
     case storageAlteredOutputs(String)
     case insufficientFunds(required: Int64, available: Int64)
+    /// An input storage chose cannot be used as described.
+    case unusableInput(String)
 }

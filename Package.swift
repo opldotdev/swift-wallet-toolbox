@@ -121,6 +121,7 @@ let package = Package(
                 "ToolboxBRC29",
                 "ToolboxStorage",
                 "ToolboxServices",
+                .product(name: "BSVCore", package: "swift-sdk"),
                 .product(name: "BSVScript", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
@@ -169,7 +170,11 @@ let package = Package(
         .testTarget(name: "ToolboxServicesTests", dependencies: ["ToolboxServices"]),
         .testTarget(
             name: "ToolboxActionsTests",
-            dependencies: ["ToolboxActions", "ToolboxStorage"]
+            dependencies: [
+                "ToolboxActions", "ToolboxStorage",
+                .product(name: "BSVTransaction", package: "swift-sdk"),
+                .product(name: "BSVWallet", package: "swift-sdk"),
+            ]
         ),
         .testTarget(name: "ToolboxWalletTests", dependencies: ["ToolboxWallet"]),
         .testTarget(name: "ToolboxMonitorTests", dependencies: ["ToolboxMonitor"]),
