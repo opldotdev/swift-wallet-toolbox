@@ -1,9 +1,11 @@
 import Foundation
 import BSVCore
 import BSVKeys
+import BSVScript
 import BSVTransaction
 import BSVWallet
 import ToolboxActions
+import ToolboxPaymail
 import ToolboxBRC29
 import ToolboxStorage
 import ToolboxStorageClient
@@ -122,6 +124,71 @@ public struct RemoteWallet: Sendable {
         description: String,
         labels: [String] = []
     ) async throws -> SentPayment {
+        try await sign(outputs, description: description, labels: labels).sent
+    }
+
+    /// Pays a recipient — a native address or a paymail — for an amount.
+    ///
+    /// Resolution is the whole point of this method: whatever the user typed becomes output
+    /// scripts, and from there the payment is the ordinary one. A native address is one P2PKH
+    /// output. A paymail is resolved through its host, which returns the outputs to pay and a
+    /// reference; after the transaction is signed and broadcast, the signed BEEF is delivered back
+    /// to that host so the recipient recognises the payment.
+    ///
+    /// A paymail whose delivery fails after the money has moved throws `paymailDeliveryFailed`
+    /// carrying the txid — the payment is on chain, but the recipient's host was not told, and the
+    /// caller must know both facts.
+    @discardableResult
+    public func pay(
+        to recipient: String,
+        satoshis: UInt64,
+        description: String,
+        labels: [String] = [],
+        paymail resolver: Paymail = Paymail()
+    ) async throws -> SentPayment {
+        if Paymail.isPaymail(recipient) {
+            let destination = try await resolver.paymentDestination(
+                paymail: recipient, satoshis: satoshis
+            )
+            let outputs = try destination.outputs.map { output in
+                try WalletCreateActionOutput(
+                    lockingScript: output.lockingScript,
+                    satoshis: output.satoshis,
+                    outputDescription: description
+                )
+            }
+            let result = try await sign(outputs, description: description, labels: labels)
+            do {
+                try await resolver.deliver(
+                    beef: try result.signed.atomicBEEF(),
+                    to: recipient,
+                    reference: destination.reference
+                )
+            } catch {
+                throw WalletError.paymailDeliveryFailed(
+                    txid: result.sent.transactionID.displayHex
+                )
+            }
+            return result.sent
+        }
+
+        // A native address: one P2PKH output for the whole amount.
+        let script = try Script.payToPublicKeyHash(
+            try Address(recipient).publicKeyHash, maximumByteCount: 1 << 20
+        )
+        let output = try WalletCreateActionOutput(
+            lockingScript: script.bytes, satoshis: satoshis, outputDescription: description
+        )
+        return try await pay([output], description: description, labels: labels)
+    }
+
+    /// Funds, signs and broadcasts the outputs, returning both the signed action (for a paymail
+    /// BEEF delivery) and the receipt.
+    private func sign(
+        _ outputs: [WalletCreateActionOutput],
+        description: String,
+        labels: [String]
+    ) async throws -> (signed: SignedAction, sent: SentPayment) {
         let request = try WalletCreateActionRequest(
             description: description, outputs: outputs, labels: labels
         )
@@ -138,10 +205,13 @@ public struct RemoteWallet: Sendable {
         let signed = try SignedAction(funded: funded, transaction: transaction)
         let result = try await storage.processAction(auth, try signed.processRequest())
 
-        return SentPayment(
-            transactionID: signed.transactionID,
-            reference: funded.reference,
-            results: result.sendWithResults
+        return (
+            signed,
+            SentPayment(
+                transactionID: signed.transactionID,
+                reference: funded.reference,
+                results: result.sendWithResults
+            )
         )
     }
 

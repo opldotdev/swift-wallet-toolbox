@@ -11,4 +11,7 @@ public enum WalletError: Error, Equatable, Sendable {
     case identityMismatch
     /// A storage reference that is not valid base64, so it cannot be sent back.
     case invalidReference
+    /// The payment broadcast, but the recipient paymail host could not be notified. The money is
+    /// on chain under this txid.
+    case paymailDeliveryFailed(txid: String)
 }
