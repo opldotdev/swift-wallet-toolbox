@@ -61,10 +61,31 @@ public enum ActionAssembler {
             )
         }
 
+        // Storage returns its outputs in array order — the requested outputs first, then any
+        // commission, then change — but their `vout` values are randomized whenever
+        // `randomizeOutputs` is set, which is the default. The transaction must place each output at
+        // its own `vout`, or storage rejects the script it recorded at that position once the signed
+        // transaction returns. The reference signer reorders storage's outputs by `vout` for the
+        // same reason; this does too.
+        let outputCount = funded.outputs.count
+        var byVout = [StorageActionOutput?](repeating: nil, count: outputCount)
+        for output in funded.outputs {
+            guard let vout = Int(exactly: output.vout), vout >= 0, vout < outputCount,
+                  byVout[vout] == nil else {
+                throw ActionError.malformedOutputs(
+                    "output vouts are not a permutation of 0..<\(outputCount)"
+                )
+            }
+            byVout[vout] = output
+        }
+
         // A change output's script is re-derived from our own key and storage's copy is
         // discarded. That is what makes the label safe to accept: an output calling itself change
         // can then only pay this wallet, whatever script storage attached to it.
-        let outputs = try funded.outputs.map { output -> TransactionOutput in
+        let outputs = try byVout.map { slot -> TransactionOutput in
+            guard let output = slot else {
+                throw ActionError.malformedOutputs("an output vout in 0..<\(outputCount) is missing")
+            }
             guard output.isChange else {
                 return TransactionOutput(
                     satoshis: output.satoshis,
@@ -73,7 +94,7 @@ public enum ActionAssembler {
             }
             guard let prefix = funded.derivationPrefix, let suffix = output.derivationSuffix else {
                 throw ActionError.unresolvableChange(
-                    "change at index \(output.vout) has no derivation, so its script cannot be "
+                    "change at vout \(output.vout) has no derivation, so its script cannot be "
                         + "rebuilt and storage's copy cannot be trusted"
                 )
             }

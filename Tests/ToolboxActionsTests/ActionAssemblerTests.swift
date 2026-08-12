@@ -80,6 +80,45 @@ final class ActionAssemblerTests: XCTestCase {
         XCTAssertEqual(transaction.version, 1)
     }
 
+    /// Storage returns outputs in array order — requested first, then change — but randomizes their
+    /// `vout` values, which is the default. The transaction must be assembled in `vout` order, or
+    /// storage rejects the script it recorded at each `vout` when the signed transaction returns.
+    func test_outputsAreAssembledInVoutOrderNotArrayOrder() throws {
+        let requested = [try output(satoshis: 1_000)]
+        // Array order is [payment, change], but the payment sits at vout 1 and the change at vout 0.
+        let action = funded(
+            outputs: [storageOutput(requested[0], vout: 1), changeOutput(satoshis: 3_000, vout: 0)],
+            inputs: [input(satoshis: 5_000)]
+        )
+
+        let transaction = try ActionAssembler.assemble(
+            action, requested: requested, changeKey: try key(1)
+        )
+
+        XCTAssertEqual(transaction.outputs.count, 2)
+        // vout 0 is the change and vout 1 is the payment — the reverse of the array order.
+        XCTAssertEqual(transaction.outputs[0].satoshis, 3_000, "vout 0 must be the change")
+        XCTAssertEqual(transaction.outputs[1].satoshis, 1_000, "vout 1 must be the payment")
+    }
+
+    /// A set of outputs whose `vout` values are not a permutation of `0..<count` cannot be placed,
+    /// so assembly refuses rather than guessing an order.
+    func test_outputsWithoutASequentialVoutAreRejected() throws {
+        let requested = [try output(satoshis: 1_000)]
+        let action = funded(
+            outputs: [storageOutput(requested[0], vout: 0), changeOutput(satoshis: 3_000, vout: 0)],
+            inputs: [input(satoshis: 5_000)]
+        )
+
+        XCTAssertThrowsError(
+            try ActionAssembler.assemble(action, requested: requested, changeKey: try key(1))
+        ) {
+            guard case .malformedOutputs = ($0 as? ActionError) else {
+                return XCTFail("expected malformedOutputs, got \($0)")
+            }
+        }
+    }
+
     /// Inputs carry no unlocking script until they are signed, but they must carry the length the
     /// fee was computed from — otherwise the signed transaction weighs more than it was funded for.
     func test_inputsAreUnsignedButKeepTheirEstimatedLength() throws {

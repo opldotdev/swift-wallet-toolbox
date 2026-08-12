@@ -114,4 +114,7 @@ public enum ActionError: Error, Equatable, Sendable {
     case unresolvableChange(String)
     /// The transaction would pay more in fees than the caller allowed.
     case feeTooHigh(paid: Int64, maximum: Int64)
+    /// Storage's outputs do not carry a `vout` for each position `0..<count` exactly once, so the
+    /// transaction cannot be assembled in the order storage recorded.
+    case malformedOutputs(String)
 }
