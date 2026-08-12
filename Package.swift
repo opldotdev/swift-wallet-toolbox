@@ -15,6 +15,7 @@ let publicModules = [
     "ToolboxStorage",
     "ToolboxStorageClient",
     "ToolboxServices",
+    "ToolboxPaymail",
     "ToolboxActions",
     "ToolboxWallet",
     "ToolboxMonitor",
@@ -116,6 +117,12 @@ let package = Package(
             ]
         ),
 
+        // Paymail discovery, payment-output resolution, and signed-transaction delivery.
+        .target(
+            name: "ToolboxPaymail",
+            dependencies: ["ToolboxCore"]
+        ),
+
         // Building, funding and signing transactions, and the BRC-29 script template. This is
         // where the output-echo check lives, so it cannot be bypassed by a caller.
         .target(
@@ -183,6 +190,7 @@ let package = Package(
             ]
         ),
         .testTarget(name: "ToolboxServicesTests", dependencies: ["ToolboxServices"]),
+        .testTarget(name: "ToolboxPaymailTests", dependencies: ["ToolboxPaymail"]),
         .testTarget(
             name: "ToolboxActionsTests",
             dependencies: [

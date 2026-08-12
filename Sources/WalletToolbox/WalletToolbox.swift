@@ -8,6 +8,7 @@
 @_exported import ToolboxStorage
 @_exported import ToolboxStorageClient
 @_exported import ToolboxServices
+@_exported import ToolboxPaymail
 @_exported import ToolboxActions
 @_exported import ToolboxWallet
 @_exported import ToolboxMonitor
