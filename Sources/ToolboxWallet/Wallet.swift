@@ -14,4 +14,12 @@ public enum WalletError: Error, Equatable, Sendable {
     /// The payment broadcast, but the recipient paymail host could not be notified. The money is
     /// on chain under this txid.
     case paymailDeliveryFailed(txid: String)
+    /// An internalize request named a subject transaction the BEEF does not contain.
+    case internalizeSubjectMissing
+    /// An internalize output index is outside the subject transaction's outputs.
+    case internalizeOutputOutOfRange(outputIndex: UInt32)
+    /// An internalize output claimed to be a BRC-29 payment to this wallet, but its locking script
+    /// is not the one this wallet's key derives for the given sender, prefix and suffix. Accepting
+    /// it would tell storage to track an output this wallet cannot spend.
+    case outputIsNotBRC29Payment(outputIndex: UInt32)
 }

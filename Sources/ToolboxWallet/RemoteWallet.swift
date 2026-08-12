@@ -111,6 +111,59 @@ public struct RemoteWallet: Sendable {
         }
     }
 
+    /// Claims an incoming transaction's outputs into this wallet, verifying ownership first.
+    ///
+    /// This is the receive side of BRC-29. For every output tagged `wallet payment`, the wallet
+    /// re-derives the key it would hold for that output — from its own identity key, the sender's
+    /// identity key, and the payment's prefix and suffix — and refuses unless the output's locking
+    /// script is exactly the P2PKH that key unlocks. A `basket insertion` output carries no such
+    /// claim and is passed through for storage to track.
+    ///
+    /// Every output is checked before storage is called, so a later bad output cannot follow an
+    /// earlier one that already changed state. Storage does the actual tracking, proof validation
+    /// and any rebroadcast; the wallet's job is only to prove each claimed output is really its own.
+    @discardableResult
+    public func internalizeAction(
+        _ request: WalletInternalizeActionRequest
+    ) async throws -> WalletInternalizeActionResult {
+        let limits = WalletTransactionLimits.standard
+        guard let subject = try request.transaction.beef.transaction(
+            for: request.transaction.subjectTransactionID, limits: limits
+        ) else {
+            throw WalletError.internalizeSubjectMissing
+        }
+
+        for output in request.outputs {
+            let index = Int(output.outputIndex)
+            guard index < subject.outputs.count else {
+                throw WalletError.internalizeOutputOutOfRange(outputIndex: output.outputIndex)
+            }
+
+            switch output.remittance {
+            case .basketInsertion:
+                // No BRC-29 claim to check; storage tracks it as instructed.
+                continue
+            case .walletPayment(let payment):
+                // The prefix and suffix are the canonical base64 strings the sender derived with, so
+                // they are rebuilt from the remittance bytes, never used as raw bytes.
+                let prefix = Base64Encoding.encode(payment.derivationPrefix.bytes)
+                let suffix = Base64Encoding.encode(payment.derivationSuffix.bytes)
+                let receivingKey = try BRC29.receivingPrivateKey(
+                    recipient: identityKey,
+                    sender: payment.senderIdentityKey,
+                    prefix: prefix,
+                    suffix: suffix
+                )
+                let expected = try BRC29.lockingScript(for: receivingKey.publicKey)
+                guard subject.outputs[index].lockingScript == expected else {
+                    throw WalletError.outputIsNotBRC29Payment(outputIndex: output.outputIndex)
+                }
+            }
+        }
+
+        return try await storage.internalizeAction(auth, request)
+    }
+
     /// Pays the given outputs and broadcasts.
     ///
     /// The order is the point. Storage funds the action and returns it; the signer re-checks the
