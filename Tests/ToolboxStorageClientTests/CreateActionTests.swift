@@ -1,6 +1,8 @@
 import XCTest
 import BSVWallet
 import ToolboxCore
+import BSVTransaction
+import BSVWallet
 import ToolboxStorage
 @testable import ToolboxStorageClient
 
@@ -73,7 +75,7 @@ final class CreateActionTests: XCTestCase {
              }],
              "outputs": [{"lockingScript": "76a9", "satoshis": 1000,
                           "outputDescription": "to someone"}]}
-            """), requested: [])
+            """))
 
         XCTAssertEqual(decoded.reference, "abc123")
         XCTAssertEqual(decoded.inputs.count, 1)
@@ -92,9 +94,10 @@ final class CreateActionTests: XCTestCase {
         )
 
         let decoded = try StorageClient.decodeCreateAction(try result("""
-            {"reference": "r", "outputs": [{"lockingScript": "bb", "satoshis": 999,
-                                            "outputDescription": "theirs"}]}
-            """), requested: [ours])
+            {"reference": "r", "version": 1, "lockTime": 0, "inputs": [],
+             "outputs": [{"lockingScript": "bb", "satoshis": 999,
+                          "outputDescription": "theirs"}]}
+            """))
 
         XCTAssertEqual(decoded.outputs.count, 1)
         XCTAssertEqual(decoded.outputs[0].lockingScript, [0xbb], "storage's script, not ours")
@@ -106,22 +109,80 @@ final class CreateActionTests: XCTestCase {
     /// whose value it does not know, which is how a transaction burns money to fees.
     func test_anInputWithNoAmountIsRefused() throws {
         XCTAssertThrowsError(try StorageClient.decodeCreateAction(try result("""
-            {"reference": "r", "inputs": [{"sourceTxid": "aa", "sourceVout": 0,
+            {"reference": "r", "version": 1, "lockTime": 0, "outputs": [],
+             "inputs": [{"sourceTxid": "aa", "sourceVout": 0,
               "sourceLockingScript": "76", "unlockingScriptLength": 108}]}
-            """), requested: []))
+            """)))
     }
 
     func test_anActionWithNoReferenceIsRefused() throws {
         XCTAssertThrowsError(
-            try StorageClient.decodeCreateAction(try result(#"{"inputs": []}"#), requested: [])
+            try StorageClient.decodeCreateAction(try result(#"{"inputs": []}"#))
         )
     }
 
     func test_anInputWithAnUnreadableScriptIsRefused() throws {
         XCTAssertThrowsError(try StorageClient.decodeCreateAction(try result("""
-            {"reference": "r", "inputs": [{"sourceTxid": "aa", "sourceVout": 0,
+            {"reference": "r", "version": 1, "lockTime": 0, "outputs": [],
+             "inputs": [{"sourceTxid": "aa", "sourceVout": 0,
               "sourceSatoshis": 10, "sourceLockingScript": "zz",
               "unlockingScriptLength": 108}]}
-            """), requested: []))
+            """)))
+    }
+
+    // MARK: - Faithfulness (review findings #3, #4, #7, #16)
+
+    func test_callerOptionsAreSerialized() throws {
+        let request = try WalletCreateActionRequest(
+            description: "held back",
+            outputs: [try WalletCreateActionOutput(
+                lockingScript: [0x76], satoshis: 1, outputDescription: "x"
+            )],
+            options: try WalletCreateActionOptions(acceptDelayedBroadcast: true, noSend: true)
+        )
+
+        let arguments = StorageClient.arguments(for: request)
+
+        XCTAssertEqual(arguments["options"]?["noSend"]?.boolValue, true)
+        XCTAssertEqual(arguments["isNoSend"]?.boolValue, true)
+        XCTAssertEqual(arguments["options"]?["acceptDelayedBroadcast"]?.boolValue, true)
+        XCTAssertEqual(arguments["isDelayed"]?.boolValue, true)
+    }
+
+    func test_callerInputsAreSerialized() throws {
+        let outpoint = "8ac7230489e80000000000000000000000000000000000000000000000000001.2"
+        let request = try WalletCreateActionRequest(
+            description: "spends a specific coin",
+            inputs: [WalletCreateActionInput(
+                outpoint: try Outpoint(outpoint),
+                inputDescription: "the ordinal",
+                unlockingScriptLength: 107,
+                sequenceNumber: 42
+            )]
+        )
+
+        let arguments = StorageClient.arguments(for: request)
+        let input = try XCTUnwrap(arguments["inputs"]?.arrayValue?.first)
+
+        XCTAssertEqual(input["outpoint"]?.stringValue, outpoint)
+        XCTAssertEqual(input["unlockingScriptLength"]?.intValue, 107)
+        XCTAssertEqual(input["sequenceNumber"]?.intValue, 42)
+    }
+
+    func test_inputBeefIsReadAsAByteArray() throws {
+        let decoded = try StorageClient.decodeCreateAction(try result("""
+            {"reference": "r", "version": 1, "lockTime": 0, "inputs": [], "outputs": [],
+             "inputBeef": [1, 2, 255]}
+            """))
+
+        XCTAssertEqual(decoded.inputBEEF, [0x01, 0x02, 0xff])
+    }
+
+    func test_aTruncatedFundedActionIsRefused() throws {
+        // No version, no lockTime, no inputs array — inventing them would describe a transaction
+        // storage never sent.
+        XCTAssertThrowsError(try StorageClient.decodeCreateAction(try result("""
+            {"reference": "r", "outputs": []}
+            """)))
     }
 }

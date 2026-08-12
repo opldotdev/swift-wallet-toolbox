@@ -20,7 +20,7 @@ extension StorageClient {
         let result = try await call(
             "createAction", [.object(auth.jsonObject), .object(Self.arguments(for: request))]
         )
-        return try Self.decodeCreateAction(result, requested: request.outputs ?? [])
+        return try Self.decodeCreateAction(result)
     }
 
     /// The validated argument shape the storage protocol expects.
@@ -30,6 +30,9 @@ extension StorageClient {
     /// fault there rather than a default here — `tags` on `listOutputs` proved that the hard way.
     static func arguments(for request: WalletCreateActionRequest) -> [String: JSONValue] {
         let requestedOutputs = request.outputs ?? []
+        let requestedInputs = request.inputs ?? []
+        let options = request.options
+
         let outputs = requestedOutputs.map { output -> JSONValue in
             var encoded: [String: JSONValue] = [
                 "lockingScript": .string(hexText(output.lockingScript)),
@@ -44,51 +47,82 @@ extension StorageClient {
             return .object(encoded)
         }
 
-        let isNewTx = !requestedOutputs.isEmpty || !(request.inputs ?? []).isEmpty
+        // Caller inputs travel with their outpoint, sequence and the length of the unlocking
+        // script they will carry once signed. The script bytes themselves are not sent — storage
+        // does not sign — but the length is, so the fee it funds matches the final weight.
+        let inputs = requestedInputs.map { input -> JSONValue in
+            var encoded: [String: JSONValue] = [
+                "outpoint": .string(input.outpoint.description),
+                "inputDescription": .string(input.inputDescription),
+                "unlockingScriptLength": .number(Double(unlockingLength(of: input.unlocking))),
+            ]
+            if let sequence = input.sequenceNumber {
+                encoded["sequenceNumber"] = .number(Double(sequence))
+            }
+            return .object(encoded)
+        }
+
+        let isNewTx = !requestedOutputs.isEmpty || !requestedInputs.isEmpty
+        let noSend = options?.noSend ?? false
+        let delayed = options?.acceptDelayedBroadcast ?? false
+        let sendWith = (options?.sendWith ?? []).map { JSONValue.string($0.displayHex) }
 
         return [
             "description": .string(request.description),
-            "inputs": .array([]),
+            "inputs": .array(inputs),
             "outputs": .array(outputs),
             "lockTime": .number(Double(request.lockTime ?? 0)),
             "version": .number(Double(request.version ?? 1)),
             "labels": .array((request.labels ?? []).map { .string($0) }),
             "options": .object([
-                "acceptDelayedBroadcast": .bool(false),
-                "returnTXIDOnly": .bool(false),
-                "noSend": .bool(false),
-                "sendWith": .array([]),
+                "acceptDelayedBroadcast": .bool(delayed),
+                "returnTXIDOnly": .bool(options?.returnTransactionIDOnly ?? false),
+                "noSend": .bool(noSend),
+                "sendWith": .array(sendWith),
+                // Overridden, and only this one: the wallet holds the keys, so storage must stop
+                // and hand the action back rather than completing it.
                 "signAndProcess": .bool(false),
-                "knownTxids": .array([]),
-                "noSendChange": .array([]),
-                "randomizeOutputs": .bool(false),
+                "knownTxids": .array(
+                    (options?.knownTransactionIDs ?? []).map { .string($0.displayHex) }
+                ),
+                "noSendChange": .array(
+                    (options?.noSendChange ?? []).map { .string($0.description) }
+                ),
+                "randomizeOutputs": .bool(options?.randomizeOutputs ?? true),
             ]),
-            // The wallet signs, so storage must stop and hand the action back rather than
-            // completing it. Anything else would mean storage holds keys, which it does not.
             "isSignAction": .bool(true),
-            "isSendWith": .bool(false),
+            "isSendWith": .bool(!sendWith.isEmpty),
             "isNewTx": .bool(isNewTx),
             "isRemixChange": .bool(false),
-            "isNoSend": .bool(false),
-            "isDelayed": .bool(false),
+            "isNoSend": .bool(noSend),
+            "isDelayed": .bool(delayed),
             "isTestWerrReviewActions": .bool(false),
             "includeAllSourceTransactions": .bool(false),
         ]
     }
 
+    private static func unlockingLength(of unlocking: WalletInputUnlocking) -> UInt32 {
+        switch unlocking {
+        case .script(let bytes): UInt32(bytes.count)
+        case .scriptLength(let length): length
+        }
+    }
+
     /// Reads the funded action.
     ///
-    /// `requested` is carried through so the outputs storage claims we asked for can be compared
-    /// with the ones we did. This function does not perform that comparison — the signer does,
-    /// where it cannot be skipped — but it keeps them together so the check has both sides.
-    static func decodeCreateAction(
-        _ result: JSONValue, requested: [WalletCreateActionOutput]
-    ) throws -> StorageCreateActionResult {
-        guard let reference = result["reference"]?.stringValue else {
+    /// Every field the protocol mandates is required, not defaulted. A funded action with no
+    /// version, no lock time, or no inputs array is a truncated response, and inventing values for
+    /// it would hand the signer a transaction storage never actually described.
+    static func decodeCreateAction(_ result: JSONValue) throws -> StorageCreateActionResult {
+        guard let reference = result["reference"]?.stringValue,
+              let versionValue = result["version"]?.intValue,
+              let lockTimeValue = result["lockTime"]?.intValue,
+              let inputRows = result["inputs"]?.arrayValue,
+              let outputRows = result["outputs"]?.arrayValue else {
             throw StorageClientError.unreadableResponse(method: "createAction")
         }
 
-        let inputs = try (result["inputs"]?.arrayValue ?? []).map { row -> StorageActionInput in
+        let inputs = try inputRows.map { row -> StorageActionInput in
             guard let txid = row["sourceTxid"]?.stringValue ?? row["sourceTXID"]?.stringValue,
                   let vout = row["sourceVout"]?.intValue.flatMap(UInt32.init(exactly:)),
                   let satoshis = row["sourceSatoshis"]?.intValue, satoshis >= 0,
@@ -112,9 +146,6 @@ extension StorageClient {
         // Every output storage put in the transaction, kept exactly as sent and never merged
         // with our own request. Substituting ours where storage's is absent would make the
         // security comparison compare the request with itself and pass for anything.
-        guard let outputRows = result["outputs"]?.arrayValue else {
-            throw StorageClientError.unreadableResponse(method: "createAction")
-        }
         let outputs = try outputRows.enumerated().map { index, row -> StorageActionOutput in
             guard let scriptText = row["lockingScript"]?.stringValue,
                   let script = hexBytes(scriptText),
@@ -137,13 +168,30 @@ extension StorageClient {
 
         return StorageCreateActionResult(
             reference: reference,
-            version: try narrow(result["version"]?.intValue ?? 1),
-            lockTime: try narrow(result["lockTime"]?.intValue ?? 0),
+            version: try narrow(versionValue),
+            lockTime: try narrow(lockTimeValue),
             outputs: outputs,
             inputs: inputs,
-            inputBEEF: result["inputBeef"]?.stringValue.flatMap(hexBytes),
+            // The funded proof graph arrives as a JSON byte array, not a hex string. Reading it as
+            // hex silently produced nil and lost the ancestors an Atomic BEEF has to carry.
+            inputBEEF: try byteArray(result["inputBeef"]),
             derivationPrefix: result["derivationPrefix"]?.stringValue
         )
+    }
+
+    /// Reads a JSON array of byte values, bounded. Absent is `nil`; malformed is a refusal, not a
+    /// silent `nil`, because an unreadable proof graph is not the same as no proof graph.
+    static func byteArray(_ value: JSONValue?, maximumCount: Int = 8 << 20) throws -> [UInt8]? {
+        guard let value, value != .null else { return nil }
+        guard let elements = value.arrayValue, elements.count <= maximumCount else {
+            throw StorageClientError.unreadableResponse(method: "createAction")
+        }
+        return try elements.map { element in
+            guard let byte = element.intValue, let narrowed = UInt8(exactly: byte) else {
+                throw StorageClientError.unreadableResponse(method: "createAction")
+            }
+            return narrowed
+        }
     }
 
     /// Narrows a wire integer, refusing rather than trapping. A hostile server sending

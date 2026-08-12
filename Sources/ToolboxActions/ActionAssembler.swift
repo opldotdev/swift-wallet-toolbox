@@ -91,8 +91,22 @@ public enum ActionAssembler {
         return Transaction(
             version: funded.version,
             inputs: inputs,
-            outputs: outputs,
+            // A transaction with no outputs is rejected by processors. When an action genuinely
+            // has none, the reference adds one zero-satoshi `OP_FALSE OP_RETURN` output so the
+            // transaction is well formed, and so does this.
+            outputs: outputs.isEmpty
+                ? [try TransactionOutput(satoshis: 0, lockingScript: emptyDataOutput(limits: limits))]
+                : outputs,
             lockTime: funded.lockTime
+        )
+    }
+
+    /// A provably unspendable zero-value output, for an action that would otherwise have none.
+    private static func emptyDataOutput(limits: TransactionLimits) throws -> Script {
+        try Script.falseReturn(
+            [],
+            maximumByteCount: Int(limits.maximumScriptByteCount),
+            maximumPartByteCount: Int(limits.maximumScriptByteCount)
         )
     }
 
