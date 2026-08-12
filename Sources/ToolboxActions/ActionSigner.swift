@@ -1,0 +1,69 @@
+import BSVKeys
+import BSVTransaction
+import BSVWallet
+import ToolboxBRC29
+import ToolboxStorage
+
+/// Signs the inputs a funded action spends.
+///
+/// Every input storage returns is one of the wallet's own outputs, locked to a BRC-29 key. The
+/// prefix and suffix stored alongside it name that key; this derives it and signs.
+///
+/// It goes through `assemble`, so the output check has already run by the time any key is used.
+/// Signing from a `StorageCreateActionResult` directly is not offered — a second entry point is a
+/// second way to skip the check.
+public enum ActionSigner {
+
+    /// Verifies, assembles, and signs every input.
+    ///
+    /// - Parameters:
+    ///   - funded: what storage returned.
+    ///   - requested: the outputs the caller asked for, from their own request.
+    ///   - identityKey: the wallet's key, from which each input's spending key is derived.
+    ///   - senderPublicKey: who paid these outputs. For change the wallet paid itself, so this is
+    ///     the wallet's own public key.
+    public static func sign(
+        _ funded: StorageCreateActionResult,
+        requested: [WalletCreateActionOutput],
+        identityKey: PrivateKey,
+        senderPublicKey: PublicKey,
+        limits: TransactionLimits = WalletTransactionLimits.standard
+    ) throws -> Transaction {
+        var transaction = try ActionAssembler.assemble(
+            funded, requested: requested, limits: limits
+        )
+
+        for (index, input) in funded.inputs.enumerated() {
+            guard let prefix = input.derivationPrefix,
+                  let suffix = input.derivationSuffix else {
+                // Without both halves the key cannot be rebuilt. Signing the rest and returning a
+                // partly signed transaction would look like success and spend nothing.
+                throw ActionError.unusableInput(
+                    "input \(index) is missing its derivation, so its key cannot be found"
+                )
+            }
+
+            let spendingKey = try BRC29.receivingPrivateKey(
+                recipient: identityKey,
+                sender: senderPublicKey,
+                prefix: prefix,
+                suffix: suffix
+            )
+
+            do {
+                try transaction.signPayToPublicKeyHashInput(
+                    at: index, with: spendingKey, limits: limits
+                )
+            } catch {
+                // The SDK refuses when the derived key does not hash to the script it is unlocking.
+                // That means the derivation and the output disagree, which is worth saying plainly
+                // rather than reporting as a signature failure.
+                throw ActionError.unusableInput(
+                    "input \(index) is not locked to the key its derivation produces"
+                )
+            }
+        }
+
+        return transaction
+    }
+}
