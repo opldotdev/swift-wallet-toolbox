@@ -129,9 +129,9 @@ reached the same cut, with certificates rated as having no Swift consumer today.
 - BRC-29 key derivation (`ToolboxBRC29`), cross-checked against the Go toolbox's vectors
 - The composed wallet (`ToolboxWallet.RemoteWallet`): `connect`, `balance`, `history`, `pay`,
   `abort`, `receiveAddress`, and `restore(fromPhrase:)`
-- Recovery-phrase restore (`ToolboxWallet.MnemonicRestore`) and receive-address derivation
-  (`ToolboxBRC29`), both matching Yours Wallet's paths and both checked against vectors from the
-  reference libraries
+- Recovery-phrase restore (`ToolboxWallet.MnemonicRestore`, Yours BIP-32 paths) and 1Sat
+  deposit/receive-address derivation (`ToolboxBRC29.OneSatDeposit`, protocol [0, "p 1sat"]),
+  both checked against ground-truth vectors from `@bsv/sdk`'s own derivation, not self-generated
 
 `createAction`, `listOutputs`, `processAction` and the whole `pay` flow are exercised against
 `https://wallet.1sat.app` in gated live tests.

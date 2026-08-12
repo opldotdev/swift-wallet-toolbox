@@ -35,8 +35,8 @@ Atomic BEEF packaging. An adversarial review of 2026-08-11 raised 20 findings; a
 see [`docs/reviews/2026-08-11-adversarial.md`](docs/reviews/2026-08-11-adversarial.md).
 
 `RemoteWallet` composes the whole wallet: `restore(fromPhrase:)`, `connect`, `balance`,
-`history`, `receiveAddress`, `pay`, `abort`. Recovery-phrase restore and receive-address
-derivation match Yours Wallet's paths, checked against vectors from the reference libraries.
+`history`, `receiveAddress`, `pay`, `abort`. Recovery-phrase restore matches Yours Wallet; receive-address
+derivation matches the live @1sat deposit convention's paths, checked against vectors from the reference libraries.
 
 Not yet built: the `Services` provider chains and the monitor tasks. See
 [`docs/DESIGN.md`](docs/DESIGN.md) §4.

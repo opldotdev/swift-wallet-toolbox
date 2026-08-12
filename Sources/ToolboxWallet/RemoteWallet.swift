@@ -90,13 +90,14 @@ public struct RemoteWallet: Sendable {
 
     // MARK: - Receiving
 
-    /// A receiving address, derived at the given index the way Yours Wallet derives them, so a
-    /// wallet restored from a Yours backup shows the same addresses. Index 0 is the primary
+    /// A receiving address, derived at the given index under the 1Sat deposit convention
+    /// (`OneSatDeposit`) — the same derivation the live `@1sat/actions` uses, so any wallet
+    /// binding this identity key derives the same default addresses. Index 0 is the primary
     /// address a wallet usually displays.
     public func receiveAddress(
         index: Int = 0, network: BitcoinNetwork = .mainnet
     ) throws -> String {
-        try BRC29.receivingAddress(identity: identityKey, index: index, network: network)
+        try OneSatDeposit.address(identity: identityKey, index: index, network: network)
             .description
     }
 
