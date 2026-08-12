@@ -1,5 +1,23 @@
 # Adversarial review — 2026-08-11
 
+## Remediation status
+
+All 20 confirmed findings are resolved as of commit `ff1075b`. Fixes landed across these commits,
+each with tests:
+
+| Findings | Commit | What changed |
+|---|---|---|
+| #1, #6 (+ change re-derivation) | `7c03f70` | Fee ceiling; two-part output check; change rebuilt from own keys |
+| #3, #4, #7, #15 | `284a02a` | Caller options and inputs serialized; funded fields required |
+| #5, #16 | `819e0d7` | Signed Atomic BEEF carried into finalization; inputBeef as byte array |
+| #2, #11, #12, #13 | `cedb709` | HTTPS default + peer pinning; body cap; session recovery; path fix |
+| #8, #9, #14, #17, #18, #19, #20 | `284a02a`, `ff1075b` | Per-input sender; trap-free conversions; strict collections; jsonrpc/id; in-flight settings |
+
+The findings as reported by the reviewer follow, unedited.
+
+---
+
+
 Reviewer: `gpt-5.6-sol` via codex, high reasoning effort, read-only.
 Protocol: Hunter → Skeptic → Referee, each reading the code independently.
 Target: commit `725aa5d`, against pinned `swift-sdk` `ebdac0d`.

@@ -28,9 +28,14 @@ and the Go toolbox in [`bsv-blockchain/go-wallet-toolbox`](https://github.com/bs
 
 ## Status
 
-Early. The package builds, the module boundaries are settled, and two pieces are implemented and
-tested: the storage wire error taxonomy and the signing-path output check. Everything else is a
-declared contract with no body yet.
+The send path works end to end against a real BRC-103 storage server: authenticated handshake,
+JSON-RPC transport, `makeAvailable` / `listOutputs` / `createAction` / `processAction`, BRC-29 key
+derivation (cross-checked against the Go toolbox's vectors), transaction assembly, signing, and
+Atomic BEEF packaging. An adversarial review of 2026-08-11 raised 20 findings; all are resolved —
+see [`docs/reviews/2026-08-11-adversarial.md`](docs/reviews/2026-08-11-adversarial.md).
+
+Not yet built: `listActions`, `internalizeAction`, `abortAction`, `relinquishOutput`, the concrete
+`Wallet` composition, the `Services` provider chains, and the monitor tasks.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and why.
 
