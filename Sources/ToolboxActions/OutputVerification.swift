@@ -26,9 +26,11 @@ public enum OutputVerification {
 
     /// The most a commission may be, in satoshis.
     ///
-    /// The reference implementation bounds it for the same reason: without a ceiling, "commission"
-    /// is an unlimited payment to the storage operator with a respectable name.
-    public static let maximumCommission: UInt64 = 2_000
+    /// This is `MAX_STORAGE_COMMISSION_SATOSHIS` from the TypeScript toolbox, matched exactly. A
+    /// lower ceiling would look safer but would reject a legitimate commission an honest server is
+    /// entitled to charge, breaking the payment. The bound exists so "commission" cannot become an
+    /// unlimited payment to the operator, not to second-guess the reference's number.
+    public static let maximumCommission: UInt64 = 500_000
 
     /// Throws unless storage's outputs are the requested ones followed only by change and at most
     /// one bounded commission.
