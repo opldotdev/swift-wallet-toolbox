@@ -17,16 +17,16 @@ public struct StorageCreateActionResult: Equatable, Sendable {
     public let reference: String
     public let version: UInt32
     public let lockTime: UInt32
-    /// The outputs storage says the caller requested. Verified against the real request, never
-    /// taken as fact.
-    public let outputs: [WalletCreateActionOutput]
+    /// Every output storage put in the transaction: the caller's first, then at most one
+    /// commission, then change. None of it is taken as fact — see `OutputVerification`.
+    public let outputs: [StorageActionOutput]
     public let inputs: [StorageActionInput]
     /// Present when the caller supplied inputs whose source transactions storage already holds.
     public let inputBEEF: [UInt8]?
     public let derivationPrefix: String?
 
     public init(reference: String, version: UInt32, lockTime: UInt32,
-                outputs: [WalletCreateActionOutput], inputs: [StorageActionInput],
+                outputs: [StorageActionOutput], inputs: [StorageActionInput],
                 inputBEEF: [UInt8]?, derivationPrefix: String?) {
         self.reference = reference
         self.version = version

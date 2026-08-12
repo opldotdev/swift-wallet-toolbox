@@ -90,54 +90,69 @@ extension StorageClient {
 
         let inputs = try (result["inputs"]?.arrayValue ?? []).map { row -> StorageActionInput in
             guard let txid = row["sourceTxid"]?.stringValue ?? row["sourceTXID"]?.stringValue,
-                  let vout = row["sourceVout"]?.intValue, vout >= 0,
+                  let vout = row["sourceVout"]?.intValue.flatMap(UInt32.init(exactly:)),
                   let satoshis = row["sourceSatoshis"]?.intValue, satoshis >= 0,
                   let scriptText = row["sourceLockingScript"]?.stringValue,
                   let script = hexBytes(scriptText),
-                  let unlockingLength = row["unlockingScriptLength"]?.intValue,
-                  unlockingLength >= 0 else {
+                  let unlockingLength = row["unlockingScriptLength"]?.intValue
+                    .flatMap(UInt32.init(exactly:)) else {
                 throw StorageClientError.unreadableResponse(method: "createAction")
             }
             return StorageActionInput(
                 sourceTXID: txid,
-                sourceVout: UInt32(vout),
+                sourceVout: vout,
                 sourceSatoshis: Int64(satoshis),
                 sourceLockingScript: script,
-                unlockingScriptLength: UInt32(unlockingLength),
+                unlockingScriptLength: unlockingLength,
                 derivationPrefix: row["derivationPrefix"]?.stringValue,
                 derivationSuffix: row["derivationSuffix"]?.stringValue
             )
         }
 
-        // What storage says we asked for. Kept exactly as sent, never merged with our own request,
-        // because the whole point of the later comparison is that these two can differ.
-        let echoed = try (result["outputs"]?.arrayValue).map { rows in
-            try rows.map { row -> WalletCreateActionOutput in
-                guard let scriptText = row["lockingScript"]?.stringValue,
-                      let script = hexBytes(scriptText),
-                      let satoshis = row["satoshis"]?.intValue, satoshis >= 0 else {
-                    throw StorageClientError.unreadableResponse(method: "createAction")
-                }
-                return try WalletCreateActionOutput(
-                    lockingScript: script,
-                    satoshis: UInt64(satoshis),
-                    outputDescription: row["outputDescription"]?.stringValue ?? "",
-                    basket: row["basket"]?.stringValue,
-                    customInstructions: row["customInstructions"]?.stringValue,
-                    tags: row["tags"]?.arrayValue?.compactMap(\.stringValue) ?? []
-                )
+        // Every output storage put in the transaction, kept exactly as sent and never merged
+        // with our own request. Substituting ours where storage's is absent would make the
+        // security comparison compare the request with itself and pass for anything.
+        guard let outputRows = result["outputs"]?.arrayValue else {
+            throw StorageClientError.unreadableResponse(method: "createAction")
+        }
+        let outputs = try outputRows.enumerated().map { index, row -> StorageActionOutput in
+            guard let scriptText = row["lockingScript"]?.stringValue,
+                  let script = hexBytes(scriptText),
+                  let satoshis = row["satoshis"]?.intValue, satoshis >= 0,
+                  let vout = row["vout"]?.intValue.flatMap({ UInt32(exactly: $0) })
+                    ?? UInt32(exactly: index) else {
+                throw StorageClientError.unreadableResponse(method: "createAction")
             }
-        } ?? requested
+            return StorageActionOutput(
+                vout: vout,
+                satoshis: UInt64(satoshis),
+                lockingScript: script,
+                providedBy: row["providedBy"]?.stringValue
+                    .flatMap(StorageActionOutput.ProvidedBy.init(rawValue:)),
+                purpose: row["purpose"]?.stringValue
+                    .flatMap(StorageActionOutput.Purpose.init(rawValue:)),
+                derivationSuffix: row["derivationSuffix"]?.stringValue
+            )
+        }
 
         return StorageCreateActionResult(
             reference: reference,
-            version: UInt32(max(0, result["version"]?.intValue ?? 1)),
-            lockTime: UInt32(max(0, result["lockTime"]?.intValue ?? 0)),
-            outputs: echoed,
+            version: try narrow(result["version"]?.intValue ?? 1),
+            lockTime: try narrow(result["lockTime"]?.intValue ?? 0),
+            outputs: outputs,
             inputs: inputs,
             inputBEEF: result["inputBeef"]?.stringValue.flatMap(hexBytes),
             derivationPrefix: result["derivationPrefix"]?.stringValue
         )
+    }
+
+    /// Narrows a wire integer, refusing rather than trapping. A hostile server sending
+    /// 4294967296 would otherwise crash the process.
+    static func narrow(_ value: Int) throws -> UInt32 {
+        guard let narrowed = UInt32(exactly: value) else {
+            throw StorageClientError.unreadableResponse(method: "createAction")
+        }
+        return narrowed
     }
 
     static func hexText(_ bytes: [UInt8]) -> String {

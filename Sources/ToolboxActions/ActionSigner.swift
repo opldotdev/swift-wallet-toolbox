@@ -22,15 +22,22 @@ public enum ActionSigner {
     ///   - identityKey: the wallet's key, from which each input's spending key is derived.
     ///   - senderPublicKey: who paid these outputs. For change the wallet paid itself, so this is
     ///     the wallet's own public key.
+    ///   - maximumFee: the most the caller will pay to miners, in satoshis.
     public static func sign(
         _ funded: StorageCreateActionResult,
         requested: [WalletCreateActionOutput],
         identityKey: PrivateKey,
         senderPublicKey: PublicKey,
+        maximumFee: Int64,
         limits: TransactionLimits = WalletTransactionLimits.standard
     ) throws -> Transaction {
+        // Before the outputs are even checked. Storage picks the inputs, so it can leave every
+        // output exactly as asked and still take the whole wallet as a fee by selecting a large
+        // input and returning no change. No output is wrong, so no output check finds it.
+        try ActionAssembler.requireFeeWithin(maximumFee, for: funded)
+
         var transaction = try ActionAssembler.assemble(
-            funded, requested: requested, limits: limits
+            funded, requested: requested, changeKey: identityKey, limits: limits
         )
 
         for (index, input) in funded.inputs.enumerated() {

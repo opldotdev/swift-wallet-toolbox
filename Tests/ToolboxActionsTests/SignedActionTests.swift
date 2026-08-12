@@ -9,6 +9,27 @@ import ToolboxStorage
 /// Packaging a signed transaction for storage to broadcast.
 final class SignedActionTests: XCTestCase {
 
+    /// An output as storage returns it: the caller's own, echoed back.
+    private func storageOutput(
+        _ requested: WalletCreateActionOutput, vout: UInt32 = 0
+    ) -> StorageActionOutput {
+        StorageActionOutput(
+            vout: vout, satoshis: requested.satoshis,
+            lockingScript: requested.lockingScript, providedBy: .you,
+            purpose: nil, derivationSuffix: nil
+        )
+    }
+
+    /// A change output, which the assembler re-derives rather than trusts.
+    private func changeOutput(
+        satoshis: UInt64, vout: UInt32, suffix: String = "Su=="
+    ) -> StorageActionOutput {
+        StorageActionOutput(
+            vout: vout, satoshis: satoshis, lockingScript: [0x00],
+            providedBy: .storage, purpose: .change, derivationSuffix: suffix
+        )
+    }
+
     private let prefix = "Pr=="
     private let suffix = "Su=="
 
@@ -52,7 +73,8 @@ final class SignedActionTests: XCTestCase {
             )
         ]
         let action = StorageCreateActionResult(
-            reference: "ref", version: 1, lockTime: 0, outputs: requested,
+            reference: "ref", version: 1, lockTime: 0,
+            outputs: requested.map { storageOutput($0) },
             inputs: [
                 StorageActionInput(
                     sourceTXID: sourceID.displayHex,
@@ -64,7 +86,7 @@ final class SignedActionTests: XCTestCase {
             inputBEEF: nil, derivationPrefix: prefix
         )
         return try ActionSigner.sign(
-            action, requested: requested, identityKey: identity, senderPublicKey: sender
+            action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
         )
     }
 

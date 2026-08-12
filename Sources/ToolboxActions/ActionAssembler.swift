@@ -1,5 +1,7 @@
 import Foundation
 import BSVCore
+import BSVKeys
+import ToolboxBRC29
 import BSVScript
 import BSVTransaction
 import BSVWallet
@@ -25,6 +27,7 @@ public enum ActionAssembler {
     public static func assemble(
         _ funded: StorageCreateActionResult,
         requested: [WalletCreateActionOutput],
+        changeKey: PrivateKey,
         limits: TransactionLimits = WalletTransactionLimits.standard
     ) throws -> Transaction {
         // Before anything else. See `OutputVerification` for why.
@@ -58,10 +61,30 @@ public enum ActionAssembler {
             )
         }
 
-        let outputs = try funded.outputs.map { output in
-            TransactionOutput(
+        // A change output's script is re-derived from our own key and storage's copy is
+        // discarded. That is what makes the label safe to accept: an output calling itself change
+        // can then only pay this wallet, whatever script storage attached to it.
+        let outputs = try funded.outputs.map { output -> TransactionOutput in
+            guard output.isChange else {
+                return TransactionOutput(
+                    satoshis: output.satoshis,
+                    lockingScript: try script(output.lockingScript, limits: limits)
+                )
+            }
+            guard let prefix = funded.derivationPrefix, let suffix = output.derivationSuffix else {
+                throw ActionError.unresolvableChange(
+                    "change at index \(output.vout) has no derivation, so its script cannot be "
+                        + "rebuilt and storage's copy cannot be trusted"
+                )
+            }
+            let mine = try BRC29.receivingPrivateKey(
+                recipient: changeKey, sender: changeKey.publicKey,
+                prefix: prefix, suffix: suffix
+            )
+            return TransactionOutput(
                 satoshis: output.satoshis,
-                lockingScript: try script(output.lockingScript, limits: limits)
+                lockingScript: try BRC29.lockingScript(for: mine.publicKey),
+                isChange: true
             )
         }
 
@@ -84,15 +107,45 @@ public enum ActionAssembler {
         }
     }
 
+    /// Refuses a fee above what the caller allows.
+    ///
+    /// Storage chooses the inputs, so nothing else stops it selecting a large one and returning no
+    /// change: the requested output is untouched, every other check passes, and the difference —
+    /// which can be the whole wallet — goes to miners as a fee. Verifying outputs does not catch
+    /// this, because no output is wrong.
+    public static func requireFeeWithin(
+        _ maximum: Int64, for funded: StorageCreateActionResult
+    ) throws {
+        let paid = try fee(for: funded)
+        guard paid <= maximum else {
+            throw ActionError.feeTooHigh(paid: paid, maximum: maximum)
+        }
+    }
+
     /// What the transaction pays in fees, from the amounts storage reported.
     ///
     /// Computed rather than taken on trust: storage chose the inputs and the change, and this is
     /// the number that says whether those choices were sane. A negative result means the outputs
     /// exceed the inputs, which is not a fee but an impossible transaction.
     public static func fee(for funded: StorageCreateActionResult) throws -> Int64 {
-        let inputTotal = funded.inputs.reduce(Int64(0)) { $0 + $1.sourceSatoshis }
-        let outputTotal = funded.outputs.reduce(Int64(0)) { $0 + Int64($1.satoshis) }
-        let fee = inputTotal - outputTotal
+        // Reporting overflow rather than trapping: these amounts come from a remote server.
+        var inputTotal = Int64(0)
+        for input in funded.inputs {
+            let (sum, overflow) = inputTotal.addingReportingOverflow(input.sourceSatoshis)
+            guard !overflow else { throw ActionError.unusableInput("input amounts overflow") }
+            inputTotal = sum
+        }
+        var outputTotal = Int64(0)
+        for output in funded.outputs {
+            guard let amount = Int64(exactly: output.satoshis) else {
+                throw ActionError.unusableInput("an output amount is out of range")
+            }
+            let (sum, overflow) = outputTotal.addingReportingOverflow(amount)
+            guard !overflow else { throw ActionError.unusableInput("output amounts overflow") }
+            outputTotal = sum
+        }
+        let (fee, feeOverflow) = inputTotal.subtractingReportingOverflow(outputTotal)
+        guard !feeOverflow else { throw ActionError.unusableInput("amounts overflow") }
         guard fee >= 0 else {
             throw ActionError.unusableInput(
                 "outputs exceed inputs by \(-fee) satoshis"

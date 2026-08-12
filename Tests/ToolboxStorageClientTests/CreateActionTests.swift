@@ -99,7 +99,7 @@ final class CreateActionTests: XCTestCase {
         XCTAssertEqual(decoded.outputs.count, 1)
         XCTAssertEqual(decoded.outputs[0].lockingScript, [0xbb], "storage's script, not ours")
         XCTAssertEqual(decoded.outputs[0].satoshis, 999)
-        XCTAssertNotEqual(decoded.outputs[0], ours)
+        XCTAssertNotEqual(decoded.outputs[0].lockingScript, ours.lockingScript)
     }
 
     /// A missing input amount is refused. Reading it as zero would let the signer sign an input

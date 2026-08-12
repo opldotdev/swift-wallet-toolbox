@@ -14,6 +14,27 @@ import ToolboxStorage
 /// being right, which is the only part that can go wrong quietly.
 final class ActionSignerTests: XCTestCase {
 
+    /// An output as storage returns it: the caller's own, echoed back.
+    private func storageOutput(
+        _ requested: WalletCreateActionOutput, vout: UInt32 = 0
+    ) -> StorageActionOutput {
+        StorageActionOutput(
+            vout: vout, satoshis: requested.satoshis,
+            lockingScript: requested.lockingScript, providedBy: .you,
+            purpose: nil, derivationSuffix: nil
+        )
+    }
+
+    /// A change output, which the assembler re-derives rather than trusts.
+    private func changeOutput(
+        satoshis: UInt64, vout: UInt32, suffix: String = "Su=="
+    ) -> StorageActionOutput {
+        StorageActionOutput(
+            vout: vout, satoshis: satoshis, lockingScript: [0x00],
+            providedBy: .storage, purpose: .change, derivationSuffix: suffix
+        )
+    }
+
     private let sourceTXID =
         "8ac7230489e80000000000000000000000000000000000000000000000000001"
     private let prefix = "Pr=="
@@ -50,7 +71,7 @@ final class ActionSignerTests: XCTestCase {
     }
 
     private func funded(
-        outputs: [WalletCreateActionOutput], inputs: [StorageActionInput]
+        outputs: [StorageActionOutput], inputs: [StorageActionInput]
     ) -> StorageCreateActionResult {
         StorageCreateActionResult(
             reference: "ref", version: 1, lockTime: 0, outputs: outputs, inputs: inputs,
@@ -65,11 +86,11 @@ final class ActionSignerTests: XCTestCase {
         let sender = try key(2).publicKey
         let requested = [try output(satoshis: 1_000)]
         let action = funded(
-            outputs: requested, inputs: [try brc29Input(identity: identity, sender: sender)]
+            outputs: requested.map { storageOutput($0) }, inputs: [try brc29Input(identity: identity, sender: sender)]
         )
 
         let signed = try ActionSigner.sign(
-            action, requested: requested, identityKey: identity, senderPublicKey: sender
+            action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
         )
 
         XCTAssertFalse(signed.inputs[0].unlockingScript.bytes.isEmpty,
@@ -84,13 +105,13 @@ final class ActionSignerTests: XCTestCase {
         let sender = try key(9).publicKey
         let requested = [try output(satoshis: 100)]
         let action = funded(
-            outputs: requested,
+            outputs: requested.map { storageOutput($0) },
             inputs: [try brc29Input(identity: identity, sender: sender, satoshis: 900)]
         )
 
         XCTAssertNoThrow(
             try ActionSigner.sign(
-                action, requested: requested, identityKey: identity, senderPublicKey: sender
+                action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
             )
         )
     }
@@ -99,13 +120,13 @@ final class ActionSignerTests: XCTestCase {
         let identity = try key(1)
         let sender = try key(2).publicKey
         let requested = [try output(satoshis: 1_000)]
-        let action = funded(outputs: requested, inputs: [
+        let action = funded(outputs: requested.map { storageOutput($0) }, inputs: [
             try brc29Input(identity: identity, sender: sender),
             try brc29Input(identity: identity, sender: sender, suffix: "Other=="),
         ])
 
         let signed = try ActionSigner.sign(
-            action, requested: requested, identityKey: identity, senderPublicKey: sender
+            action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
         )
 
         XCTAssertEqual(signed.inputs.count, 2)
@@ -126,12 +147,12 @@ final class ActionSignerTests: XCTestCase {
             )
         ]
         let action = funded(
-            outputs: tampered, inputs: [try brc29Input(identity: identity, sender: sender)]
+            outputs: tampered.map { storageOutput($0) }, inputs: [try brc29Input(identity: identity, sender: sender)]
         )
 
         XCTAssertThrowsError(
             try ActionSigner.sign(
-                action, requested: requested, identityKey: identity, senderPublicKey: sender
+                action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
             )
         ) {
             XCTAssertEqual($0 as? ActionError,
@@ -153,11 +174,11 @@ final class ActionSignerTests: XCTestCase {
             unlockingScriptLength: input.unlockingScriptLength,
             derivationPrefix: prefix, derivationSuffix: nil
         )
-        let action = funded(outputs: requested, inputs: [input])
+        let action = funded(outputs: requested.map { storageOutput($0) }, inputs: [input])
 
         XCTAssertThrowsError(
             try ActionSigner.sign(
-                action, requested: requested, identityKey: identity, senderPublicKey: sender
+                action, requested: requested, identityKey: identity, senderPublicKey: sender, maximumFee: 1_000_000
             )
         )
     }
@@ -171,13 +192,13 @@ final class ActionSignerTests: XCTestCase {
         let wrongSender = try key(3).publicKey
         let requested = [try output(satoshis: 1_000)]
         let action = funded(
-            outputs: requested, inputs: [try brc29Input(identity: identity, sender: realSender)]
+            outputs: requested.map { storageOutput($0) }, inputs: [try brc29Input(identity: identity, sender: realSender)]
         )
 
         XCTAssertThrowsError(
             try ActionSigner.sign(
                 action, requested: requested, identityKey: identity,
-                senderPublicKey: wrongSender
+                senderPublicKey: wrongSender, maximumFee: 1_000_000
             )
         )
     }
@@ -188,12 +209,12 @@ final class ActionSignerTests: XCTestCase {
         let sender = try key(2).publicKey
         let requested = [try output(satoshis: 1_000)]
         let action = funded(
-            outputs: requested, inputs: [try brc29Input(identity: identity, sender: sender)]
+            outputs: requested.map { storageOutput($0) }, inputs: [try brc29Input(identity: identity, sender: sender)]
         )
 
         XCTAssertThrowsError(
             try ActionSigner.sign(
-                action, requested: requested, identityKey: other, senderPublicKey: sender
+                action, requested: requested, identityKey: other, senderPublicKey: sender, maximumFee: 1_000_000
             )
         )
     }
