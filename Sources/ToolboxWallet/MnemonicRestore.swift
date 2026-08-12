@@ -21,7 +21,15 @@ public enum MnemonicRestore {
 
     /// The identity key a phrase recovers. This key both authenticates to storage and signs.
     public static func identityKey(fromPhrase phrase: String) throws -> PrivateKey {
-        let mnemonic = try Mnemonic(phrase)
+        try identityKey(from: try Mnemonic(phrase))
+    }
+
+    /// The identity key a parsed mnemonic recovers.
+    ///
+    /// The branch on entropy size is the whole scheme, so it lives here once and both the phrase
+    /// overload and a caller that already holds the mnemonic go through it. A caller that instead
+    /// takes the first 32 bytes of the seed for a 24-word phrase derives a different, wrong key.
+    public static func identityKey(from mnemonic: Mnemonic) throws -> PrivateKey {
         let keyBytes: [UInt8]
         if mnemonic.entropy.count == 32 {
             // 24-word: the entropy is the key, reversibly.
