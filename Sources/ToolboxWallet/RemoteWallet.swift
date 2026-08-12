@@ -182,6 +182,69 @@ public struct RemoteWallet: Sendable {
         return try await pay([output], description: description, labels: labels)
     }
 
+    /// Pays a counterparty's identity key with a BRC-29 payment, returning everything the recipient
+    /// needs to internalize and spend the output.
+    ///
+    /// The wallet is the sender. It derives the recipient's paying key with BRC-42 against this
+    /// wallet's identity key under the BRC-29 protocol, using the caller-supplied `prefix` and
+    /// `suffix`, and locks a plain P2PKH to it (`BRC29`). Only the recipient, holding the same
+    /// `prefix`, `suffix`, and this wallet's identity key, can derive the private key that spends it
+    /// — so the caller MUST keep `prefix` and `suffix`, or the money becomes unspendable.
+    ///
+    /// The output index is confirmed against the signed transaction **before** the broadcast. A
+    /// derivation that does not appear exactly once throws and nothing is sent, because telling the
+    /// recipient a wrong index points it at an output it cannot spend.
+    public func payToCounterparty(
+        recipient recipientIdentityKey: PublicKey,
+        satoshis: UInt64,
+        derivationPrefix prefix: String,
+        derivationSuffix suffix: String,
+        description: String,
+        labels: [String] = []
+    ) async throws -> CounterpartyPayment {
+        let payingPublicKey = try BRC29.payingPublicKey(
+            recipient: recipientIdentityKey, sender: identityKey, prefix: prefix, suffix: suffix
+        )
+        let script = try BRC29.lockingScript(for: payingPublicKey)
+        let output = try WalletCreateActionOutput(
+            lockingScript: script.bytes, satoshis: satoshis, outputDescription: description
+        )
+
+        let request = try WalletCreateActionRequest(
+            description: description, outputs: [output], labels: labels
+        )
+        let funded = try await storage.createAction(auth, request)
+        let transaction = try ActionSigner.sign(
+            funded,
+            requested: [output],
+            identityKey: identityKey,
+            senderPublicKey: identityKey.publicKey,
+            maximumFee: maximumFee
+        )
+        let signed = try SignedAction(funded: funded, transaction: transaction)
+
+        // The paid output is located by its locking script, not assumed at an index, because storage
+        // may add change and may reorder. Zero or several matches means the derivation is wrong or
+        // collided; the funded inputs are released and nothing is broadcast.
+        let scriptBytes = script.bytes
+        let matches = signed.transaction.outputs.enumerated().filter {
+            $0.element.lockingScript.bytes == scriptBytes
+        }
+        guard matches.count == 1, let index = matches.first?.offset else {
+            _ = try? await abort(reference: funded.reference)
+            throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
+        }
+
+        let processed = try await storage.processAction(auth, try signed.processRequest())
+        return CounterpartyPayment(
+            transactionID: signed.transactionID,
+            outputIndex: index,
+            atomicBEEF: try signed.atomicBEEF(),
+            reference: funded.reference,
+            results: processed.sendWithResults
+        )
+    }
+
     /// Funds, signs and broadcasts the outputs, returning both the signed action (for a paymail
     /// BEEF delivery) and the receipt.
     private func sign(
@@ -224,9 +287,44 @@ public struct RemoteWallet: Sendable {
         guard let bytes = Data(base64Encoded: reference) else {
             throw WalletError.invalidReference
         }
-        let request = try WalletAbortActionRequest(reference: try WalletBase64Data(Array(bytes)))
+        let request = WalletAbortActionRequest(reference: try WalletBase64Data(Array(bytes)))
         return try await storage.abortAction(auth, request).aborted
     }
+}
+
+/// The receipt of a BRC-29 payment to a counterparty.
+///
+/// It carries the three things the recipient needs to internalize the output, beyond the derivation
+/// prefix and suffix the caller already holds: the transaction id, the index of the paid output,
+/// and the Atomic BEEF (BRC-95). With these plus the sender's identity key the recipient derives the
+/// spending key and validates the transaction without trusting anyone.
+public struct CounterpartyPayment: Sendable {
+    public let transactionID: TransactionID
+    public let outputIndex: Int
+    public let atomicBEEF: [UInt8]
+    public let reference: String
+    public let results: [SendWithResult]
+
+    public init(
+        transactionID: TransactionID,
+        outputIndex: Int,
+        atomicBEEF: [UInt8],
+        reference: String,
+        results: [SendWithResult]
+    ) {
+        self.transactionID = transactionID
+        self.outputIndex = outputIndex
+        self.atomicBEEF = atomicBEEF
+        self.reference = reference
+        self.results = results
+    }
+}
+
+/// Failures of a BRC-29 counterparty payment.
+public enum BRC29PaymentError: Error, Equatable, Sendable {
+    /// The derived output did not appear exactly once in the signed transaction. The payment was
+    /// not broadcast. `matches` is how many outputs carried the derived locking script.
+    case outputNotUniquelyIdentified(matches: Int)
 }
 
 /// The outcome of a payment that reached storage.
