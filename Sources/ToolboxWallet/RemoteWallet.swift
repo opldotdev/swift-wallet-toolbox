@@ -91,10 +91,13 @@ public struct RemoteWallet: Sendable {
 
     // MARK: - Receiving
 
-    /// A receiving address, derived at the given index under the 1Sat deposit convention
-    /// (`OneSatDeposit`) — the same derivation the live `@1sat/actions` uses, so any wallet
-    /// binding this identity key derives the same default addresses. Index 0 is the primary
-    /// address a wallet usually displays.
+    /// A receiving address, derived at the given index under the 1Sat deposit convention.
+    ///
+    /// The protocol owner is `DepositAddresses` in `swift-1sat-sdk` (`@1sat/actions`
+    /// `deriveDepositAddresses`). This method uses `OneSatDeposit`, the toolbox's byte-identical
+    /// copy of that derivation for the default prefix `"1sat"`. Any wallet that binds this
+    /// identity key derives the same default addresses. Index 0 is the primary address a wallet
+    /// usually displays.
     public func receiveAddress(
         index: Int = 0, network: BitcoinNetwork = .mainnet
     ) throws -> String {
@@ -103,6 +106,9 @@ public struct RemoteWallet: Sendable {
     }
 
     /// A run of receiving addresses, for scanning the chain or handing out fresh ones.
+    ///
+    /// Each index is `receiveAddress(index:network:)` — the same `DepositAddresses` derivation
+    /// via the local `OneSatDeposit` copy.
     public func receiveAddresses(
         startIndex: Int, count: Int, network: BitcoinNetwork = .mainnet
     ) throws -> [String] {

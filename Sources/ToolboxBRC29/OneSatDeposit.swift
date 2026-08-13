@@ -8,15 +8,19 @@ import BSVKeys
 /// with the identity key as its own counterparty. Any wallet that binds the same identity key
 /// derives the same default addresses without coordinating.
 ///
+/// The protocol owner is `OneSatAddresses.DepositAddresses` in `swift-1sat-sdk`, which mirrors
+/// `@1sat/actions` `deriveDepositAddresses` (including a caller-chosen prefix). This type is a
+/// byte-identical copy of that derivation for the fixed default prefix `"1sat"`. The copy stays
+/// here because the toolbox cannot depend on `swift-1sat-sdk`: that package already depends on
+/// this one (`swift-1sat-sdk/Package.swift`), and the reverse edge would cycle. Change
+/// `DepositAddresses` first. A change here that is not made there fails the cross-repo equality
+/// test in `OneSatAddressesTests`.
+///
 /// An earlier version of this file used the prefix `"yours receive"` under BRC-29's protocol. That
 /// convention was deleted upstream (`1sat-sdk` commit "Default deposit prefix '1sat'; remove
 /// YOURS_PREFIX"), so it produced addresses the live ecosystem no longer scans — money received
 /// against a real Yours identity would have been invisible. The values here are checked against
 /// `@bsv/sdk`'s own `getPublicKey`, not against a vector this library generated for itself.
-///
-/// This belongs in `swift-1sat-sdk` once that exists — it is a 1Sat protocol, not a wallet-toolbox
-/// primitive. It lives here for now so the wallet has a correct receive address; the move is
-/// mechanical.
 public enum OneSatDeposit {
     /// The keyID prefix. The suffix is the index as a decimal string, joined by a space.
     public static let prefix = "1sat"
