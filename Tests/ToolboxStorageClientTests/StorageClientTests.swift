@@ -1,4 +1,5 @@
 import XCTest
+import BSVWallet
 import ToolboxAuth
 import ToolboxCore
 import ToolboxStorage
@@ -190,6 +191,30 @@ final class StorageClientTests: XCTestCase {
         } catch let error as StorageClientError {
             XCTAssertEqual(error, .httpFailure(method: "listOutputs", statusCode: 503))
         }
+    }
+
+    func test_listOutputsSendsTagQueryMode() async throws {
+        let transport = FakeTransport(json: #"{"result": {"totalOutputs": 0, "outputs": []}}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        _ = try await client.listOutputs(
+            auth,
+            try WalletListOutputsRequest(
+                basket: "bap",
+                tags: ["type:alias", "id:abc"],
+                tagQueryMode: .all,
+                include: .lockingScripts,
+                pagination: WalletPagination(limit: 1)
+            )
+        )
+        let params = try await transport.sentEnvelopes()[0]["params"]?.arrayValue
+        let arguments = try XCTUnwrap(params?[1])
+        XCTAssertEqual(arguments["basket"]?.stringValue, "bap")
+        XCTAssertEqual(
+            arguments["tags"]?.arrayValue?.compactMap(\.stringValue),
+            ["type:alias", "id:abc"]
+        )
+        XCTAssertEqual(arguments["tagQueryMode"]?.stringValue, "all")
+        XCTAssertEqual(arguments["include"]?.stringValue, "locking scripts")
     }
 
     // MARK: - Availability

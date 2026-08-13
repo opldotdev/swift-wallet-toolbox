@@ -39,6 +39,9 @@ extension StorageClient {
         if let include = request.include {
             arguments["include"] = .string(include.rawValue)
         }
+        if let tagQueryMode = request.tagQueryMode {
+            arguments["tagQueryMode"] = .string(tagQueryMode.rawValue)
+        }
 
         let result = try await call("listOutputs", [.object(auth.jsonObject), .object(arguments)])
         return try Self.decodeOutputs(result)
