@@ -18,7 +18,7 @@ extension StorageClient {
         _ auth: AuthID, _ request: WalletCreateActionRequest
     ) async throws -> StorageCreateActionResult {
         let result = try await call(
-            "createAction", [.object(auth.jsonObject), .object(Self.arguments(for: request))]
+            "createAction", [.object(auth.jsonObject), .object(try Self.arguments(for: request))]
         )
         return try Self.decodeCreateAction(result)
     }
@@ -67,7 +67,7 @@ extension StorageClient {
     /// Fields the reference client always sends are always sent, including empty collections. The
     /// server reads several of them without checking they exist, so an omitted empty array is a
     /// fault there rather than a default here — `tags` on `listOutputs` proved that the hard way.
-    static func arguments(for request: WalletCreateActionRequest) -> [String: JSONValue] {
+    static func arguments(for request: WalletCreateActionRequest) throws -> [String: JSONValue] {
         let requestedOutputs = request.outputs ?? []
         let requestedInputs = request.inputs ?? []
         let options = request.options
@@ -106,7 +106,7 @@ extension StorageClient {
         let delayed = options?.acceptDelayedBroadcast ?? false
         let sendWith = (options?.sendWith ?? []).map { JSONValue.string($0.displayHex) }
 
-        return [
+        var encoded: [String: JSONValue] = [
             "description": .string(request.description),
             "inputs": .array(inputs),
             "outputs": .array(outputs),
@@ -138,6 +138,12 @@ extension StorageClient {
             "isTestWerrReviewActions": .bool(false),
             "includeAllSourceTransactions": .bool(false),
         ]
+        if let inputBEEF = request.inputBEEF {
+            encoded["inputBEEF"] = .array(
+                try inputBEEF.serialized(limits: StorageLimits.beef).map { .number(Double($0)) }
+            )
+        }
+        return encoded
     }
 
     private static func unlockingLength(of unlocking: WalletInputUnlocking) -> UInt32 {

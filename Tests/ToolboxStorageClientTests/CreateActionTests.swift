@@ -1,8 +1,8 @@
 import XCTest
-import BSVWallet
-import ToolboxCore
+import BSVScript
 import BSVTransaction
 import BSVWallet
+import ToolboxCore
 import ToolboxStorage
 @testable import ToolboxStorageClient
 
@@ -34,7 +34,7 @@ final class CreateActionTests: XCTestCase {
     /// The server reads several collections without checking they exist. An omitted empty array
     /// is a crash there, not a default here — `tags` on `listOutputs` proved it.
     func test_theRequestCarriesEveryCollectionEvenWhenEmpty() throws {
-        let arguments = StorageClient.arguments(for: try payment())
+        let arguments = try StorageClient.arguments(for: try payment())
 
         XCTAssertNotNil(arguments["inputs"]?.arrayValue)
         XCTAssertNotNil(arguments["labels"]?.arrayValue)
@@ -49,14 +49,14 @@ final class CreateActionTests: XCTestCase {
     /// Storage must hand the action back rather than completing it. Anything else would mean
     /// storage holds keys, which it does not.
     func test_theRequestAsksStorageToStopBeforeSigning() throws {
-        let arguments = StorageClient.arguments(for: try payment())
+        let arguments = try StorageClient.arguments(for: try payment())
 
         XCTAssertEqual(arguments["isSignAction"]?.boolValue, true)
         XCTAssertEqual(arguments["options"]?["signAndProcess"]?.boolValue, false)
     }
 
     func test_anOutputIsSentAsHexWithItsAmount() throws {
-        let arguments = StorageClient.arguments(for: try payment(satoshis: 4_200))
+        let arguments = try StorageClient.arguments(for: try payment(satoshis: 4_200))
 
         let output = try XCTUnwrap(arguments["outputs"]?.arrayValue?.first)
         XCTAssertEqual(output["lockingScript"]?.stringValue, "76a9")
@@ -141,7 +141,7 @@ final class CreateActionTests: XCTestCase {
             options: try WalletCreateActionOptions(acceptDelayedBroadcast: true, noSend: true)
         )
 
-        let arguments = StorageClient.arguments(for: request)
+        let arguments = try StorageClient.arguments(for: request)
 
         XCTAssertEqual(arguments["options"]?["noSend"]?.boolValue, true)
         XCTAssertEqual(arguments["isNoSend"]?.boolValue, true)
@@ -161,12 +161,45 @@ final class CreateActionTests: XCTestCase {
             )]
         )
 
-        let arguments = StorageClient.arguments(for: request)
+        let arguments = try StorageClient.arguments(for: request)
         let input = try XCTUnwrap(arguments["inputs"]?.arrayValue?.first)
 
         XCTAssertEqual(input["outpoint"]?.stringValue, outpoint)
         XCTAssertEqual(input["unlockingScriptLength"]?.intValue, 107)
         XCTAssertEqual(input["sequenceNumber"]?.intValue, 42)
+    }
+
+    func test_callerInputBEEFIsSerialized() throws {
+        let source = Transaction(
+            version: 1,
+            inputs: [],
+            outputs: [
+                TransactionOutput(
+                    satoshis: 1,
+                    lockingScript: try Script(bytes: [0x51], maximumByteCount: 10_000)
+                ),
+            ],
+            lockTime: 0
+        )
+        let beef = try BEEF(
+            merklePaths: [],
+            transactions: [.raw(source)],
+            limits: StorageLimits.beef
+        )
+        let request = try WalletCreateActionRequest(
+            description: "external input",
+            inputBEEF: beef,
+            outputs: [
+                try WalletCreateActionOutput(
+                    lockingScript: [0x51], satoshis: 1, outputDescription: "x"
+                ),
+            ]
+        )
+
+        let arguments = try StorageClient.arguments(for: request)
+        let sent = try XCTUnwrap(arguments["inputBEEF"]?.arrayValue).compactMap(\.intValue)
+
+        XCTAssertEqual(sent, try beef.serialized(limits: StorageLimits.beef).map(Int.init))
     }
 
     func test_inputBeefIsReadAsAByteArray() throws {

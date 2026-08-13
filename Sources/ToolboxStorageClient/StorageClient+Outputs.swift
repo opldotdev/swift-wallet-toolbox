@@ -36,6 +36,9 @@ extension StorageClient {
         if request.includeCustomInstructions == true {
             arguments["includeCustomInstructions"] = .bool(true)
         }
+        if let include = request.include {
+            arguments["include"] = .string(include.rawValue)
+        }
 
         let result = try await call("listOutputs", [.object(auth.jsonObject), .object(arguments)])
         return try Self.decodeOutputs(result)
@@ -68,9 +71,11 @@ extension StorageClient {
             )
         }
 
+        let beefBytes = try byteArray(result["BEEF"] ?? result["beef"])
+        let beef = try beefBytes.map { try BEEF(bytes: $0, limits: StorageLimits.beef) }
         return try WalletListOutputsResult(
             totalOutputs: UInt32(max(0, total)),
-            beef: nil,
+            beef: beef,
             outputs: outputs
         )
     }

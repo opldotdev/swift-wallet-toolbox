@@ -1,6 +1,9 @@
 import XCTest
+import BSVScript
+import BSVTransaction
 import BSVWallet
 import ToolboxCore
+import ToolboxStorage
 @testable import ToolboxStorageClient
 
 /// Turning the store's answer into outputs.
@@ -39,6 +42,36 @@ final class OutputDecodingTests: XCTestCase {
 
         XCTAssertEqual(decoded.totalOutputs, 0)
         XCTAssertTrue(decoded.outputs.isEmpty)
+        XCTAssertNil(decoded.beef)
+    }
+
+    func test_entireTransactionBEEFIsDecoded() throws {
+        let source = Transaction(
+            version: 1,
+            inputs: [],
+            outputs: [
+                TransactionOutput(
+                    satoshis: 1,
+                    lockingScript: try Script(bytes: [0x51], maximumByteCount: 10_000)
+                ),
+            ],
+            lockTime: 0
+        )
+        let beef = try BEEF(
+            merklePaths: [],
+            transactions: [.raw(source)],
+            limits: StorageLimits.beef
+        )
+        let bytes = try beef.serialized(limits: StorageLimits.beef)
+        let array = bytes.map(String.init).joined(separator: ",")
+        let decoded = try StorageClient.decodeOutputs(try result("""
+            {"totalOutputs": 0, "outputs": [], "BEEF": [\(array)]}
+            """))
+
+        XCTAssertEqual(
+            try decoded.beef?.serialized(limits: StorageLimits.beef),
+            bytes
+        )
     }
 
     /// An unspendable output still exists and still has to be reported. Dropping it would hide a
