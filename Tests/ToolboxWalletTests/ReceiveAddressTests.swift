@@ -34,19 +34,29 @@ final class ReceiveAddressTests: XCTestCase {
         )
     }
 
+    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "p 1sat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-13.
+    private let depositAddresses = [
+        "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc",
+        "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz",
+        "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y",
+        "1Ao2nLUR9r1gyfwWVtex5SbRpEkPUo147C",
+        "13UNnQTCcRsSRjTSTX27CUZ1PZBQyee14o",
+        "1P52KZuMLJhXYLc8rmULvf3swsY1h24pea",
+        "19A5k4UXqaqwzhY4qmbk5SCZh8MHsD6p9E",
+        "197U2wbdyaTb2i8MkCgeCJmsffgbASaj61",
+        "18YComjX76MyjgnnsrHUixgvT3m3DbEPjU",
+        "18r2S3wm1UA1rxTWW1DfmHXfiJUtHYFrz5",
+    ]
+
     /// A restored wallet regenerates the same address set from the phrase alone — the whole point
     /// of a deterministic receive address.
     func test_aRestoredWalletRegeneratesTheSameAddresses() throws {
         let wallet = try RemoteWallet.restore(fromPhrase: phrase)
 
-        XCTAssertEqual(try wallet.receiveAddress(index: 0), "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc")
+        XCTAssertEqual(try wallet.receiveAddress(index: 0), depositAddresses[0])
         XCTAssertEqual(
-            try wallet.receiveAddresses(startIndex: 0, count: 3),
-            [
-                "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc",
-                "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz",
-                "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y",
-            ]
+            try wallet.receiveAddresses(startIndex: 0, count: 10),
+            depositAddresses
         )
     }
 
