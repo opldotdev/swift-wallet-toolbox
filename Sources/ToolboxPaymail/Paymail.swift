@@ -297,8 +297,13 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
     }
 
     public func get(_ url: URL) async throws -> (status: Int, body: [UInt8]) {
+#if canImport(Darwin)
         let (stream, response) = try await session.bytes(from: url)
         return try await read(stream: stream, response: response)
+#else
+        let (data, response) = try await session.data(from: url)
+        return try read(data: data, response: response)
+#endif
     }
 
     public func post(_ url: URL, json: [UInt8]) async throws -> (status: Int, body: [UInt8]) {
@@ -306,10 +311,16 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = Data(json)
+#if canImport(Darwin)
         let (stream, response) = try await session.bytes(for: request)
         return try await read(stream: stream, response: response)
+#else
+        let (data, response) = try await session.data(for: request)
+        return try read(data: data, response: response)
+#endif
     }
 
+#if canImport(Darwin)
     private func read(
         stream: URLSession.AsyncBytes,
         response: URLResponse
@@ -324,6 +335,17 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
         }
         return ((response as? HTTPURLResponse)?.statusCode ?? 0, body)
     }
+#else
+    private func read(
+        data: Data,
+        response: URLResponse
+    ) throws -> (status: Int, body: [UInt8]) {
+        guard data.count <= maximumResponseBytes else {
+            throw PaymailError.unreadableResponse
+        }
+        return ((response as? HTTPURLResponse)?.statusCode ?? 0, Array(data))
+    }
+#endif
 }
 
 public enum PaymailError: Error, Equatable, Sendable {

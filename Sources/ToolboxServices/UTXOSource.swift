@@ -63,10 +63,15 @@ public struct URLSessionHTTPGet: HTTPGet {
     }
 
     public func get(_ url: URL) async throws -> (status: Int, body: [UInt8]) {
+#if canImport(Darwin)
         let (stream, response) = try await session.bytes(from: url)
+#else
+        let (data, response) = try await session.data(from: url)
+#endif
         guard let http = response as? HTTPURLResponse else {
             throw UTXOSourceError.httpFailure(provider: url.host ?? "http", statusCode: 0)
         }
+#if canImport(Darwin)
         var bytes: [UInt8] = []
         for try await byte in stream {
             bytes.append(byte)
@@ -76,6 +81,14 @@ public struct URLSessionHTTPGet: HTTPGet {
                 )
             }
         }
+#else
+        guard data.count <= maximumResponseBytes else {
+            throw UTXOSourceError.httpFailure(
+                provider: url.host ?? "http", statusCode: http.statusCode
+            )
+        }
+        let bytes = Array(data)
+#endif
         return (http.statusCode, bytes)
     }
 }
