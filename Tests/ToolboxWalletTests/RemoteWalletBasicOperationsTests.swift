@@ -91,6 +91,62 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         XCTAssertEqual(params?[1]["reference"]?.stringValue, "AQID")
     }
 
+    func test_listActionsForwardsAndBlocksStorageCustomInstructions() async throws {
+        let txid = String(repeating: "77", count: 32)
+        let (wallet, transport) = try wallet(answers: ["""
+            {"result":{"totalActions":1,"actions":[{
+              "txid":"\(txid)","satoshis":12,"status":"completed",
+              "isOutgoing":false,"description":"received","labels":["income"],
+              "version":1,"lockTime":0,"inputs":[],"outputs":[{
+                "satoshis":12,"lockingScript":"51","spendable":true,
+                "customInstructions":"storage-only secret","tags":["kind:test"],
+                "outputIndex":0,"outputDescription":"received output","basket":"apps"
+              }]
+            }]}}
+            """])
+        let request = try WalletListActionsRequest(
+            labels: ["income"],
+            labelQueryMode: .all,
+            includeLabels: true,
+            includeInputs: true,
+            includeOutputs: true,
+            includeOutputLockingScripts: true
+        )
+
+        let result = try await wallet.listActions(request)
+
+        XCTAssertEqual(result.totalActions, 1)
+        XCTAssertEqual(result.actions[0].labels, ["income"])
+        XCTAssertEqual(result.actions[0].inputs, [])
+        XCTAssertEqual(result.actions[0].outputs?[0].lockingScript, [0x51])
+        XCTAssertNil(
+            result.actions[0].outputs?[0].customInstructions,
+            "the live TypeScript wallet strips storage-private instructions"
+        )
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["labels"]?.arrayValue?.compactMap(\.stringValue), ["income"])
+        XCTAssertEqual(arguments?["labelQueryMode"]?.stringValue, "all")
+        XCTAssertEqual(arguments?["includeOutputs"]?.boolValue, true)
+        XCTAssertEqual(arguments?["includeOutputLockingScripts"]?.boolValue, true)
+    }
+
+    func test_historyUsesTheSameSafeListActionsBoundary() async throws {
+        let txid = String(repeating: "88", count: 32)
+        let (wallet, _) = try wallet(answers: ["""
+            {"result":{"totalActions":1,"actions":[{
+              "txid":"\(txid)","satoshis":1,"status":"completed",
+              "isOutgoing":false,"description":"history","version":1,"lockTime":0,
+              "outputs":[{"satoshis":1,"spendable":true,
+                "customInstructions":"storage-only secret","tags":[],"outputIndex":0,
+                "outputDescription":"output","basket":"apps"}]
+            }]}}
+            """])
+
+        let result = try await wallet.history()
+
+        XCTAssertNil(result.actions[0].outputs?[0].customInstructions)
+    }
+
     func test_listOutputsReturnsTheStorageResult() async throws {
         let (wallet, transport) = try wallet(answers: ["""
             {"result":{"totalOutputs":1,"outputs":[{

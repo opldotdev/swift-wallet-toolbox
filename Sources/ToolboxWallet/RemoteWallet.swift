@@ -89,7 +89,7 @@ public struct RemoteWallet: Sendable {
     public func history(
         _ request: WalletListActionsRequest? = nil
     ) async throws -> WalletListActionsResult {
-        try await storage.listActions(auth, request ?? (try WalletListActionsRequest(labels: [])))
+        try await listActions(request ?? (try WalletListActionsRequest(labels: [])))
     }
 
     // MARK: - Receiving
