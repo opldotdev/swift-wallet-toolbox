@@ -1,4 +1,6 @@
 import XCTest
+import BSVScript
+import BSVTransaction
 import BSVWallet
 import ToolboxAuth
 import ToolboxCore
@@ -215,6 +217,57 @@ final class StorageClientTests: XCTestCase {
         )
         XCTAssertEqual(arguments["tagQueryMode"]?.stringValue, "all")
         XCTAssertEqual(arguments["include"]?.stringValue, "locking scripts")
+    }
+
+    func test_internalizeActionSendsCustomInstructionsOnBasketInsertion() async throws {
+        let transport = FakeTransport(json: #"{"result": {"accepted": true}}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        let output = TransactionOutput(
+            satoshis: 1,
+            lockingScript: try Script(bytes: [0x51], maximumByteCount: 10_000)
+        )
+        let tx = Transaction(version: 1, inputs: [], outputs: [output], lockTime: 0)
+        let beef = try BEEF(
+            merklePaths: [],
+            transactions: [.raw(tx)],
+            limits: StorageLimits.beef
+        )
+        let id = try tx.transactionID(limits: StorageLimits.beef.transactionLimits)
+        let atomic = try AtomicBEEF(
+            subjectTransactionID: id, beef: beef, limits: StorageLimits.beef
+        )
+        let insertion = try WalletBasketInsertion(
+            basket: "1sat",
+            customInstructions: "{\"protocolID\":[0,\"p 1sat\"],\"keyID\":\"x\"}",
+            tags: ["origin:aa"]
+        )
+        _ = try await client.internalizeAction(
+            auth,
+            try WalletInternalizeActionRequest(
+                transaction: atomic,
+                description: "move basket",
+                outputs: [
+                    WalletInternalizeOutput(
+                        outputIndex: 0,
+                        remittance: .basketInsertion(insertion)
+                    ),
+                ]
+            )
+        )
+        let params = try await transport.sentEnvelopes()[0]["params"]?.arrayValue
+        let arguments = try XCTUnwrap(params?[1])
+        let outputs = try XCTUnwrap(arguments["outputs"]?.arrayValue)
+        XCTAssertEqual(outputs[0]["protocol"]?.stringValue, "basket insertion")
+        let remittance = try XCTUnwrap(outputs[0]["insertionRemittance"])
+        XCTAssertEqual(remittance["basket"]?.stringValue, "1sat")
+        XCTAssertEqual(
+            remittance["customInstructions"]?.stringValue,
+            "{\"protocolID\":[0,\"p 1sat\"],\"keyID\":\"x\"}"
+        )
+        XCTAssertEqual(
+            remittance["tags"]?.arrayValue?.compactMap(\.stringValue),
+            ["origin:aa"]
+        )
     }
 
     // MARK: - Availability

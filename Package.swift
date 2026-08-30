@@ -189,6 +189,8 @@ let package = Package(
                 "ToolboxStorageClient", "ToolboxStorage", "ToolboxAuth", "ToolboxCore",
                 .product(name: "BSVWallet", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVScript", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
             ]
         ),
         .testTarget(name: "ToolboxServicesTests", dependencies: ["ToolboxServices"]),

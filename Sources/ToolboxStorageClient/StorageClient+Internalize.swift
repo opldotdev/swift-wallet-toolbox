@@ -31,13 +31,17 @@ extension StorageClient {
                     ]),
                 ])
             case .basketInsertion(let insertion):
+                var remittance: [String: JSONValue] = [
+                    "basket": .string(insertion.basket),
+                    "tags": .array(insertion.tags.map { .string($0) }),
+                ]
+                if let instructions = insertion.customInstructions {
+                    remittance["customInstructions"] = .string(instructions)
+                }
                 return .object([
                     "outputIndex": .number(Double(output.outputIndex)),
                     "protocol": .string("basket insertion"),
-                    "insertionRemittance": .object([
-                        "basket": .string(insertion.basket),
-                        "tags": .array(insertion.tags.map { .string($0) }),
-                    ]),
+                    "insertionRemittance": .object(remittance),
                 ])
             }
         }

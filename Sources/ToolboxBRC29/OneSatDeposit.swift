@@ -4,9 +4,10 @@ import BSVKeys
 ///
 /// This is a 1Sat-ecosystem convention, not a generic BRC-100 one, and it is **not** BRC-29. The
 /// current `@1sat/actions` `deriveDepositAddresses` derives self-referentially under protocol
-/// `[0, "p 1sat"]` with the key identifier `"1sat <index>"` — a BRC-42 child of the identity key
+/// `[0, "onesat"]` with the key identifier `"1sat <index>"` — a BRC-42 child of the identity key
 /// with the identity key as its own counterparty. Any wallet that binds the same identity key
-/// derives the same default addresses without coordinating.
+/// derives the same default addresses without coordinating. Spends still use the protocolID
+/// recorded in customInstructions, including legacy `[0, "p 1sat"]` rows.
 ///
 /// The protocol owner is `OneSatAddresses.DepositAddresses` in `swift-1sat-sdk`, which mirrors
 /// `@1sat/actions` `deriveDepositAddresses` (including a caller-chosen prefix). This type is a
@@ -27,10 +28,11 @@ public enum OneSatDeposit {
 
     /// The BRC-43 invoice number the derivation runs against.
     ///
-    /// Security level 0, protocol name `"p 1sat"`, key identifier `"1sat <index>"`. The exact
-    /// string `@bsv/sdk` computes for `getPublicKey([0, "p 1sat"], "1sat <index>")`.
+    /// Security level 0, protocol name `"onesat"`, key identifier `"1sat <index>"`. The exact
+    /// string `@bsv/sdk` computes for `getPublicKey([0, "onesat"], "1sat <index>")`.
+    /// `"1sat"` is 4 characters; BRC-100 protocol names must be at least 5.
     static func invoiceNumber(index: Int) -> String {
-        "0-p 1sat-\(prefix) \(index)"
+        "0-onesat-\(prefix) \(index)"
     }
 
     /// The private key that receives at a given index.
