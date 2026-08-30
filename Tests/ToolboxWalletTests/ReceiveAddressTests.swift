@@ -5,7 +5,7 @@ import ToolboxBRC29
 
 /// Deriving receiving addresses the way the live 1Sat ecosystem does.
 ///
-/// The expected addresses come from the same reference derivation: self-derivation under protocol [0, "p 1sat"] with keyID
+/// The expected addresses come from the same reference derivation: self-derivation under protocol [0, "onesat"] with keyID
 /// "1sat <index>" — the current @1sat/actions deriveDepositAddresses convention. If these drift, the wallet shows different
 /// addresses than the live ecosystem and received money is invisible.
 final class ReceiveAddressTests: XCTestCase {
@@ -22,30 +22,30 @@ final class ReceiveAddressTests: XCTestCase {
 
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 0).description,
-            "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc"
+            "1QJvLPW2fRZsFqcncVfS3p4PaeMMCcrwnx"
         )
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 1).description,
-            "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz"
+            "1ACGfnV2DrzzY3cBUWvN6BZae8s9AU3YhH"
         )
         XCTAssertEqual(
             try OneSatDeposit.address(identity: identity, index: 2).description,
-            "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y"
+            "1KWFd6YZghV2kZHWwFhKodVH7eocbpZ3fA"
         )
     }
 
-    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "p 1sat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-13.
+    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "onesat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-28.
     private let depositAddresses = [
-        "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc",
-        "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz",
-        "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y",
-        "1Ao2nLUR9r1gyfwWVtex5SbRpEkPUo147C",
-        "13UNnQTCcRsSRjTSTX27CUZ1PZBQyee14o",
-        "1P52KZuMLJhXYLc8rmULvf3swsY1h24pea",
-        "19A5k4UXqaqwzhY4qmbk5SCZh8MHsD6p9E",
-        "197U2wbdyaTb2i8MkCgeCJmsffgbASaj61",
-        "18YComjX76MyjgnnsrHUixgvT3m3DbEPjU",
-        "18r2S3wm1UA1rxTWW1DfmHXfiJUtHYFrz5",
+        "1QJvLPW2fRZsFqcncVfS3p4PaeMMCcrwnx",
+        "1ACGfnV2DrzzY3cBUWvN6BZae8s9AU3YhH",
+        "1KWFd6YZghV2kZHWwFhKodVH7eocbpZ3fA",
+        "1EyBKgtgkd4X4EQqxJX18Yi8huTsbHH2QX",
+        "1AYA2Qgr5Lyq3Utf8GHnKUPhRz5fB5qrjH",
+        "1LV3J6GpPDm4G8rT5itKbQAiu1rw1CRMnT",
+        "1Lnj566VgNguoSZJwpqNo1BCcY2p3aiYM7",
+        "1CRGL1tNfwKXzz69Wcpz7WYbxgAM9jdFmB",
+        "141sNrPhVAU4FzMY9pGKnhU36opmVkUFoP",
+        "18MQLhTfJM8yA59dHxdfchKzgPPF4CqEaK",
     ]
 
     /// A restored wallet regenerates the same address set from the phrase alone — the whole point

@@ -13,32 +13,32 @@ final class OneSatDepositTests: XCTestCase {
     private let abandonIdentityHex =
         "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1"
 
-    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "p 1sat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-13.
+    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "onesat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-28.
     private let depositAddresses = [
-        "18Dg5KjZsS4fTPZYTvNP9z76WySuB8XSLc",
-        "1JKT82gZGUCMo9PU7Hjrqa9rKBtcj9khPz",
-        "1BdMVZzcu9G67hrfQFMnae6EFkrzJCDC9y",
-        "1Ao2nLUR9r1gyfwWVtex5SbRpEkPUo147C",
-        "13UNnQTCcRsSRjTSTX27CUZ1PZBQyee14o",
-        "1P52KZuMLJhXYLc8rmULvf3swsY1h24pea",
-        "19A5k4UXqaqwzhY4qmbk5SCZh8MHsD6p9E",
-        "197U2wbdyaTb2i8MkCgeCJmsffgbASaj61",
-        "18YComjX76MyjgnnsrHUixgvT3m3DbEPjU",
-        "18r2S3wm1UA1rxTWW1DfmHXfiJUtHYFrz5",
+        "1QJvLPW2fRZsFqcncVfS3p4PaeMMCcrwnx",
+        "1ACGfnV2DrzzY3cBUWvN6BZae8s9AU3YhH",
+        "1KWFd6YZghV2kZHWwFhKodVH7eocbpZ3fA",
+        "1EyBKgtgkd4X4EQqxJX18Yi8huTsbHH2QX",
+        "1AYA2Qgr5Lyq3Utf8GHnKUPhRz5fB5qrjH",
+        "1LV3J6GpPDm4G8rT5itKbQAiu1rw1CRMnT",
+        "1Lnj566VgNguoSZJwpqNo1BCcY2p3aiYM7",
+        "1CRGL1tNfwKXzz69Wcpz7WYbxgAM9jdFmB",
+        "141sNrPhVAU4FzMY9pGKnhU36opmVkUFoP",
+        "18MQLhTfJM8yA59dHxdfchKzgPPF4CqEaK",
     ]
 
-    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "p 1sat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-13.
+    /// bun `@bsv/sdk` KeyDeriver protocol `[0, "onesat"]` keyID `"1sat <i>"` counterparty self forSelf; abandon identity `5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1`; 2026-08-28.
     private let depositPublicKeys = [
-        "027f3c674f462912e89eacddce2c8133b7be63d2f647375dcab7c03033a43e8b21",
-        "0333d3b568e30466cc10b6ba0fd565af4eafe80a96806b228b80cebd01a820349a",
-        "0254b40ff590e454a57a95493e17eb15d4aff99541ca4c1b42f5942f26bbb0f394",
-        "03468d8a6d1668e0075f965ba9b6c208af577be5e12f71debfcf4e0646924cd7df",
-        "0383e328e4d9872c513e4fae240861e22003240f8de30359343f224204a98abdff",
-        "02e2d77735ab93a531ee81586e20ed924fd4708c2d69360aaf8ffe3c5586636ff2",
-        "02ffa998d4d1248cad42692e656ee6ee3c358858c143f4ec61832b1750da6dee78",
-        "036c315cdf1c552b8b15a6f10267131efa6d223371691ca85ed2604ac62fc0c0a6",
-        "03a8fa6014017b92e2b0cc21962872d42df353bd72060a1d95c298b28f0428f90c",
-        "038dffb81fd25c697e773e65c6a62726ef42242487fd27667a2c57af791ab7a13d",
+        "020c778686118af71d0e0a11e63cec2357640ae7c2100f4969c3d2336b99aa0a87",
+        "02635ca4953a033aad8c69ad9780fd0f2b31ffa14d887185701ee688c9289f197f",
+        "02c31e6433acb6c6b0b22e0443dccc91c931a16ff873e1cbcd60355c8f9ee22905",
+        "0331c1dac77f7e2acc2049e9fc7d534e6a62cb3941284aa816bec8424705b58f35",
+        "03ff7b751ad251d1e7d53b54fb59a81fa124e9d2d0ea38fa42051bd3ddf8ef14f8",
+        "023a524765f66e554e7c39b0c1105f37465f16f682ccc84a35fcc49fcc8069f6d9",
+        "035db554a3710aa3a4749216763cb43d8efa05980b0c3f5ae2bb608ceb6a0fc3bd",
+        "02c40df6fbb72bd57efdf5213d346561048cd582292af4409f33cb8c881fa3ee2a",
+        "02c721f01dd5ba4c87e7c50c3e8a5689e0e6569a1ed6226910bcec6de8b3979491",
+        "0242b8fffda863c1703355da4306b664aef0eec67ef490e8439131efba1da6a79c",
     ]
 
     private func identity() throws -> PrivateKey {
@@ -57,9 +57,9 @@ final class OneSatDepositTests: XCTestCase {
     }
 
     func test_invoiceNumberMatchesThe1SatKeyID() {
-        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 0), "0-p 1sat-1sat 0")
-        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 1), "0-p 1sat-1sat 1")
-        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 9), "0-p 1sat-1sat 9")
+        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 0), "0-onesat-1sat 0")
+        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 1), "0-onesat-1sat 1")
+        XCTAssertEqual(OneSatDeposit.invoiceNumber(index: 9), "0-onesat-1sat 9")
     }
 
     func test_addressesMatchThe1SatReference() throws {
