@@ -21,9 +21,11 @@ import ToolboxStorageClient
 /// It is a `struct` around an actor `StorageClient`: the mutable state lives in the client, and
 /// concurrent payments serialize there.
 public struct RemoteWallet: Sendable {
-    private let storage: StorageClient
+    // Internal so capability extensions can compose the same authenticated storage client without
+    // exposing it as part of the public wallet API.
+    let storage: StorageClient
     private let identityKey: PrivateKey
-    private let auth: AuthID
+    let auth: AuthID
     /// The most this wallet will pay to miners on any single payment, in satoshis. A payment whose
     /// funding would exceed it is refused before signing rather than silently overpaid.
     public let maximumFee: Int64

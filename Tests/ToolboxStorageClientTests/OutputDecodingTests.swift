@@ -141,4 +141,38 @@ final class OutputDecodingTests: XCTestCase {
             try StorageClient.decodeOutputs(try result(#"{"totalOutputs": 0}"#))
         )
     }
+
+    func test_aNegativeTotalIsRefused() throws {
+        XCTAssertThrowsError(
+            try StorageClient.decodeOutputs(
+                try result(#"{"totalOutputs": -1, "outputs": []}"#)
+            )
+        )
+    }
+
+    func test_aTotalLargerThanTheABIIsRefusedWithoutTrapping() throws {
+        XCTAssertThrowsError(
+            try StorageClient.decodeOutputs(
+                try result(#"{"totalOutputs": 4294967296, "outputs": []}"#)
+            )
+        )
+    }
+
+    func test_aMalformedPresentLockingScriptIsRefused() throws {
+        XCTAssertThrowsError(try StorageClient.decodeOutputs(try result("""
+            {"totalOutputs": 1, "outputs": [{
+              "outpoint": "8ac7230489e80000000000000000000000000000000000000000000000000001.0",
+              "satoshis": 10, "spendable": true, "lockingScript": "not-hex"
+            }]}
+            """)))
+    }
+
+    func test_malformedPresentCustomInstructionsAreRefused() throws {
+        XCTAssertThrowsError(try StorageClient.decodeOutputs(try result("""
+            {"totalOutputs": 1, "outputs": [{
+              "outpoint": "8ac7230489e80000000000000000000000000000000000000000000000000001.0",
+              "satoshis": 10, "spendable": true, "customInstructions": 7
+            }]}
+            """)))
+    }
 }

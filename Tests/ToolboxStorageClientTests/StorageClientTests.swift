@@ -219,6 +219,35 @@ final class StorageClientTests: XCTestCase {
         XCTAssertEqual(arguments["include"]?.stringValue, "locking scripts")
     }
 
+    func test_abortActionRequiresTheStorageDecision() async throws {
+        let transport = FakeTransport(json: #"{"result": {}}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        let request = WalletAbortActionRequest(reference: try WalletBase64Data([1, 2, 3]))
+
+        do {
+            _ = try await client.abortAction(auth, request)
+            XCTFail("a missing aborted decision must not become success")
+        } catch let error as StorageClientError {
+            XCTAssertEqual(error, .unreadableResponse(method: "abortAction"))
+        }
+    }
+
+    func test_relinquishOutputRequiresTheStorageUpdateCount() async throws {
+        let transport = FakeTransport(json: #"{"result": {"relinquished": true}}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        let output = try Outpoint(
+            "0000000000000000000000000000000000000000000000000000000000000001.0"
+        )
+        let request = try WalletRelinquishOutputRequest(basket: "app", output: output)
+
+        do {
+            _ = try await client.relinquishOutput(auth, request)
+            XCTFail("a wallet-shaped result is not the storage update-count result")
+        } catch let error as StorageClientError {
+            XCTAssertEqual(error, .unreadableResponse(method: "relinquishOutput"))
+        }
+    }
+
     func test_internalizeActionSendsCustomInstructionsOnBasketInsertion() async throws {
         let transport = FakeTransport(json: #"{"result": {"accepted": true}}"#)
         let client = StorageClient(endpoint: endpoint, transport: transport)

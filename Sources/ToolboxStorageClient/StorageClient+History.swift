@@ -68,7 +68,10 @@ extension StorageClient {
             "abortAction",
             [.object(auth.jsonObject), .object(["reference": .string(request.reference.base64)])]
         )
-        return WalletAbortActionResult(aborted: result["aborted"]?.boolValue ?? true)
+        guard let aborted = result["aborted"]?.boolValue else {
+            throw StorageClientError.unreadableResponse(method: "abortAction")
+        }
+        return WalletAbortActionResult(aborted: aborted)
     }
 
     /// Gives up tracking an output — it stays on chain, the wallet just stops counting it.
@@ -82,6 +85,13 @@ extension StorageClient {
                 "output": .string(request.output.description),
             ]),
         ])
-        return WalletRelinquishOutputResult(relinquished: result["relinquished"]?.boolValue ?? true)
+        // The storage contract returns its update count, while BRC-100 returns a boolean. The live
+        // TypeScript wallet considers any successful storage call relinquished; the count is not
+        // part of the public result. Still require the actual storage shape so a null or truncated
+        // response cannot silently become success.
+        guard let updated = result.intValue, updated >= 0 else {
+            throw StorageClientError.unreadableResponse(method: "relinquishOutput")
+        }
+        return WalletRelinquishOutputResult(relinquished: true)
     }
 }
