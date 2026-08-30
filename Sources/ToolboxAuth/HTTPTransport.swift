@@ -74,13 +74,18 @@ public struct URLSessionHTTPTransport: HTTPTransport {
             urlRequest.httpBody = Data(body)
         }
 
-        // Streamed rather than buffered whole, so an oversized body is cut off as it arrives
-        // instead of after it has all been held in memory.
+        // Darwin streams so an oversized body is cut off as it arrives. FoundationNetworking
+        // does not expose AsyncBytes, so Linux uses its data API and enforces the same decoded cap.
+#if canImport(Darwin)
         let (stream, response) = try await session.bytes(for: urlRequest)
+#else
+        let (data, response) = try await session.data(for: urlRequest)
+#endif
         guard let http = response as? HTTPURLResponse else {
             throw AuthTransportError.transportFailed("the response was not HTTP")
         }
 
+#if canImport(Darwin)
         var bytes: [UInt8] = []
         bytes.reserveCapacity(min(maximumResponseBytes, 64 << 10))
         do {
@@ -93,6 +98,14 @@ public struct URLSessionHTTPTransport: HTTPTransport {
                 }
             }
         }
+#else
+        guard data.count <= maximumResponseBytes else {
+            throw AuthTransportError.transportFailed(
+                "the response exceeded \(maximumResponseBytes) bytes"
+            )
+        }
+        let bytes = Array(data)
+#endif
 
         var headers: [String: String] = [:]
         for (name, value) in http.allHeaderFields {
