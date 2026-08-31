@@ -86,6 +86,9 @@ public struct BRC39Envelope: Equatable, Sendable {
         guard iterations > 0 else { throw BRC39Error.invalidIterations }
         guard memoryKiB > 0 else { throw BRC39Error.invalidMemory }
         guard parallelism > 0 else { throw BRC39Error.invalidParallelism }
+        // RFC 9106 requires m >= 8*p. Division avoids overflowing a narrower multiplication if
+        // these wire widths change independently in a future envelope version.
+        guard memoryKiB / 8 >= UInt32(parallelism) else { throw BRC39Error.invalidMemory }
         guard derivedKeyByteCount == 32 else { throw BRC39Error.invalidDerivedKeyLength }
         guard iterations <= limits.maximumIterations else { throw BRC39Error.iterationsTooLarge }
         guard memoryKiB <= limits.maximumMemoryKiB else { throw BRC39Error.memoryTooLarge }

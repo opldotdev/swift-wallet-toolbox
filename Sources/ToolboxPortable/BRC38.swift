@@ -1,22 +1,44 @@
 import Foundation
-import ToolboxCore
 
-public typealias BRC38PortableRow = [String: JSONValue]
+public typealias BRC38PortableRow = BRC38JSONObject
 
 /// Resource bounds applied before and during BRC-38 parsing.
 public struct BRC38Limits: Equatable, Sendable {
     public let maximumUTF8ByteCount: Int
     public let maximumRowCount: Int
+    public let maximumTotalValueCount: Int
+    public let maximumTotalObjectMemberCount: Int
+    public let maximumTotalArrayElementCount: Int
 
-    public init(maximumUTF8ByteCount: Int, maximumRowCount: Int) {
+    public init(
+        maximumUTF8ByteCount: Int,
+        maximumRowCount: Int,
+        maximumTotalValueCount: Int = 16_000_000,
+        maximumTotalObjectMemberCount: Int = 12_000_000,
+        maximumTotalArrayElementCount: Int = 2_000_000
+    ) {
         self.maximumUTF8ByteCount = maximumUTF8ByteCount
         self.maximumRowCount = maximumRowCount
+        self.maximumTotalValueCount = maximumTotalValueCount
+        self.maximumTotalObjectMemberCount = maximumTotalObjectMemberCount
+        self.maximumTotalArrayElementCount = maximumTotalArrayElementCount
     }
 
     public static let standard = BRC38Limits(
         maximumUTF8ByteCount: 64 << 20,
-        maximumRowCount: 1_000_000
+        maximumRowCount: 1_000_000,
+        maximumTotalValueCount: 16_000_000,
+        maximumTotalObjectMemberCount: 12_000_000,
+        maximumTotalArrayElementCount: 2_000_000
     )
+
+    var isValid: Bool {
+        maximumUTF8ByteCount > 0
+            && maximumRowCount >= 0
+            && maximumTotalValueCount > 0
+            && maximumTotalObjectMemberCount >= 0
+            && maximumTotalArrayElementCount >= 0
+    }
 }
 
 public struct BRC38Tables: Equatable, Sendable {
@@ -117,18 +139,12 @@ public struct BRC38WalletData: Equatable, Sendable {
         _ json: String,
         limits: BRC38Limits = .standard
     ) throws -> BRC38WalletData {
+        guard limits.isValid else { throw BRC38Error.canonicalization }
         let bytes = Array(json.utf8)
         guard bytes.count <= limits.maximumUTF8ByteCount else {
             throw BRC38Error.documentTooLarge(maximumByteCount: limits.maximumUTF8ByteCount)
         }
-        try StrictJSONPreflight.validate(bytes)
-
-        let root: JSONValue
-        do {
-            root = try JSONDecoder().decode(JSONValue.self, from: Data(bytes))
-        } catch {
-            throw BRC38Error.invalidJSON
-        }
+        let root = try StrictJSONPreflight.decode(bytes, limits: limits)
         try BRC38Validator.rejectNulls(root, path: "document")
         guard let object = root.objectValue else { throw BRC38Error.expectedObject("document") }
         try rejectUnknownFields(object, allowed: documentFields, path: "document")
@@ -174,7 +190,7 @@ public struct BRC38WalletData: Equatable, Sendable {
     }
 
     private static func rejectUnknownFields(
-        _ object: [String: JSONValue],
+        _ object: BRC38JSONObject,
         allowed: Set<String>,
         path: String
     ) throws {
@@ -200,8 +216,10 @@ public struct BRC38WalletData: Equatable, Sendable {
 public enum BRC38Error: Error, Equatable, Sendable {
     case invalidJSON
     case duplicateJSONKey(String)
-    case ambiguousJSONKey(String)
     case documentTooLarge(maximumByteCount: Int)
+    case tooManyJSONValues(maximum: Int)
+    case tooManyJSONObjectMembers(maximum: Int)
+    case tooManyJSONArrayElements(maximum: Int)
     case tooManyRows(maximum: Int)
     case missingField(String)
     case unknownField(String)
@@ -225,8 +243,13 @@ extension BRC38Error: LocalizedError {
         switch self {
         case .invalidJSON: "Invalid BRC-38 JSON"
         case .duplicateJSONKey(let key): "BRC-38 JSON contains duplicate key \(key)"
-        case .ambiguousJSONKey(let key): "BRC-38 JSON contains a key Swift cannot preserve: \(key)"
         case .documentTooLarge(let maximum): "BRC-38 document exceeds \(maximum) bytes"
+        case .tooManyJSONValues(let maximum):
+            "BRC-38 JSON exceeds \(maximum) total values"
+        case .tooManyJSONObjectMembers(let maximum):
+            "BRC-38 JSON exceeds \(maximum) total object members"
+        case .tooManyJSONArrayElements(let maximum):
+            "BRC-38 JSON exceeds \(maximum) total array elements"
         case .tooManyRows(let maximum): "BRC-38 document exceeds \(maximum) rows"
         case .missingField(let path): "BRC-38 is missing \(path)"
         case .unknownField(let path): "BRC-38 contains unsupported field \(path)"

@@ -1,5 +1,4 @@
 import Foundation
-import ToolboxCore
 
 enum BRC38Validator {
     private static let requiredFields: [String: Set<String>] = [
@@ -139,7 +138,7 @@ enum BRC38Validator {
     ]
 
     static func validate(_ data: BRC38WalletData, limits: BRC38Limits) throws {
-        guard limits.maximumUTF8ByteCount > 0, limits.maximumRowCount >= 0 else {
+        guard limits.isValid else {
             throw BRC38Error.canonicalization
         }
         guard data.tables.rowCount <= limits.maximumRowCount else {
@@ -148,7 +147,7 @@ enum BRC38Validator {
         try rejectNulls(.object(data.sourceStorage), path: "sourceStorage")
         try rejectNulls(.object(data.user), path: "user")
         for (name, kind, rows) in rowGroups(data.tables) {
-            try rejectNulls(.array(rows.map(JSONValue.object)), path: "tables.\(name)")
+            try rejectNulls(.array(rows.map(BRC38JSONValue.object)), path: "tables.\(name)")
             try validateRows(kind, rows, path: name)
         }
         try timestamp(.string(data.exportedAt), path: "exportedAt")
@@ -177,7 +176,7 @@ enum BRC38Validator {
         ]
     }
 
-    static func rejectNulls(_ value: JSONValue, path: String) throws {
+    static func rejectNulls(_ value: BRC38JSONValue, path: String) throws {
         switch value {
         case .null:
             throw BRC38Error.nullValue(path)
@@ -194,12 +193,12 @@ enum BRC38Validator {
         }
     }
 
-    static func row(_ value: JSONValue?, path: String) throws -> BRC38PortableRow {
+    static func row(_ value: BRC38JSONValue?, path: String) throws -> BRC38PortableRow {
         guard let object = value?.objectValue else { throw BRC38Error.expectedObject(path) }
         return object
     }
 
-    static func rows(_ tables: [String: JSONValue], _ name: String) throws -> [BRC38PortableRow] {
+    static func rows(_ tables: BRC38JSONObject, _ name: String) throws -> [BRC38PortableRow] {
         guard let values = tables[name]?.arrayValue else {
             throw BRC38Error.expectedArray("tables.\(name)")
         }
@@ -245,7 +244,7 @@ enum BRC38Validator {
         }
     }
 
-    private static func timestamp(_ value: JSONValue?, path: String) throws {
+    private static func timestamp(_ value: BRC38JSONValue?, path: String) throws {
         guard let string = value?.stringValue,
               string.utf8.count == 24,
               string.utf8.enumerated().allSatisfy({ offset, byte in
@@ -267,7 +266,7 @@ enum BRC38Validator {
         }
     }
 
-    private static func base64(_ value: JSONValue?, path: String) throws {
+    private static func base64(_ value: BRC38JSONValue?, path: String) throws {
         guard let string = value?.stringValue,
               string.utf8.count.isMultiple(of: 4),
               let decoded = Data(base64Encoded: string),
@@ -339,14 +338,14 @@ enum BRC38Validator {
         }
     }
 
-    private static func validateSyncError(_ value: JSONValue?, path: String) throws {
+    private static func validateSyncError(_ value: BRC38JSONValue?, path: String) throws {
         let error = try object(value, path: path)
         _ = try string(error["code"], path: "\(path).code")
         _ = try string(error["description"], path: "\(path).description")
         if error["stack"] != nil { _ = try string(error["stack"], path: "\(path).stack") }
     }
 
-    private static func object(_ value: JSONValue?, path: String) throws -> [String: JSONValue] {
+    private static func object(_ value: BRC38JSONValue?, path: String) throws -> BRC38JSONObject {
         guard let object = value?.objectValue else { throw BRC38Error.invalidJSONField(path) }
         return object
     }
@@ -537,21 +536,21 @@ enum BRC38Validator {
         }
     }
 
-    private static func reference(_ value: JSONValue?, in ids: Set<Int>, _ path: String) throws {
+    private static func reference(_ value: BRC38JSONValue?, in ids: Set<Int>, _ path: String) throws {
         guard ids.contains(try integer(value, path: path)) else {
             throw BRC38Error.relationship(path)
         }
     }
 
     private static func optionalReference(
-        _ value: JSONValue?,
+        _ value: BRC38JSONValue?,
         in ids: Set<Int>,
         _ path: String
     ) throws {
         if value != nil { try reference(value, in: ids, path) }
     }
 
-    static func integer(_ value: JSONValue?, path: String) throws -> Int {
+    static func integer(_ value: BRC38JSONValue?, path: String) throws -> Int {
         guard let integer = value?.intValue,
               integer >= -9_007_199_254_740_991,
               integer <= 9_007_199_254_740_991
@@ -559,14 +558,14 @@ enum BRC38Validator {
         return integer
     }
 
-    static func string(_ value: JSONValue?, path: String) throws -> String {
+    static func string(_ value: BRC38JSONValue?, path: String) throws -> String {
         guard let string = value?.stringValue else { throw BRC38Error.invalidString(path) }
         return string
     }
 }
 
 extension BRC38Tables {
-    func canonicalObject() throws -> [String: JSONValue] {
+    func canonicalObject() throws -> BRC38JSONObject {
         [
             "provenTxs": .array(try sorted(provenTxs, by: ["provenTxId"])),
             "provenTxReqs": .array(try sorted(provenTxReqs, by: ["provenTxReqId"])),
@@ -587,7 +586,7 @@ extension BRC38Tables {
                     BRC38Validator.string(left["fieldName"], path: "fieldName"),
                     BRC38Validator.string(right["fieldName"], path: "fieldName")
                 )
-            }.map(JSONValue.object)),
+            }.map(BRC38JSONValue.object)),
             "syncStates": .array(try sorted(syncStates, by: ["syncStateId"])),
         ]
     }
@@ -595,7 +594,7 @@ extension BRC38Tables {
     private func sorted(
         _ rows: [BRC38PortableRow],
         by fields: [String]
-    ) throws -> [JSONValue] {
+    ) throws -> [BRC38JSONValue] {
         try rows.sorted { left, right in
             for field in fields {
                 let lhs = try BRC38Validator.integer(left[field], path: field)
@@ -603,6 +602,6 @@ extension BRC38Tables {
                 if lhs != rhs { return lhs < rhs }
             }
             return false
-        }.map(JSONValue.object)
+        }.map(BRC38JSONValue.object)
     }
 }

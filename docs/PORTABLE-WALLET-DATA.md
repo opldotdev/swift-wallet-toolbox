@@ -7,12 +7,16 @@ boundary defined by BRC-39.
   Toolbox row shapes and portable encodings, and checks table uniqueness and relationship closure.
   Unknown fields inside a known row are preserved so additive storage-schema fields are not lost.
   Schema integers are limited to the interoperable JavaScript safe-integer range used by the
-  TypeScript Wallet Toolbox.
+  TypeScript Wallet Toolbox. Byte, row, total-value, object-member, and array-element limits are
+  checked by the lexical parser before it builds the corresponding untrusted structures.
 - `BRC38WalletData.canonicalJSON` applies RFC 8785 JCS and the table ordering required by BRC-38.
+  Its portable object representation identifies and sorts names by raw UTF-16, so distinct
+  normalization-equivalent property names remain distinct as JCS requires.
 - `BRC39Envelope.parse` validates and splits the version 1 `WDAT` envelope before any password or
   memory-hard work. It returns zero-copy slices of the input. The default untrusted Argon2id ceiling
   is 16 iterations, 256 MiB, and parallelism 4; a caller may opt into larger explicit bounds on a
-  platform that can safely afford them.
+  platform that can safely afford them. Headers must also satisfy RFC 9106's minimum of 8 KiB of
+  Argon2 memory per lane.
 
 This is not a custody backup format. BRC-38 explicitly excludes root keys, profiles, mnemonics,
 and encrypted runtime snapshots. Do not label a file containing those values as BRC-38 or BRC-39.

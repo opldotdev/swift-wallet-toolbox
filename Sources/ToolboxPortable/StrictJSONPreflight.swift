@@ -1,77 +1,95 @@
 import Foundation
-import ToolboxCore
 
-/// A bounded lexical pass that rejects duplicate object names before `JSONDecoder` loses them in a
-/// Swift dictionary. RFC 8785 requires I-JSON input, whose object names are unique.
+/// A bounded JSON parser for the portable-data boundary.
+///
+/// Structural counters are checked before an array element, object member, or value is decoded and
+/// before an object name enters the duplicate-detection set. This avoids asking Foundation to
+/// allocate an unbounded object graph and preserves RFC 8785 property identity as raw UTF-16.
 struct StrictJSONPreflight {
     private let bytes: [UInt8]
+    private let limits: BRC38Limits
     private var offset = 0
+    private var valueCount = 0
+    private var objectMemberCount = 0
+    private var arrayElementCount = 0
 
-    static func validate(_ bytes: [UInt8]) throws {
-        var parser = StrictJSONPreflight(bytes: bytes)
-        try parser.value(depth: 0)
+    static func decode(_ bytes: [UInt8], limits: BRC38Limits) throws -> BRC38JSONValue {
+        var parser = StrictJSONPreflight(bytes: bytes, limits: limits)
+        let value = try parser.value(depth: 0)
         parser.whitespace()
         guard parser.offset == bytes.count else { throw BRC38Error.invalidJSON }
+        return value
     }
 
-    private mutating func value(depth: Int) throws {
-        guard depth <= JSONValue.maximumDepth else { throw BRC38Error.invalidJSON }
+    private mutating func value(depth: Int) throws -> BRC38JSONValue {
+        guard depth <= BRC38JSONValue.maximumDepth else { throw BRC38Error.invalidJSON }
+        try countValue()
         whitespace()
         guard let byte = peek else { throw BRC38Error.invalidJSON }
         switch byte {
-        case 0x7b: try object(depth: depth + 1) // {
-        case 0x5b: try array(depth: depth + 1) // [
-        case 0x22: _ = try string()
-        case 0x74: try literal([0x74, 0x72, 0x75, 0x65]) // true
-        case 0x66: try literal([0x66, 0x61, 0x6c, 0x73, 0x65]) // false
-        case 0x6e: try literal([0x6e, 0x75, 0x6c, 0x6c]) // null
-        case 0x2d, 0x30 ... 0x39: try number()
-        default: throw BRC38Error.invalidJSON
+        case 0x7b: return .object(try object(depth: depth + 1)) // {
+        case 0x5b: return .array(try array(depth: depth + 1)) // [
+        case 0x22: return .string(try string())
+        case 0x74:
+            try literal([0x74, 0x72, 0x75, 0x65])
+            return .bool(true)
+        case 0x66:
+            try literal([0x66, 0x61, 0x6c, 0x73, 0x65])
+            return .bool(false)
+        case 0x6e:
+            try literal([0x6e, 0x75, 0x6c, 0x6c])
+            return .null
+        case 0x2d, 0x30 ... 0x39:
+            return .number(try number())
+        default:
+            throw BRC38Error.invalidJSON
         }
     }
 
-    private mutating func object(depth: Int) throws {
+    private mutating func object(depth: Int) throws -> BRC38JSONObject {
         try consume(0x7b)
         whitespace()
-        if take(0x7d) { return }
+        if take(0x7d) { return BRC38JSONObject(uncheckedMembers: []) }
 
         var rawNames = Set<[UInt16]>()
-        var swiftNames = Set<String>()
+        var members: [BRC38JSONMember] = []
         while true {
             whitespace()
+            try countObjectMember()
             let name = try string()
             let rawName = Array(name.utf16)
             guard rawNames.insert(rawName).inserted else {
                 throw BRC38Error.duplicateJSONKey(name)
             }
-            // Swift String equality is normalization-aware. Reject a pair that Foundation would
-            // collapse even though its UTF-16 names differ rather than silently losing a value.
-            guard swiftNames.insert(name).inserted else {
-                throw BRC38Error.ambiguousJSONKey(name)
-            }
             whitespace()
             try consume(0x3a)
-            try value(depth: depth)
+            let child = try value(depth: depth)
+            members.append(BRC38JSONMember(
+                property: BRC38JSONProperty(name: name, utf16: rawName),
+                value: child
+            ))
             whitespace()
-            if take(0x7d) { return }
+            if take(0x7d) { return BRC38JSONObject(uncheckedMembers: members) }
             try consume(0x2c)
         }
     }
 
-    private mutating func array(depth: Int) throws {
+    private mutating func array(depth: Int) throws -> [BRC38JSONValue] {
         try consume(0x5b)
         whitespace()
-        if take(0x5d) { return }
+        if take(0x5d) { return [] }
+
+        var values: [BRC38JSONValue] = []
         while true {
-            try value(depth: depth)
+            try countArrayElement()
+            values.append(try value(depth: depth))
             whitespace()
-            if take(0x5d) { return }
+            if take(0x5d) { return values }
             try consume(0x2c)
         }
     }
 
-    /// Returns the decoded JSON string so escaped and literal spellings of one object name compare
-    /// identically. Foundation performs the Unicode and surrogate validation for this one token.
+    /// Foundation performs Unicode and surrogate validation for this single string token.
     private mutating func string() throws -> String {
         let start = offset
         try consume(0x22)
@@ -97,7 +115,8 @@ struct StrictJSONPreflight {
         throw BRC38Error.invalidJSON
     }
 
-    private mutating func number() throws {
+    private mutating func number() throws -> Double {
+        let start = offset
         _ = take(0x2d)
         guard let first = peek else { throw BRC38Error.invalidJSON }
         if first == 0x30 {
@@ -120,6 +139,31 @@ struct StrictJSONPreflight {
             }
             digits()
         }
+        guard let value = Double(String(decoding: bytes[start ..< offset], as: UTF8.self)),
+              value.isFinite
+        else { throw BRC38Error.invalidJSON }
+        return value
+    }
+
+    private mutating func countValue() throws {
+        guard valueCount < limits.maximumTotalValueCount else {
+            throw BRC38Error.tooManyJSONValues(maximum: limits.maximumTotalValueCount)
+        }
+        valueCount += 1
+    }
+
+    private mutating func countObjectMember() throws {
+        guard objectMemberCount < limits.maximumTotalObjectMemberCount else {
+            throw BRC38Error.tooManyJSONObjectMembers(maximum: limits.maximumTotalObjectMemberCount)
+        }
+        objectMemberCount += 1
+    }
+
+    private mutating func countArrayElement() throws {
+        guard arrayElementCount < limits.maximumTotalArrayElementCount else {
+            throw BRC38Error.tooManyJSONArrayElements(maximum: limits.maximumTotalArrayElementCount)
+        }
+        arrayElementCount += 1
     }
 
     private mutating func digits() {
@@ -127,8 +171,8 @@ struct StrictJSONPreflight {
     }
 
     private mutating func literal(_ expected: [UInt8]) throws {
-        guard offset + expected.count <= bytes.count,
-              Array(bytes[offset ..< offset + expected.count]) == expected
+        guard expected.count <= bytes.count - offset,
+              bytes[offset ..< offset + expected.count].elementsEqual(expected)
         else { throw BRC38Error.invalidJSON }
         offset += expected.count
     }

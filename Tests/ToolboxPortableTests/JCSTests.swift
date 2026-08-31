@@ -1,5 +1,4 @@
 import XCTest
-import ToolboxCore
 @testable import ToolboxPortable
 
 final class JCSTests: XCTestCase {
@@ -23,7 +22,7 @@ final class JCSTests: XCTestCase {
     }
 
     func test_propertyNamesSortByUTF16CodeUnits() throws {
-        let object: JSONValue = .object([
+        let object: BRC38JSONValue = .object([
             "€": "Euro Sign",
             "\r": "Carriage Return",
             "דּ": "Hebrew Letter Dalet With Dagesh",
@@ -38,6 +37,18 @@ final class JCSTests: XCTestCase {
             "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\","
                 + "\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\","
                 + "\"😀\":\"Emoji\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}"
+        )
+    }
+
+    func test_normalizationEquivalentPropertyNamesRemainDistinct() throws {
+        let object: BRC38JSONValue = .object([
+            "é": "precomposed",
+            "e\u{301}": "decomposed",
+        ])
+
+        XCTAssertEqual(
+            try JCS.serialize(object),
+            "{\"e\u{301}\":\"decomposed\",\"é\":\"precomposed\"}"
         )
     }
 }

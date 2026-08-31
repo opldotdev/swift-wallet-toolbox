@@ -1,9 +1,8 @@
 import Foundation
-import ToolboxCore
 
 /// RFC 8785 JSON Canonicalization Scheme serialization for the toolbox's JSON value type.
 enum JCS {
-    static func serialize(_ value: JSONValue) throws -> String {
+    static func serialize(_ value: BRC38JSONValue) throws -> String {
         switch value {
         case .null:
             return "null"
@@ -16,8 +15,8 @@ enum JCS {
         case .array(let values):
             return "[" + (try values.map(serialize)).joined(separator: ",") + "]"
         case .object(let object):
-            let entries = try object.keys.sorted(by: utf16Less).map { key in
-                string(key) + ":" + (try serialize(object[key]!))
+            let entries = try object.canonicalMembers.map { member in
+                string(member.property.name) + ":" + (try serialize(member.value))
             }
             return "{" + entries.joined(separator: ",") + "}"
         }

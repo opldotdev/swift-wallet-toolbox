@@ -73,7 +73,41 @@ final class BRC39Tests: XCTestCase {
         }
     }
 
-    private func makeFile(ciphertext: [UInt8] = [1]) -> [UInt8] {
+    func test_argon2MemoryTracksEightKiBPerLaneAtWireBoundaries() throws {
+        let broadLimits = BRC39Limits(
+            maximumFileByteCount: 1_024,
+            maximumIterations: .max,
+            maximumMemoryKiB: .max,
+            maximumParallelism: .max
+        )
+
+        XCTAssertThrowsError(try BRC39Envelope.parse(
+            makeFile(memoryKiB: 7, parallelism: 1), limits: broadLimits
+        )) {
+            XCTAssertEqual($0 as? BRC39Error, .invalidMemory)
+        }
+        XCTAssertNoThrow(try BRC39Envelope.parse(
+            makeFile(memoryKiB: 8, parallelism: 1), limits: broadLimits
+        ))
+
+        XCTAssertThrowsError(try BRC39Envelope.parse(
+            makeFile(memoryKiB: 2_039, parallelism: .max), limits: broadLimits
+        )) {
+            XCTAssertEqual($0 as? BRC39Error, .invalidMemory)
+        }
+        XCTAssertNoThrow(try BRC39Envelope.parse(
+            makeFile(memoryKiB: 2_040, parallelism: .max), limits: broadLimits
+        ))
+        XCTAssertNoThrow(try BRC39Envelope.parse(
+            makeFile(memoryKiB: .max, parallelism: .max), limits: broadLimits
+        ))
+    }
+
+    private func makeFile(
+        ciphertext: [UInt8] = [1],
+        memoryKiB: UInt32 = 131_072,
+        parallelism: UInt8 = 1
+    ) -> [UInt8] {
         var file = [UInt8](repeating: 0, count: 33)
         file.replaceSubrange(0 ..< 4, with: [0x57, 0x44, 0x41, 0x54])
         file[4] = 1
@@ -83,8 +117,13 @@ final class BRC39Tests: XCTestCase {
         file[9] = 32
         file[10] = 32
         file.replaceSubrange(11 ..< 15, with: [0, 0, 0, 7])
-        file.replaceSubrange(15 ..< 19, with: [0, 2, 0, 0])
-        file[19] = 1
+        file.replaceSubrange(15 ..< 19, with: [
+            UInt8(truncatingIfNeeded: memoryKiB >> 24),
+            UInt8(truncatingIfNeeded: memoryKiB >> 16),
+            UInt8(truncatingIfNeeded: memoryKiB >> 8),
+            UInt8(truncatingIfNeeded: memoryKiB),
+        ])
+        file[19] = parallelism
         file[20] = 32
         return file + [UInt8](repeating: 7, count: 32) + [UInt8](repeating: 9, count: 32)
             + ciphertext + [UInt8](repeating: 11, count: 16)

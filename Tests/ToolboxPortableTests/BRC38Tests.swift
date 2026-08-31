@@ -29,7 +29,7 @@ final class BRC38Tests: XCTestCase {
         XCTAssertTrue(canonical.contains("\"extensionNumber\":1e-7"))
     }
 
-    func test_rejectsDuplicateAmbiguousAndUnknownObjectNames() throws {
+    func test_rejectsDuplicateAndUnknownObjectNamesButPreservesDistinctUnicodeNames() throws {
         let duplicate = minimalJSON().replacingOccurrences(
             of: "\"brc\":38", with: "\"brc\":38,\"\\u0062rc\":38"
         )
@@ -37,15 +37,15 @@ final class BRC38Tests: XCTestCase {
             XCTAssertEqual($0 as? BRC38Error, .duplicateJSONKey("brc"))
         }
 
-        let ambiguous = minimalJSON().replacingOccurrences(
+        let normalizationEquivalent = minimalJSON().replacingOccurrences(
             of: "\"activeStorage\":\"source\"",
             with: "\"activeStorage\":\"source\",\"é\":1,\"e\\u0301\":2"
         )
-        XCTAssertThrowsError(try BRC38WalletData.parse(ambiguous)) {
-            guard case .ambiguousJSONKey? = $0 as? BRC38Error else {
-                return XCTFail("unexpected error: \($0)")
-            }
-        }
+        let document = try BRC38WalletData.parse(normalizationEquivalent)
+        let canonical = try document.canonicalJSON()
+        XCTAssertTrue(canonical.contains("\"e\u{301}\":2"))
+        XCTAssertTrue(canonical.contains("\"é\":1"))
+        XCTAssertEqual(try BRC38WalletData.parse(canonical), document)
 
         let forbiddenTable = minimalJSON().replacingOccurrences(
             of: "\"syncStates\":[]", with: "\"syncStates\":[],\"monitorEvents\":[]"
@@ -147,6 +147,60 @@ final class BRC38Tests: XCTestCase {
         XCTAssertThrowsError(try BRC38WalletData.parse(unsafeInteger)) {
             XCTAssertEqual($0 as? BRC38Error, .invalidInteger("user[0].userId"))
         }
+    }
+
+    func test_structuralBudgetsAcceptBoundaryAndRejectNextToken() throws {
+        XCTAssertNoThrow(try StrictJSONPreflight.decode(
+            Array("[0,1]".utf8), limits: structuralLimits(values: 3, members: 0, elements: 2)
+        ))
+        XCTAssertThrowsError(try StrictJSONPreflight.decode(
+            Array("[0,1]".utf8), limits: structuralLimits(values: 2, members: 0, elements: 2)
+        )) {
+            XCTAssertEqual($0 as? BRC38Error, .tooManyJSONValues(maximum: 2))
+        }
+
+        XCTAssertNoThrow(try StrictJSONPreflight.decode(
+            Array("{\"a\":0,\"b\":1}".utf8),
+            limits: structuralLimits(values: 3, members: 2, elements: 0)
+        ))
+        XCTAssertThrowsError(try StrictJSONPreflight.decode(
+            Array("{\"a\":0,\"b\":1}".utf8),
+            limits: structuralLimits(values: 3, members: 1, elements: 0)
+        )) {
+            XCTAssertEqual($0 as? BRC38Error, .tooManyJSONObjectMembers(maximum: 1))
+        }
+
+        XCTAssertNoThrow(try StrictJSONPreflight.decode(
+            Array("[[],[0]]".utf8), limits: structuralLimits(values: 4, members: 0, elements: 3)
+        ))
+        XCTAssertThrowsError(try StrictJSONPreflight.decode(
+            Array("[[],[0]]".utf8), limits: structuralLimits(values: 4, members: 0, elements: 2)
+        )) {
+            XCTAssertEqual($0 as? BRC38Error, .tooManyJSONArrayElements(maximum: 2))
+        }
+    }
+
+    func test_objectMemberBudgetWinsBeforeDuplicateSetInsertion() throws {
+        XCTAssertThrowsError(try StrictJSONPreflight.decode(
+            Array("{\"a\":0,\"a\":1}".utf8),
+            limits: structuralLimits(values: 3, members: 1, elements: 0)
+        )) {
+            XCTAssertEqual($0 as? BRC38Error, .tooManyJSONObjectMembers(maximum: 1))
+        }
+    }
+
+    private func structuralLimits(
+        values: Int,
+        members: Int,
+        elements: Int
+    ) -> BRC38Limits {
+        BRC38Limits(
+            maximumUTF8ByteCount: 1_024,
+            maximumRowCount: 10,
+            maximumTotalValueCount: values,
+            maximumTotalObjectMemberCount: members,
+            maximumTotalArrayElementCount: elements
+        )
     }
 
     private func minimalJSON(
