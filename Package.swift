@@ -12,6 +12,7 @@ let publicModules = [
     "ToolboxCore",
     "ToolboxAuth",
     "ToolboxBRC29",
+    "ToolboxPortable",
     "ToolboxStorage",
     "ToolboxStorageClient",
     "ToolboxServices",
@@ -77,6 +78,14 @@ let package = Package(
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVScript", package: "swift-sdk"),
             ]
+        ),
+
+        // Canonical BRC-38 wallet-data documents and the BRC-39 binary envelope. This target is
+        // intentionally independent of a storage engine: portable data can be validated before a
+        // caller chooses restore or merge semantics.
+        .target(
+            name: "ToolboxPortable",
+            dependencies: ["ToolboxCore"]
         ),
 
         // The storage contract and its record types. No implementation lives here, so an engine
@@ -181,6 +190,11 @@ let package = Package(
                 "ToolboxBRC29",
                 .product(name: "BSVKeys", package: "swift-sdk"),
             ]
+        ),
+        .testTarget(
+            name: "ToolboxPortableTests",
+            dependencies: ["ToolboxPortable"],
+            resources: [.copy("Fixtures")]
         ),
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(

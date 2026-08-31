@@ -5,6 +5,7 @@
 @_exported import ToolboxCore
 @_exported import ToolboxAuth
 @_exported import ToolboxBRC29
+@_exported import ToolboxPortable
 @_exported import ToolboxStorage
 @_exported import ToolboxStorageClient
 @_exported import ToolboxServices
