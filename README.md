@@ -55,6 +55,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and w
 | `ToolboxServices` | Broadcast, output status, block headers, exchange rate |
 | `ToolboxBRC29` | BRC-29 payment derivation |
 | `ToolboxActions` | Building, funding and signing transactions |
+| `ToolboxPermissions` | BRC-116 policy, permission tokens, and veto-only module preflight ([details](docs/PERMISSION-MODULES.md)) |
 | `ToolboxWallet` | The concrete BRC-100 wallet |
 | `ToolboxMonitor` | Scheduled background work |
 | `WalletToolbox` | Umbrella, re-exporting all of the above |
