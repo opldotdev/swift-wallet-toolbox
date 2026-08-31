@@ -399,6 +399,72 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
         XCTAssertEqual(abortCount, 1)
     }
 
+    func testBrandNewTokenCreationUsesStorageFundingAndProcesses() async throws {
+        let key = try testIdentityKey()
+        let identity = key.publicKey.compressedBytes.map { String(format: "%02x", $0) }.joined()
+        let mixed = try brc29Source(identity: key)
+        let transport = MutationTransport(sources: [], extraBRC29: mixed)
+        let adapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+            key: key, auth: AuthID(identityKey: identity), transport: transport
+        ))
+        let token = PermissionToken.dbap(try .init(
+            scope: .init(
+                originator: try CanonicalOriginator("example.com"), basket: "payments"
+            ),
+            expiry: 0
+        ))
+        let request = try PermissionTokenMutationRequest(
+            accountID: adapter.permissionAccountID,
+            consumed: [],
+            created: [token]
+        )
+
+        _ = try await adapter.commitPermissionTokenMutation(request)
+
+        let methods = await transport.methods()
+        let abortCount = await transport.abortCount()
+        XCTAssertEqual(methods, ["createAction", "processAction"])
+        XCTAssertEqual(abortCount, 0)
+    }
+
+    func testInvalidStorageReferenceFailsBeforeSigningOrProcessing() async throws {
+        let key = try testIdentityKey()
+        let identity = key.publicKey.compressedBytes.map { String(format: "%02x", $0) }.joined()
+        let bootstrap = ScriptedPermissionTransport()
+        let bootstrapAdapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+            key: key, auth: AuthID(identityKey: identity), transport: bootstrap
+        ))
+        let source = try await tokenSource(
+            .dbap(try .init(
+                scope: .init(
+                    originator: try CanonicalOriginator("example.com"), basket: "payments"
+                ),
+                expiry: 1
+            )),
+            adapter: bootstrapAdapter
+        )
+        let transport = MutationTransport(
+            sources: [source.fixture], failure: .invalidReference
+        )
+        let adapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+            key: key, auth: AuthID(identityKey: identity), transport: transport
+        ))
+        let request = try PermissionTokenMutationRequest(
+            accountID: adapter.permissionAccountID,
+            consumed: [source.match],
+            created: []
+        )
+
+        do {
+            _ = try await adapter.commitPermissionTokenMutation(request)
+            XCTFail("noncanonical storage reference must fail")
+        } catch let error as PermissionTokenMutationError {
+            XCTAssertEqual(error, .invalidStorageReference)
+        }
+        let methods = await transport.methods()
+        XCTAssertEqual(methods, ["createAction"])
+    }
+
     private func adapter(
         transport: any AuthenticatedTransport
     ) throws -> RemoteWalletPermissionTokenAdapter {
@@ -543,6 +609,7 @@ private actor MutationTransport: AuthenticatedTransport {
     enum Failure: Equatable, Sendable {
         case substituteOutput, process, omitBEEF, unrelatedBEEF
         case substituteInputScript, substituteInputValue, substituteInputOutpoint
+        case invalidReference
     }
 
     private let sources: [String: MutationSourceFixture]
@@ -655,7 +722,7 @@ private actor MutationTransport: AuthenticatedTransport {
             return .object(object)
         }
         var object: [String: JSONValue] = [
-            "reference": .string("cmVm"),
+            "reference": .string(failure == .invalidReference ? "not-base64" : "cmVm"),
             "version": .number(1),
             "lockTime": .number(0),
             "inputs": .array(fundedInputs),
@@ -664,9 +731,12 @@ private actor MutationTransport: AuthenticatedTransport {
         if failure != .omitBEEF {
             var inputBEEF = arguments["inputBEEF"] ?? .array([])
             if let extraBRC29 {
-                let graph = try BEEF(
-                    bytes: try byteArray(inputBEEF), limits: StorageLimits.beef
-                )
+                let bytes = try byteArray(inputBEEF)
+                let graph = bytes.isEmpty
+                    ? try BEEF(
+                        merklePaths: [], transactions: [], limits: StorageLimits.beef
+                    )
+                    : try BEEF(bytes: bytes, limits: StorageLimits.beef)
                 let merged = try graph.merging(extraBRC29.beef, limits: StorageLimits.beef)
                 inputBEEF = .array(try merged.serialized(limits: StorageLimits.beef).map {
                     .number(Double($0))

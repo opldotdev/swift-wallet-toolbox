@@ -32,26 +32,33 @@ public struct RemoteWalletPermissionTokenAdapter: PermissionTokenWallet, Sendabl
 
     private static func hasCanonicalTagShape(_ request: WalletListOutputsRequest) -> Bool {
         let tags = request.tags
+        func hasValue(_ tag: String, prefix: String) -> Bool {
+            tag.hasPrefix(prefix) && tag.count > prefix.count
+        }
+        func isBoolean(_ tag: String, prefix: String) -> Bool {
+            tag == "\(prefix)true" || tag == "\(prefix)false"
+        }
         switch PermissionTokenBasket(rawValue: request.basket) {
         case .protocolPermission:
-            return (tags.count == 4 || tags.count == 5)
-                && tags[0].hasPrefix("originator ")
-                && tags[1].hasPrefix("privileged ")
-                && tags[2].hasPrefix("protocolName ")
-                && tags[3].hasPrefix("protocolSecurityLevel ")
-                && (tags.count == 4 || tags[4].hasPrefix("counterparty "))
+            let levelOne = tags.count == 4 && tags[3] == "protocolSecurityLevel 1"
+            let levelTwo = tags.count == 5 && tags[3] == "protocolSecurityLevel 2"
+                && hasValue(tags[4], prefix: "counterparty ")
+            return (levelOne || levelTwo)
+                && hasValue(tags[0], prefix: "originator ")
+                && isBoolean(tags[1], prefix: "privileged ")
+                && hasValue(tags[2], prefix: "protocolName ")
         case .basketAccess:
             return tags.count == 2
-                && tags[0].hasPrefix("originator ")
-                && tags[1].hasPrefix("basket ")
+                && hasValue(tags[0], prefix: "originator ")
+                && hasValue(tags[1], prefix: "basket ")
         case .certificateAccess:
             return tags.count == 4
-                && tags[0].hasPrefix("originator ")
-                && tags[1].hasPrefix("privileged ")
-                && tags[2].hasPrefix("type ")
-                && tags[3].hasPrefix("verifier ")
+                && hasValue(tags[0], prefix: "originator ")
+                && isBoolean(tags[1], prefix: "privileged ")
+                && hasValue(tags[2], prefix: "type ")
+                && hasValue(tags[3], prefix: "verifier ")
         case .spendingAuthorization:
-            return tags.count == 1 && tags[0].hasPrefix("originator ")
+            return tags.count == 1 && hasValue(tags[0], prefix: "originator ")
         case nil:
             return false
         }
