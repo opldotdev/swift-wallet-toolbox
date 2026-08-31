@@ -49,6 +49,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and w
 |---|---|
 | `ToolboxCore` | Shared vocabulary: the wire error taxonomy, decode limits |
 | `ToolboxAuth` | BRC-103 mutual authentication over HTTP |
+| `ToolboxPortable` | BRC-38 canonical wallet data and BRC-39 envelope validation |
 | `ToolboxStorage` | The storage contract and its record types |
 | `ToolboxStorageClient` | Remote storage over JSON-RPC |
 | `ToolboxServices` | Broadcast, output status, block headers, exchange rate |
