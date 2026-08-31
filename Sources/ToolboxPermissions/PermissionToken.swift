@@ -121,6 +121,60 @@ public enum PermissionToken: Hashable, Sendable {
         }
     }
 
+    /// The canonical BRC-116 storage index. Creation and lookup intentionally share this value.
+    public var indexTags: [String] {
+        Self.indexTags(for: scopeKey)
+    }
+
+    package var scopeKey: PermissionScopeKey {
+        switch self {
+        case .dpacp(let token): .protocolAccess(token.scope)
+        case .dbap(let token): .basketAccess(token.scope)
+        case .dcap(let token): .certificateAccess(token.scope)
+        case .dsap(let token): .spendingAuthorization(token.scope)
+        }
+    }
+
+    package static func basket(for scope: PermissionScopeKey) -> PermissionTokenBasket {
+        switch scope {
+        case .protocolAccess: .protocolPermission
+        case .basketAccess: .basketAccess
+        case .certificateAccess: .certificateAccess
+        case .spendingAuthorization: .spendingAuthorization
+        }
+    }
+
+    package static func indexTags(for scope: PermissionScopeKey) -> [String] {
+        switch scope {
+        case .protocolAccess(let value):
+            var tags = [
+                "originator \(value.originator.rawValue)",
+                "privileged \(value.privileged)",
+                "protocolName \(value.protocolName)",
+                "protocolSecurityLevel \(value.securityLevel.rawValue)",
+            ]
+            if value.securityLevel == .applicationAndCounterparty,
+               let counterparty = value.counterparty {
+                tags.append("counterparty \(counterparty.rawValue)")
+            }
+            return tags
+        case .basketAccess(let value):
+            return [
+                "originator \(value.originator.rawValue)",
+                "basket \(value.basket)",
+            ]
+        case .certificateAccess(let value):
+            return [
+                "originator \(value.originator.rawValue)",
+                "privileged \(value.privileged)",
+                "type \(value.certificateType)",
+                "verifier \(value.verifier.rawValue)",
+            ]
+        case .spendingAuthorization(let value):
+            return ["originator \(value.originator.rawValue)"]
+        }
+    }
+
     public func isExpired(at unixTime: UInt64) -> Bool {
         switch self {
         case .dpacp(let token): token.isExpired(at: unixTime)

@@ -62,7 +62,8 @@ public enum OutputVerification {
         for (index, output) in requested.enumerated() {
             let echoed = returned[index]
             guard echoed.satoshis == output.satoshis,
-                  echoed.lockingScript == output.lockingScript else {
+                  echoed.lockingScript == output.lockingScript,
+                  echoed.providedBy == .you || echoed.providedBy == .youAndStorage else {
                 throw ActionError.storageAlteredOutputs("storage altered output \(index)")
             }
         }

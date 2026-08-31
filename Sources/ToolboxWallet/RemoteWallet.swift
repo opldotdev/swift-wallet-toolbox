@@ -5,6 +5,7 @@ import BSVScript
 import BSVTransaction
 import BSVWallet
 import ToolboxActions
+import ToolboxPermissions
 import ToolboxPaymail
 import ToolboxBRC29
 import ToolboxStorage
@@ -348,6 +349,298 @@ public struct RemoteWallet: Sendable {
         }
         let request = WalletAbortActionRequest(reference: try WalletBase64Data(Array(bytes)))
         return try await storage.abortAction(auth, request).aborted
+    }
+
+    package func _permissionAccountID() throws -> PermissionAccountID {
+        guard Self.hexBytes(auth.identityKey) == identityKey.publicKey.compressedBytes else {
+            throw PermissionTokenMutationError.accountMismatch
+        }
+        let identityComponent = Base64Encoding.encode(identityKey.publicKey.compressedBytes)
+        let userComponent = auth.userID.map { "some:\($0)" } ?? "none"
+        return try PermissionAccountID("auth-v1|\(identityComponent)|\(userComponent)")
+    }
+
+    package func _listPermissionTokenOutputs(
+        _ request: WalletListOutputsRequest
+    ) async throws -> WalletListOutputsResult {
+        _ = try _permissionAccountID()
+        return try await storage.listOutputs(auth, request)
+    }
+
+    package func _commitPermissionTokenMutation(
+        _ mutation: PermissionTokenMutationRequest,
+        using tokenWallet: any PermissionTokenWallet
+    ) async throws -> PermissionTokenMutationResult {
+        try Task.checkCancellation()
+        let accountID = try _permissionAccountID()
+        guard mutation.accountID == accountID,
+              tokenWallet.permissionAccountID == accountID else {
+            throw PermissionTokenMutationError.accountMismatch
+        }
+
+        // Finish all codec work and source validation before storage reserves any inputs.
+        var requestedOutputs = [WalletCreateActionOutput]()
+        requestedOutputs.reserveCapacity(mutation.created.count)
+        for token in mutation.created {
+            try Task.checkCancellation()
+            let script = try await PermissionTokenCodec.encode(token, using: tokenWallet)
+            requestedOutputs.append(try WalletCreateActionOutput(
+                lockingScript: script.bytes,
+                satoshis: 1,
+                outputDescription: "\(token.basket.rawValue) permission token",
+                basket: token.basket.rawValue,
+                tags: token.indexTags
+            ))
+        }
+
+        for match in mutation.consumed {
+            try Task.checkCancellation()
+            try Self.validatePermissionTokenSource(match)
+        }
+        try Task.checkCancellation()
+        let inputBEEF = try Self.mergePermissionTokenSources(mutation.consumed)
+        try Task.checkCancellation()
+        let requestedInputs = try mutation.consumed.map { match in
+            try WalletCreateActionInput(
+                outpoint: match.outpoint,
+                inputDescription: "Consume \(match.token.basket.rawValue) permission token",
+                unlockingScriptLength: UInt32(TransactionInput.pushDropUnlockingScriptByteCount)
+            )
+        }
+        let options = try WalletCreateActionOptions(
+            signAndProcess: false,
+            acceptDelayedBroadcast: true,
+            randomizeOutputs: false
+        )
+        let createRequest = try WalletCreateActionRequest(
+            description: "Update wallet permission token",
+            inputBEEF: inputBEEF,
+            inputs: requestedInputs,
+            outputs: requestedOutputs,
+            options: options
+        )
+        try Task.checkCancellation()
+        let funded = try await storage.createAction(auth, createRequest)
+
+        do {
+            guard !funded.reference.isEmpty,
+                  (try? WalletBase64Data(base64: funded.reference)) != nil else {
+                throw PermissionTokenMutationError.invalidStorageReference
+            }
+            try Task.checkCancellation()
+            try ActionAssembler.requireFeeWithin(maximumFee, for: funded)
+            let unsigned = try ActionAssembler.assemble(
+                funded, requested: requestedOutputs, changeKey: identityKey
+            )
+            let fundedSourceGraph = try Self.validatedFundedSourceGraph(
+                funded, subject: unsigned, expectedSourceGraph: inputBEEF
+            )
+            try Task.checkCancellation()
+            let declarations = try mutation.consumed.map { match in
+                guard let satoshis = Int64(exactly: match.satoshis) else {
+                    throw PermissionTokenMutationError.invalidConsumedValue(
+                        outpoint: match.outpoint, satoshis: match.satoshis
+                    )
+                }
+                return ActionSigner.BRC116PermissionTokenSpend(
+                    outpoint: match.outpoint,
+                    satoshis: satoshis,
+                    lockingScript: match.lockingScript,
+                    signer: tokenWallet
+                )
+            }
+            let transaction = try await ActionSigner.signBRC116PermissionTokenAction(
+                funded,
+                requested: requestedOutputs,
+                identityKey: identityKey,
+                senderPublicKey: identityKey.publicKey,
+                permissionTokenSpends: declarations,
+                maximumFee: maximumFee
+            )
+            try Task.checkCancellation()
+            let transactionID = try transaction.transactionID(
+                limits: StorageLimits.transaction
+            )
+            let atomic = try Self.atomicBEEF(
+                subject: transaction,
+                transactionID: transactionID,
+                sourceGraph: fundedSourceGraph
+            )
+            let processRequest = StorageProcessActionRequest(
+                reference: funded.reference,
+                isNewTx: true,
+                isSendWith: false,
+                rawTX: try atomic.serialized(limits: StorageLimits.beef),
+                sendWith: []
+            )
+            try Task.checkCancellation()
+            _ = try await storage.processAction(auth, processRequest)
+            // No cancellation or epoch check belongs after process success: the mutation committed.
+            return PermissionTokenMutationResult(
+                transactionID: transactionID,
+                reference: funded.reference
+            )
+        } catch {
+            let primaryError = error
+            await Task.detached { [storage, auth] in
+                guard let reference = try? WalletBase64Data(base64: funded.reference) else {
+                    return
+                }
+                _ = try? await storage.abortAction(
+                    auth, WalletAbortActionRequest(reference: reference)
+                )
+            }.value
+            throw primaryError
+        }
+    }
+
+    private static func mergePermissionTokenSources(
+        _ matches: [PermissionTokenMatch]
+    ) throws -> BEEF? {
+        guard var merged = matches.first?.sourceBEEF else { return nil }
+        for match in matches.dropFirst() {
+            merged = try merged.merging(match.sourceBEEF, limits: StorageLimits.beef)
+        }
+        _ = try merged.merkleRootsByBlockHeight()
+        return merged
+    }
+
+    /// Checks storage's complete input graph against every funded source before any signer runs.
+    private static func validatedFundedSourceGraph(
+        _ funded: StorageCreateActionResult,
+        subject: Transaction,
+        expectedSourceGraph: BEEF?
+    ) throws -> BEEF {
+        let graph: BEEF
+        if let bytes = funded.inputBEEF {
+            do {
+                graph = try BEEF(bytes: bytes, limits: StorageLimits.beef)
+            } catch {
+                throw PermissionTokenMutationError.untrustworthyFundedBEEF
+            }
+        } else {
+            guard funded.inputs.isEmpty else {
+                throw PermissionTokenMutationError.untrustworthyFundedBEEF
+            }
+            graph = try BEEF(
+                merklePaths: [], transactions: [], limits: StorageLimits.beef
+            )
+        }
+
+        for input in funded.inputs {
+            guard let transactionID = try? TransactionID(displayHex: input.sourceTXID),
+                  let transaction = try graph.transaction(
+                    for: transactionID,
+                    limits: StorageLimits.transaction
+                  ),
+                  let index = Int(exactly: input.sourceVout),
+                  transaction.outputs.indices.contains(index),
+                  input.sourceSatoshis >= 0 else {
+                throw PermissionTokenMutationError.untrustworthyFundedBEEF
+            }
+            let source = transaction.outputs[index]
+            guard source.satoshis == UInt64(input.sourceSatoshis),
+                  source.lockingScript.bytes == input.sourceLockingScript else {
+                throw PermissionTokenMutationError.untrustworthyFundedBEEF
+            }
+        }
+
+        // The unsigned subject connects every legitimate input root. Atomic validation rejects
+        // omitted ancestors and any unrelated transaction/path before a token signature is asked.
+        let candidate = try BEEF(
+            version: graph.version,
+            merklePaths: graph.merklePaths,
+            transactions: graph.transactions + [.raw(subject)],
+            limits: StorageLimits.beef
+        )
+        let subjectID = try subject.transactionID(limits: StorageLimits.transaction)
+        do {
+            // Storage cannot supply two different claimed roots for one block height. Atomic BEEF
+            // checks exact ancestry, while this cross-path consistency check is deliberately
+            // separate in the SDK.
+            _ = try candidate.merkleRootsByBlockHeight()
+            if let expectedSourceGraph {
+                // Storage may add funding ancestry, but it may not strip or replace proof metadata
+                // from the exact source graph supplied with the request. Normalize both sides via
+                // the graph merger so BUMP leaf unions and raw/raw-with-path spelling compare by
+                // their semantic graph rather than their original wire order.
+                let empty = try BEEF(
+                    version: graph.version,
+                    merklePaths: [],
+                    transactions: [],
+                    limits: StorageLimits.beef
+                )
+                let normalizedReturned = try graph.merging(
+                    empty, limits: StorageLimits.beef
+                )
+                let returnedWithExpected = try graph.merging(
+                    expectedSourceGraph, limits: StorageLimits.beef
+                )
+                guard returnedWithExpected == normalizedReturned else {
+                    throw PermissionTokenMutationError.untrustworthyFundedBEEF
+                }
+            }
+            _ = try AtomicBEEF(
+                subjectTransactionID: subjectID,
+                beef: candidate,
+                limits: StorageLimits.beef
+            )
+        } catch {
+            throw PermissionTokenMutationError.untrustworthyFundedBEEF
+        }
+        return graph
+    }
+
+    private static func atomicBEEF(
+        subject: Transaction,
+        transactionID: TransactionID,
+        sourceGraph: BEEF
+    ) throws -> AtomicBEEF {
+        let beef = try BEEF(
+            version: sourceGraph.version,
+            merklePaths: sourceGraph.merklePaths,
+            transactions: sourceGraph.transactions + [.raw(subject)],
+            limits: StorageLimits.beef
+        )
+        return try AtomicBEEF(
+            subjectTransactionID: transactionID,
+            beef: beef,
+            limits: StorageLimits.beef
+        )
+    }
+
+    private static func validatePermissionTokenSource(_ match: PermissionTokenMatch) throws {
+        guard match.satoshis == 1,
+              let transaction = try match.sourceBEEF.transaction(
+                for: match.outpoint.transactionID,
+                limits: StorageLimits.beef.transactionLimits
+              ),
+              let index = Int(exactly: match.outpoint.outputIndex),
+              transaction.outputs.indices.contains(index) else {
+            throw PermissionTokenMutationError.invalidConsumedValue(
+                outpoint: match.outpoint, satoshis: match.satoshis
+            )
+        }
+        let source = transaction.outputs[index]
+        guard source.satoshis == 1, source.lockingScript.bytes == match.lockingScript else {
+            throw PermissionTokenMutationError.invalidConsumedValue(
+                outpoint: match.outpoint, satoshis: match.satoshis
+            )
+        }
+    }
+
+    private static func hexBytes(_ text: String) -> [UInt8]? {
+        guard text.count.isMultiple(of: 2) else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(text.count / 2)
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        return bytes
     }
 }
 

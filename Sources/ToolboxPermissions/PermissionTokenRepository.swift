@@ -1,3 +1,4 @@
+import BSVCore
 import BSVScript
 import BSVTransaction
 import BSVWallet
@@ -63,6 +64,19 @@ public actor PermissionTokenRepository {
             maximumScriptByteCount: 1 << 20
         )
     }()
+    nonisolated static let standardBEEFLimits: BEEFLimits = {
+        try! BEEFLimits(
+            maximumByteCount: 8 << 20,
+            maximumMerklePathCount: 10_000,
+            maximumTransactionCount: 10_000,
+            transactionLimits: standardTransactionLimits,
+            merklePathLimits: try MerklePathLimits(
+                maximumByteCount: 1 << 20,
+                maximumLeavesPerLevel: 100_000,
+                maximumTotalLeaves: 1_000_000
+            )
+        )
+    }()
 
     private static let pageSize: UInt32 = 100
     private static let maximumCandidateCount = UInt64(WalletABILimits.standard.maximumCollectionCount)
@@ -71,6 +85,7 @@ public actor PermissionTokenRepository {
     private let transactionLimits: TransactionLimits
     private var invalidationEpoch: UInt64 = 0
     private var isInvalidated = false
+    private var inFlightConsumedOutpoints = Set<Outpoint>()
 
     public init(wallet: any PermissionTokenWallet) {
         self.accountID = wallet.permissionAccountID
@@ -102,8 +117,87 @@ public actor PermissionTokenRepository {
         _ scope: PermissionScopeKey,
         nowUnixTime: UInt64
     ) async throws -> PermissionTokenMatch? {
+        try await lookup(scope, nowUnixTime: nowUnixTime, expiredOnly: false)
+    }
+
+    /// Creates a new canonical token without consuming prior permission state.
+    public func create(_ token: PermissionToken) async throws -> PermissionTokenMutationResult {
         try Task.checkCancellation()
         let epoch = try activeEpoch()
+        try requireActive(epoch)
+        let request = try PermissionTokenMutationRequest(
+            accountID: accountID, consumed: [], created: [token]
+        )
+        try Task.checkCancellation()
+        try requireActive(epoch)
+        // Once mutation execution is handed to the wallet, a transport error can be ambiguous:
+        // processAction may have committed remotely before its response was lost. Conservatively
+        // invalidate every older lookup whether the wallet returns success or throws.
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
+    }
+
+    /// Replaces the exact-scope token, including an expired token that cannot authorize use.
+    public func renew(
+        _ scope: PermissionScopeKey,
+        with replacement: PermissionToken,
+        nowUnixTime: UInt64
+    ) async throws -> PermissionTokenMutationResult {
+        try Task.checkCancellation()
+        let epoch = try activeEpoch()
+        if case .spendingAuthorization = scope {
+            throw PermissionTokenMutationError.renewalNotSupported
+        }
+        guard replacement.scopeKey == scope else {
+            throw PermissionTokenMutationError.replacementScopeMismatch
+        }
+        guard let existing = try await lookup(
+            scope, nowUnixTime: nowUnixTime, expiredOnly: true, expectedEpoch: epoch
+        ) else {
+            throw PermissionTokenMutationError.noRenewalCandidate
+        }
+        try Task.checkCancellation()
+        try requireActive(epoch)
+        let request = try PermissionTokenMutationRequest(
+            accountID: accountID, consumed: [existing], created: [replacement]
+        )
+        try Task.checkCancellation()
+        try requireActive(epoch)
+        try reserveConsumedOutpoints(request.consumed)
+        defer { releaseConsumedOutpoints(request.consumed) }
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
+    }
+
+    /// Revokes one exact account-bound token by consuming it without a replacement.
+    public func revoke(_ match: PermissionTokenMatch) async throws -> PermissionTokenMutationResult {
+        try Task.checkCancellation()
+        let epoch = try activeEpoch()
+        let request = try PermissionTokenMutationRequest(
+            accountID: accountID, consumed: [match], created: []
+        )
+        try Task.checkCancellation()
+        try requireActive(epoch)
+        try reserveConsumedOutpoints(request.consumed)
+        defer { releaseConsumedOutpoints(request.consumed) }
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
+    }
+
+    private func lookup(
+        _ scope: PermissionScopeKey,
+        nowUnixTime: UInt64,
+        expiredOnly: Bool,
+        expectedEpoch: UInt64? = nil
+    ) async throws -> PermissionTokenMatch? {
+        try Task.checkCancellation()
+        let epoch: UInt64
+        if let expectedEpoch {
+            epoch = expectedEpoch
+        } else {
+            epoch = try activeEpoch()
+        }
+        try requireActive(epoch)
         let query = queryIdentity(for: scope)
         var offset: UInt32 = 0
         var scannedCandidateCount: UInt64 = 0
@@ -190,14 +284,31 @@ public actor PermissionTokenRepository {
                     continue
                 }
 
-                guard covers(token, requested: scope, nowUnixTime: nowUnixTime) else { continue }
+                guard covers(
+                    token,
+                    requested: scope,
+                    nowUnixTime: nowUnixTime,
+                    expiredOnly: expiredOnly
+                ) else { continue }
+                let exactSourceBEEF: BEEF
+                do {
+                    exactSourceBEEF = try Self.exactSourceBEEF(
+                        for: output.outpoint.transactionID,
+                        in: beef,
+                        limits: transactionLimits
+                    )
+                } catch {
+                    throw PermissionTokenRepositoryError.untrustworthyBEEF(
+                        outpoint: output.outpoint
+                    )
+                }
                 matches.append(PermissionTokenMatch(
                     accountID: accountID,
                     token: token,
                     outpoint: output.outpoint,
                     satoshis: source.satoshis,
                     lockingScript: source.lockingScript.bytes,
-                    sourceBEEF: beef
+                    sourceBEEF: exactSourceBEEF
                 ))
             }
 
@@ -223,6 +334,17 @@ public actor PermissionTokenRepository {
         guard !isInvalidated, invalidationEpoch == epoch else {
             throw PermissionTokenRepositoryError.invalidated
         }
+    }
+
+    private func reserveConsumedOutpoints(_ matches: [PermissionTokenMatch]) throws {
+        for match in matches where inFlightConsumedOutpoints.contains(match.outpoint) {
+            throw PermissionTokenMutationError.mutationInFlight(outpoint: match.outpoint)
+        }
+        inFlightConsumedOutpoints.formUnion(matches.map(\.outpoint))
+    }
+
+    private func releaseConsumedOutpoints(_ matches: [PermissionTokenMatch]) {
+        inFlightConsumedOutpoints.subtract(matches.map(\.outpoint))
     }
 
     private func sourceOutput(
@@ -272,6 +394,82 @@ public actor PermissionTokenRepository {
         }
         return nextOffset
     }
+
+    /// Extracts exactly one transaction's proof/ancestor closure from a list page BEEF.
+    private static func exactSourceBEEF(
+        for subject: TransactionID,
+        in beef: BEEF,
+        limits: TransactionLimits
+    ) throws -> BEEF {
+        let entries = try Dictionary(uniqueKeysWithValues: beef.transactions.map {
+            (try $0.transactionID(limits: limits), $0)
+        })
+        var relevant = Set<TransactionID>()
+
+        func pathContains(_ path: MerklePath, _ transactionID: TransactionID) -> Bool {
+            guard let hash = try? Hash256(transactionID.wireBytes) else { return false }
+            return path.levels[0].contains { $0.hash == hash }
+        }
+        func isProven(_ transactionID: TransactionID, _ entry: BEEFTransaction) -> Bool {
+            if let index = entry.merklePathIndex,
+               beef.merklePaths.indices.contains(index),
+               pathContains(beef.merklePaths[index], transactionID) {
+                return true
+            }
+            return beef.merklePaths.contains { pathContains($0, transactionID) }
+        }
+        func visit(_ transactionID: TransactionID) throws {
+            if !relevant.insert(transactionID).inserted { return }
+            guard let entry = entries[transactionID] else {
+                throw BEEFError.missingAncestor(
+                    transaction: subject, ancestor: transactionID
+                )
+            }
+            guard entry.format != .transactionIDOnly,
+                  !isProven(transactionID, entry),
+                  let transaction = entry.transaction else { return }
+            for input in transaction.inputs {
+                try visit(input.previousOutput.transactionID)
+            }
+        }
+        try visit(subject)
+
+        let retainedOldPathIndexes = Set(beef.merklePaths.indices.filter { index in
+            relevant.contains { pathContains(beef.merklePaths[index], $0) }
+        })
+        var newPathIndex = [Int: Int]()
+        var paths = [MerklePath]()
+        for index in beef.merklePaths.indices where retainedOldPathIndexes.contains(index) {
+            newPathIndex[index] = paths.count
+            paths.append(beef.merklePaths[index])
+        }
+        let transactions = try beef.transactions.compactMap { entry -> BEEFTransaction? in
+            let transactionID = try entry.transactionID(limits: limits)
+            guard relevant.contains(transactionID) else { return nil }
+            if case .rawWithMerklePath(let transaction, let oldIndex) = entry,
+               let remapped = newPathIndex[oldIndex] {
+                return .rawWithMerklePath(
+                    transaction: transaction, merklePathIndex: remapped
+                )
+            }
+            return entry
+        }
+        let exact = try BEEF(
+            version: beef.version,
+            merklePaths: paths,
+            transactions: transactions,
+            limits: standardBEEFLimits
+        )
+        // Atomic relevance/ancestry validation does not by itself reject two otherwise valid
+        // BUMPs that claim different roots for the same block height.
+        _ = try exact.merkleRootsByBlockHeight()
+        _ = try AtomicBEEF(
+            subjectTransactionID: subject,
+            beef: exact,
+            limits: standardBEEFLimits
+        )
+        return exact
+    }
 }
 
 private extension PermissionTokenRepository {
@@ -281,51 +479,23 @@ private extension PermissionTokenRepository {
     }
 
     func queryIdentity(for scope: PermissionScopeKey) -> QueryIdentity {
-        switch scope {
-        case .protocolAccess(let value):
-            var tags = [
-                "originator \(value.originator.rawValue)",
-                "privileged \(value.privileged)",
-                "protocolName \(value.protocolName)",
-                "protocolSecurityLevel \(value.securityLevel.rawValue)",
-            ]
-            if value.securityLevel == .applicationAndCounterparty,
-               let counterparty = value.counterparty {
-                tags.append("counterparty \(counterparty.rawValue)")
-            }
-            return QueryIdentity(basket: .protocolPermission, tags: tags)
-
-        case .basketAccess(let value):
-            return QueryIdentity(
-                basket: .basketAccess,
-                tags: ["originator \(value.originator.rawValue)", "basket \(value.basket)"]
-            )
-
-        case .certificateAccess(let value):
-            return QueryIdentity(
-                basket: .certificateAccess,
-                tags: [
-                    "originator \(value.originator.rawValue)",
-                    "privileged \(value.privileged)",
-                    "type \(value.certificateType)",
-                    "verifier \(value.verifier.rawValue)",
-                ]
-            )
-
-        case .spendingAuthorization(let value):
-            return QueryIdentity(
-                basket: .spendingAuthorization,
-                tags: ["originator \(value.originator.rawValue)"]
-            )
-        }
+        QueryIdentity(
+            basket: PermissionToken.basket(for: scope),
+            tags: PermissionToken.indexTags(for: scope)
+        )
     }
 
     func covers(
         _ token: PermissionToken,
         requested: PermissionScopeKey,
-        nowUnixTime: UInt64
+        nowUnixTime: UInt64,
+        expiredOnly: Bool
     ) -> Bool {
-        guard !token.isExpired(at: nowUnixTime) else { return false }
+        if expiredOnly {
+            guard token.isExpired(at: nowUnixTime) else { return false }
+        } else {
+            guard !token.isExpired(at: nowUnixTime) else { return false }
+        }
         switch (token, requested) {
         case (.dpacp(let grant), .protocolAccess(let request)):
             return grant.scope == request
@@ -336,7 +506,9 @@ private extension PermissionTokenRepository {
                 && grant.scope.privileged == request.privileged
                 && grant.scope.certificateType == request.certificateType
                 && grant.scope.verifier == request.verifier
-                && grant.covers(fields: request.fields)
+                && (expiredOnly
+                    ? grant.scope.fields == request.fields
+                    : grant.covers(fields: request.fields))
         case (.dsap(let grant), .spendingAuthorization(let request)):
             return grant.scope == request
         default:

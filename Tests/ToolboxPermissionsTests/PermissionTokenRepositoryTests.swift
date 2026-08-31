@@ -1,3 +1,4 @@
+import BSVCore
 import BSVKeys
 import BSVScript
 import BSVTransaction
@@ -398,6 +399,254 @@ final class PermissionTokenRepositoryTests: XCTestCase {
         XCTAssertEqual(requestCount, 1)
     }
 
+    func testCreateRenewAndRevokeUseNarrowAccountBoundMutations() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(42))
+        let scope = try dbapScope()
+        let expired = PermissionToken.dbap(try .init(scope: scope, expiry: 10))
+        let replacement = PermissionToken.dbap(try .init(scope: scope, expiry: 0))
+        let expiredCandidate = try await candidate(expired, wallet: wallet)
+        await wallet.setPage(
+            offset: 0,
+            result: try page(total: 1, candidates: [expiredCandidate])
+        )
+        let repository = try repository(wallet: wallet)
+
+        _ = try await repository.create(replacement)
+        _ = try await repository.renew(
+            .basketAccess(scope), with: replacement, nowUnixTime: 100
+        )
+        let renewalMutations = await wallet.recordedMutations()
+        let renewable = try XCTUnwrap(renewalMutations.last?.consumed.first)
+        _ = try await repository.revoke(renewable)
+
+        let mutations = await wallet.recordedMutations()
+        XCTAssertEqual(mutations.count, 3)
+        XCTAssertTrue(mutations[0].consumed.isEmpty)
+        XCTAssertEqual(mutations[0].created, [replacement])
+        XCTAssertEqual(mutations[1].consumed.map(\.token), [expired])
+        XCTAssertEqual(mutations[1].created, [replacement])
+        XCTAssertEqual(mutations[2].consumed.map(\.token), [expired])
+        XCTAssertTrue(mutations[2].created.isEmpty)
+        XCTAssertTrue(mutations.allSatisfy { $0.accountID == repositoryTestAccountID })
+    }
+
+    func testRenewalRequiresExactDCAPFieldsEvenWhenSubsetWouldAuthorize() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(43))
+        let originator = try CanonicalOriginator("example.com")
+        let verifier = CanonicalCounterparty(publicKey: try testKey(44))
+        let broad = CertificatePermissionScope(
+            originator: originator,
+            privileged: false,
+            certificateType: "identity",
+            verifier: verifier,
+            fields: ["email", "name"]
+        )
+        let narrow = CertificatePermissionScope(
+            originator: originator,
+            privileged: false,
+            certificateType: "identity",
+            verifier: verifier,
+            fields: ["name"]
+        )
+        let broadToken = PermissionToken.dcap(try .init(scope: broad, expiry: 1))
+        let narrowReplacement = PermissionToken.dcap(try .init(scope: narrow, expiry: 0))
+        await wallet.setPage(
+            offset: 0,
+            result: try await page(total: 1, tokens: [broadToken], wallet: wallet)
+        )
+
+        do {
+            _ = try await repository(wallet: wallet).renew(
+                .certificateAccess(narrow),
+                with: narrowReplacement,
+                nowUnixTime: 2
+            )
+            XCTFail("subset coverage must not select a different grant for renewal")
+        } catch let error as PermissionTokenMutationError {
+            XCTAssertEqual(error, .noRenewalCandidate)
+        }
+        let mutations = await wallet.recordedMutations()
+        XCTAssertTrue(mutations.isEmpty)
+    }
+
+    func testDSAPCannotUseExpiryRenewalToEscalateItsAmount() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(48))
+        let scope = SpendingPermissionScope(originator: try CanonicalOriginator("example.com"))
+        let replacement = PermissionToken.dsap(.init(
+            scope: scope, authorizedAmount: UInt64.max
+        ))
+
+        do {
+            _ = try await repository(wallet: wallet).renew(
+                .spendingAuthorization(scope),
+                with: replacement,
+                nowUnixTime: 1
+            )
+            XCTFail("DSAP amount changes require a new explicit grant")
+        } catch let error as PermissionTokenMutationError {
+            XCTAssertEqual(error, .renewalNotSupported)
+        }
+        let mutations = await wallet.recordedMutations()
+        XCTAssertTrue(mutations.isEmpty)
+    }
+
+    func testMatchRetainsOnlyItsExactSourceGraphFromAMultiCandidatePage() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(45))
+        let requested = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 0))
+        let unrelated = PermissionToken.dbap(try .init(
+            scope: .init(
+                originator: try CanonicalOriginator("other.example"), basket: "payments"
+            ),
+            expiry: 0
+        ))
+        await wallet.setPage(
+            offset: 0,
+            result: try await page(total: 2, tokens: [unrelated, requested], wallet: wallet)
+        )
+
+        let found = try await repository(wallet: wallet).findCovering(
+            .basketAccess(try dbapScope()), nowUnixTime: 1
+        )
+        let match = try XCTUnwrap(found)
+
+        XCTAssertEqual(match.sourceBEEF.transactions.count, 1)
+        XCTAssertNotNil(try match.sourceBEEF.transaction(
+            for: match.outpoint.transactionID,
+            limits: PermissionTokenRepository.standardTransactionLimits
+        ))
+    }
+
+    func testConflictingMerkleRootsInExactSourceFailClosed() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(49))
+        let token = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 0))
+        let value = try await candidate(token, wallet: wallet)
+        let transactionID = value.output.outpoint.transactionID
+        let transactionHash = try Hash256(transactionID.wireBytes)
+        let first = try MerklePath(
+            blockHeight: 900_003,
+            levels: [[.hash(offset: 0, hash: transactionHash, isTransactionID: true)]]
+        )
+        let conflicting = try MerklePath(
+            blockHeight: 900_003,
+            levels: [[
+                .hash(offset: 0, hash: transactionHash, isTransactionID: true),
+                .hash(
+                    offset: 1,
+                    hash: try Hash256([UInt8](repeating: 0xa5, count: 32)),
+                    isTransactionID: false
+                ),
+            ]]
+        )
+        let graph = try BEEF(
+            merklePaths: [first, conflicting],
+            transactions: [.rawWithMerklePath(
+                transaction: value.transaction, merklePathIndex: 0
+            )],
+            limits: PermissionTokenRepository.standardBEEFLimits
+        )
+        await wallet.setPage(offset: 0, result: try WalletListOutputsResult(
+            totalOutputs: 1,
+            beef: graph,
+            outputs: [value.output]
+        ))
+
+        await assertUntrustworthy {
+            try await self.repository(wallet: wallet).findCovering(
+                .basketAccess(try self.dbapScope()), nowUnixTime: 1
+            )
+        }
+    }
+
+    func testOverlappingRevokesOfSameOutpointCannotBothCommit() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(46))
+        let token = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 0))
+        await wallet.setPage(
+            offset: 0,
+            result: try await page(total: 1, tokens: [token], wallet: wallet)
+        )
+        let repository = try repository(wallet: wallet)
+        let found = try await repository.findCovering(
+            .basketAccess(try dbapScope()), nowUnixTime: 1
+        )
+        let match = try XCTUnwrap(found)
+        let gate = AsyncRepositoryGate()
+        await wallet.setMutationGate(gate)
+        let first = Task { try await repository.revoke(match) }
+        await gate.waitUntilEntered()
+
+        do {
+            _ = try await repository.revoke(match)
+            XCTFail("same outpoint cannot be reserved twice")
+        } catch let error as PermissionTokenMutationError {
+            XCTAssertEqual(error, .mutationInFlight(outpoint: match.outpoint))
+        }
+        await gate.release()
+        _ = try await first.value
+        let mutationCount = await wallet.mutationCount()
+        XCTAssertEqual(mutationCount, 1)
+    }
+
+    func testSuccessfulMutationInvalidatesAnOlderInFlightLookup() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(47))
+        let token = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 0))
+        await wallet.setPage(
+            offset: 0,
+            result: try await page(total: 1, tokens: [token], wallet: wallet)
+        )
+        let repository = try repository(wallet: wallet)
+        let found = try await repository.findCovering(
+            .basketAccess(try dbapScope()), nowUnixTime: 1
+        )
+        let match = try XCTUnwrap(found)
+        let gate = AsyncRepositoryGate()
+        await wallet.setGate(gate, offset: 0)
+        let requestedScope = try dbapScope()
+        let staleLookup = Task {
+            try await repository.findCovering(
+                .basketAccess(requestedScope), nowUnixTime: 1
+            )
+        }
+        await gate.waitUntilEntered()
+        _ = try await repository.revoke(match)
+        await gate.release()
+
+        await assertRepositoryError(.invalidated) { try await staleLookup.value }
+    }
+
+    func testUncertainMutationFailureInvalidatesAnOlderInFlightLookup() async throws {
+        let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(50))
+        let token = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 0))
+        await wallet.setPage(
+            offset: 0,
+            result: try await page(total: 1, tokens: [token], wallet: wallet)
+        )
+        let repository = try repository(wallet: wallet)
+        let found = try await repository.findCovering(
+            .basketAccess(try dbapScope()), nowUnixTime: 1
+        )
+        let match = try XCTUnwrap(found)
+        let gate = AsyncRepositoryGate()
+        await wallet.setGate(gate, offset: 0)
+        await wallet.setMutationFailure(true)
+        let requestedScope = try dbapScope()
+        let staleLookup = Task {
+            try await repository.findCovering(
+                .basketAccess(requestedScope), nowUnixTime: 1
+            )
+        }
+        await gate.waitUntilEntered()
+
+        do {
+            _ = try await repository.revoke(match)
+            XCTFail("the simulated lost process response must be returned")
+        } catch let error as RepositoryMutationFailure {
+            XCTAssertEqual(error, .responseLostAfterCommit)
+        }
+        await gate.release()
+
+        await assertRepositoryError(.invalidated) { try await staleLookup.value }
+    }
+
     private func assertInterruptedLookup(invalidate: Bool) async throws {
         let wallet = RepositoryTestWallet(rootKey: try testPrivateKey(invalidate ? 36 : 37))
         let expired = PermissionToken.dbap(try .init(scope: try dbapScope(), expiry: 1))
@@ -565,6 +814,9 @@ private actor RepositoryTestWallet: PermissionTokenWallet {
     private var pages = [UInt32: WalletListOutputsResult]()
     private var requests = [WalletListOutputsRequest]()
     private var gates = [UInt32: AsyncRepositoryGate]()
+    private var mutations = [PermissionTokenMutationRequest]()
+    private var mutationGate: AsyncRepositoryGate?
+    private var mutationFailsAfterRecording = false
 
     init(rootKey: PrivateKey, accountID: PermissionAccountID = repositoryTestAccountID) {
         protoWallet = ProtoWallet(rootKey: rootKey)
@@ -578,9 +830,13 @@ private actor RepositoryTestWallet: PermissionTokenWallet {
     func setGate(_ gate: AsyncRepositoryGate, offset: UInt32) {
         gates[offset] = gate
     }
+    func setMutationGate(_ gate: AsyncRepositoryGate?) { mutationGate = gate }
+    func setMutationFailure(_ enabled: Bool) { mutationFailsAfterRecording = enabled }
 
     func recordedRequests() -> [WalletListOutputsRequest] { requests }
     func recordedRequestCount() -> Int { requests.count }
+    func recordedMutations() -> [PermissionTokenMutationRequest] { mutations }
+    func mutationCount() -> Int { mutations.count }
 
     func listPermissionTokenOutputs(
         _ request: WalletListOutputsRequest
@@ -591,6 +847,22 @@ private actor RepositoryTestWallet: PermissionTokenWallet {
         try Task.checkCancellation()
         if let result = pages[offset] { return result }
         return try WalletListOutputsResult(totalOutputs: 0, outputs: [])
+    }
+
+    func commitPermissionTokenMutation(
+        _ request: PermissionTokenMutationRequest
+    ) async throws -> PermissionTokenMutationResult {
+        if let mutationGate { await mutationGate.wait() }
+        mutations.append(request)
+        if mutationFailsAfterRecording {
+            throw RepositoryMutationFailure.responseLostAfterCommit
+        }
+        return PermissionTokenMutationResult(
+            transactionID: try TransactionID(
+                displayHex: String(repeating: "01", count: 32)
+            ),
+            reference: "cmVm"
+        )
     }
 
     nonisolated func getPublicKey(
@@ -618,6 +890,10 @@ private actor RepositoryTestWallet: PermissionTokenWallet {
     ) async throws -> WalletVerifySignatureResult {
         try await protoWallet.verifySignature(request)
     }
+}
+
+private enum RepositoryMutationFailure: Error, Equatable {
+    case responseLostAfterCommit
 }
 
 private let repositoryTestAccountID = try! PermissionAccountID("account")
