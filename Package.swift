@@ -191,7 +191,11 @@ let package = Package(
                 .product(name: "BSVKeys", package: "swift-sdk"),
             ]
         ),
-        .testTarget(name: "ToolboxPortableTests", dependencies: ["ToolboxPortable"]),
+        .testTarget(
+            name: "ToolboxPortableTests",
+            dependencies: ["ToolboxPortable"],
+            resources: [.copy("Fixtures")]
+        ),
         .testTarget(name: "ToolboxStorageTests", dependencies: ["ToolboxStorage"]),
         .testTarget(
             name: "ToolboxStorageClientTests",

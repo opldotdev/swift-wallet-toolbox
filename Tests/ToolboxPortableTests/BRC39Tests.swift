@@ -9,10 +9,10 @@ final class BRC39Tests: XCTestCase {
         XCTAssertEqual(envelope.header.iterations, 7)
         XCTAssertEqual(envelope.header.memoryKiB, 131_072)
         XCTAssertEqual(envelope.header.parallelism, 1)
-        XCTAssertEqual(envelope.salt, [UInt8](repeating: 7, count: 32))
-        XCTAssertEqual(envelope.nonce, [UInt8](repeating: 9, count: 32))
-        XCTAssertEqual(envelope.ciphertext, [1, 2, 3])
-        XCTAssertEqual(envelope.authenticationTag, [UInt8](repeating: 11, count: 16))
+        XCTAssertEqual(Array(envelope.salt), [UInt8](repeating: 7, count: 32))
+        XCTAssertEqual(Array(envelope.nonce), [UInt8](repeating: 9, count: 32))
+        XCTAssertEqual(Array(envelope.ciphertext), [1, 2, 3])
+        XCTAssertEqual(Array(envelope.authenticationTag), [UInt8](repeating: 11, count: 16))
     }
 
     func test_rejectsInvalidConstantsReservedBytesAndEmptyCiphertext() throws {
@@ -47,6 +47,19 @@ final class BRC39Tests: XCTestCase {
         XCTAssertThrowsError(try BRC39Envelope.parse(excessiveMemory)) {
             XCTAssertEqual($0 as? BRC39Error, .memoryTooLarge)
         }
+        let aboveMobileDefault = replacing(makeFile(), range: 15 ..< 19, with: [0, 4, 0, 1])
+        XCTAssertThrowsError(try BRC39Envelope.parse(aboveMobileDefault)) {
+            XCTAssertEqual($0 as? BRC39Error, .memoryTooLarge)
+        }
+        XCTAssertNoThrow(try BRC39Envelope.parse(
+            aboveMobileDefault,
+            limits: BRC39Limits(
+                maximumFileByteCount: 1_024,
+                maximumIterations: 32,
+                maximumMemoryKiB: 1_048_576,
+                maximumParallelism: 16
+            )
+        ))
         XCTAssertThrowsError(try BRC39Envelope.parse(
             makeFile(),
             limits: BRC39Limits(

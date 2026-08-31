@@ -84,6 +84,14 @@ public struct BRC38Tables: Equatable, Sendable {
 /// wallet-runtime custody snapshots.
 public struct BRC38WalletData: Equatable, Sendable {
     public static let title = "User Wallet Data Format"
+    private static let documentFields: Set<String> = [
+        "brc", "title", "formatVersion", "exportedAt", "sourceStorage", "user", "tables",
+    ]
+    private static let tableFields: Set<String> = [
+        "provenTxs", "provenTxReqs", "outputBaskets", "transactions", "commissions",
+        "outputs", "outputTags", "outputTagMaps", "txLabels", "txLabelMaps", "certificates",
+        "certificateFields", "syncStates",
+    ]
 
     public let exportedAt: String
     public let sourceStorage: BRC38PortableRow
@@ -113,6 +121,7 @@ public struct BRC38WalletData: Equatable, Sendable {
         guard bytes.count <= limits.maximumUTF8ByteCount else {
             throw BRC38Error.documentTooLarge(maximumByteCount: limits.maximumUTF8ByteCount)
         }
+        try StrictJSONPreflight.validate(bytes)
 
         let root: JSONValue
         do {
@@ -122,6 +131,7 @@ public struct BRC38WalletData: Equatable, Sendable {
         }
         try BRC38Validator.rejectNulls(root, path: "document")
         guard let object = root.objectValue else { throw BRC38Error.expectedObject("document") }
+        try rejectUnknownFields(object, allowed: documentFields, path: "document")
         guard object["brc"]?.intValue == 38 else { throw BRC38Error.invalidConstant("brc") }
         guard object["title"]?.stringValue == title else {
             throw BRC38Error.invalidConstant("title")
@@ -137,6 +147,7 @@ public struct BRC38WalletData: Equatable, Sendable {
         guard let tableObject = object["tables"]?.objectValue else {
             throw BRC38Error.expectedObject("tables")
         }
+        try rejectUnknownFields(tableObject, allowed: tableFields, path: "tables")
 
         let tables = try BRC38Tables(
             provenTxs: BRC38Validator.rows(tableObject, "provenTxs"),
@@ -162,6 +173,16 @@ public struct BRC38WalletData: Equatable, Sendable {
         )
     }
 
+    private static func rejectUnknownFields(
+        _ object: [String: JSONValue],
+        allowed: Set<String>,
+        path: String
+    ) throws {
+        if let unknown = object.keys.first(where: { !allowed.contains($0) }) {
+            throw BRC38Error.unknownField("\(path).\(unknown)")
+        }
+    }
+
     /// Serializes this document using RFC 8785 JCS and BRC-38's required table ordering.
     public func canonicalJSON() throws -> String {
         try JCS.serialize(.object([
@@ -178,9 +199,12 @@ public struct BRC38WalletData: Equatable, Sendable {
 
 public enum BRC38Error: Error, Equatable, Sendable {
     case invalidJSON
+    case duplicateJSONKey(String)
+    case ambiguousJSONKey(String)
     case documentTooLarge(maximumByteCount: Int)
     case tooManyRows(maximum: Int)
     case missingField(String)
+    case unknownField(String)
     case invalidConstant(String)
     case expectedObject(String)
     case expectedArray(String)
@@ -190,6 +214,7 @@ public enum BRC38Error: Error, Equatable, Sendable {
     case invalidJSONField(String)
     case invalidInteger(String)
     case invalidString(String)
+    case invalidBoolean(String)
     case duplicateID(String)
     case relationship(String)
     case canonicalization
@@ -199,9 +224,12 @@ extension BRC38Error: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidJSON: "Invalid BRC-38 JSON"
+        case .duplicateJSONKey(let key): "BRC-38 JSON contains duplicate key \(key)"
+        case .ambiguousJSONKey(let key): "BRC-38 JSON contains a key Swift cannot preserve: \(key)"
         case .documentTooLarge(let maximum): "BRC-38 document exceeds \(maximum) bytes"
         case .tooManyRows(let maximum): "BRC-38 document exceeds \(maximum) rows"
         case .missingField(let path): "BRC-38 is missing \(path)"
+        case .unknownField(let path): "BRC-38 contains unsupported field \(path)"
         case .invalidConstant(let path): "BRC-38 has an unsupported \(path)"
         case .expectedObject(let path): "BRC-38 \(path) must be an object"
         case .expectedArray(let path): "BRC-38 \(path) must be an array"
@@ -211,6 +239,7 @@ extension BRC38Error: LocalizedError {
         case .invalidJSONField(let path): "BRC-38 \(path) must be an object"
         case .invalidInteger(let path): "BRC-38 \(path) must be an integer"
         case .invalidString(let path): "BRC-38 \(path) must be a string"
+        case .invalidBoolean(let path): "BRC-38 \(path) must be a boolean"
         case .duplicateID(let path): "BRC-38 contains duplicate \(path)"
         case .relationship(let path): "BRC-38 relationship does not resolve: \(path)"
         case .canonicalization: "BRC-38 contains a value that cannot be canonicalized"

@@ -82,7 +82,7 @@ enum JCS {
         return negative ? "-" + result : result
     }
 
-    private static func utf16Less(_ left: String, _ right: String) -> Bool {
+    static func utf16Less(_ left: String, _ right: String) -> Bool {
         Array(left.utf16).lexicographicallyPrecedes(Array(right.utf16))
     }
 }

@@ -1,4 +1,4 @@
-/// Resource and KDF bounds applied before a BRC-39 importer allocates memory or decrypts data.
+/// Resource and KDF bounds applied before a BRC-39 importer allocates KDF memory or decrypts data.
 public struct BRC39Limits: Equatable, Sendable {
     public let maximumFileByteCount: Int
     public let maximumIterations: UInt32
@@ -19,9 +19,9 @@ public struct BRC39Limits: Equatable, Sendable {
 
     public static let standard = BRC39Limits(
         maximumFileByteCount: (64 << 20) + 97 + 16,
-        maximumIterations: 32,
-        maximumMemoryKiB: 1_048_576,
-        maximumParallelism: 16
+        maximumIterations: 16,
+        maximumMemoryKiB: 262_144,
+        maximumParallelism: 4
     )
 }
 
@@ -49,10 +49,11 @@ public struct BRC39Header: Equatable, Sendable {
 /// invoking Argon2id or AES-GCM.
 public struct BRC39Envelope: Equatable, Sendable {
     public let header: BRC39Header
-    public let salt: [UInt8]
-    public let nonce: [UInt8]
-    public let ciphertext: [UInt8]
-    public let authenticationTag: [UInt8]
+    /// Slices retain the caller's input buffer and avoid copying a potentially 64 MiB ciphertext.
+    public let salt: ArraySlice<UInt8>
+    public let nonce: ArraySlice<UInt8>
+    public let ciphertext: ArraySlice<UInt8>
+    public let authenticationTag: ArraySlice<UInt8>
 
     public static func parse(
         _ file: [UInt8],
@@ -106,10 +107,10 @@ public struct BRC39Envelope: Equatable, Sendable {
                 parallelism: parallelism,
                 derivedKeyByteCount: derivedKeyByteCount
             ),
-            salt: Array(file[saltStart ..< nonceStart]),
-            nonce: Array(file[nonceStart ..< payloadStart]),
-            ciphertext: Array(file[payloadStart ..< tagStart]),
-            authenticationTag: Array(file[tagStart...])
+            salt: file[saltStart ..< nonceStart],
+            nonce: file[nonceStart ..< payloadStart],
+            ciphertext: file[payloadStart ..< tagStart],
+            authenticationTag: file[tagStart...]
         )
     }
 
