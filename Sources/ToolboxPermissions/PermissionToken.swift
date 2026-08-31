@@ -137,6 +137,7 @@ public enum PermissionTokenError: Error, Equatable, Sendable {
     case unexpectedFieldCount(actual: Int, expected: Int)
     case invalidSignature
     case lockingPublicKeyMismatch
+    case decryptionFailed(fieldIndex: Int)
     case invalidUTF8(field: String)
     case invalidUnsignedInteger(field: String)
     case invalidBoolean(field: String)

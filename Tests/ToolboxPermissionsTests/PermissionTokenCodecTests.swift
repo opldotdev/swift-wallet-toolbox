@@ -32,21 +32,12 @@ final class PermissionTokenCodecTests: XCTestCase {
         XCTAssertEqual(try textFields(tokens[3]), ["example.com", "10000"])
         XCTAssertEqual(tokens.map(\.basket), PermissionTokenBasket.allCases)
 
-        let levelOne = PermissionToken.dpacp(try .init(
-            scope: .init(
-                originator: CanonicalOriginator("example.com"),
-                privileged: false,
-                securityLevel: .application,
-                protocolName: "example signing",
-                counterparty: .anyone
-            ),
-            expiry: 0
-        ))
+        let levelOne = try levelOneToken()
         XCTAssertEqual(try textFields(levelOne), [
             "example.com", "0", "false", "1", "example signing", "",
         ])
 
-        let wallet = RecordingLegacyWallet(rootKey: try testPrivateKey(1))
+        let wallet = RecordingTestWallet(rootKey: try testPrivateKey(1))
         _ = try await PermissionTokenCodec.encode(tokens[0], using: wallet)
         let calls = await wallet.encryptRequests
         XCTAssertEqual(calls.map { String(decoding: $0.plaintext, as: UTF8.self) }, try textFields(tokens[0]))
@@ -60,7 +51,7 @@ final class PermissionTokenCodecTests: XCTestCase {
 
     func testAllTokenTypesRoundTripWithEncryptedSignedLockBeforePushDrop() async throws {
         let wallet = ProtoWallet(rootKey: try testPrivateKey(7))
-        for token in try fixtures() {
+        for token in try fixtures() + [levelOneToken()] {
             let script = try await PermissionTokenCodec.encode(token, using: wallet)
             XCTAssertThrowsError(try PushDrop.decode(script, lockPosition: .after))
             let structural = try PushDrop.decode(script, lockPosition: .beforeCompatibility)
@@ -112,34 +103,51 @@ final class PermissionTokenCodecTests: XCTestCase {
         }
     }
 
-    func testLegacyPlaintextFallbackIsOnlyAfterDecryptFailure() async throws {
-        let wallet = RecordingLegacyWallet(rootKey: try testPrivateKey(4))
+    func testDecryptFailureRejectsInsteadOfAuthorizingPlaintext() async throws {
+        let wallet = RecordingTestWallet(rootKey: try testPrivateKey(4), decryption: .fail)
         let token = try fixtures()[0]
         let script = try await PermissionTokenCodec.encode(token, using: wallet)
-        let roundTripped = try await PermissionTokenCodec.decode(
-            script,
-            from: token.basket,
-            using: wallet
-        )
-        XCTAssertEqual(roundTripped, token)
-        let decryptCallCount = await wallet.decryptCallCount
-        XCTAssertEqual(decryptCallCount, 6)
-
-        let malformed = try await signedPlaintextScript(
-            fields: ["example.com", "123", "not-bool", "2", "example protocol", "self"],
-            wallet: wallet
-        )
-        await assertTokenError(.invalidBoolean(field: "privileged")) {
+        await assertTokenError(.decryptionFailed(fieldIndex: 0)) {
             try await PermissionTokenCodec.decode(
-                malformed,
-                from: .protocolPermission,
+                script,
+                from: token.basket,
+                using: wallet
+            )
+        }
+        let decryptCallCount = await wallet.decryptCallCount
+        XCTAssertEqual(decryptCallCount, 1)
+    }
+
+    func testDBAPBoundaryRepartitionCannotAuthorize() async throws {
+        let wallet = ProtoWallet(rootKey: try testPrivateKey(10))
+        let token = try fixtures()[1]
+        let script = try await PermissionTokenCodec.encode(token, using: wallet)
+        let decoded = try PushDrop.decode(script, lockPosition: .beforeCompatibility)
+        var repartitionedFields = decoded.fields
+        let movedByte = repartitionedFields[0].removeLast()
+        repartitionedFields[1].insert(movedByte, at: 0)
+
+        XCTAssertEqual(
+            decoded.fields.dropLast().flatMap { $0 },
+            repartitionedFields.dropLast().flatMap { $0 },
+            "the trailing signature still covers the same concatenated bytes"
+        )
+        let collision = try PushDrop.lockingScript(
+            fields: repartitionedFields,
+            publicKey: decoded.publicKey,
+            lockPosition: .beforeCompatibility
+        )
+        await assertTokenError(.decryptionFailed(fieldIndex: 0)) {
+            try await PermissionTokenCodec.decode(
+                collision,
+                from: .basketAccess,
                 using: wallet
             )
         }
     }
 
     func testStrictProtocolValidationRejectsLevelZeroUnknownAndMalformedFields() async throws {
-        let wallet = RecordingLegacyWallet(rootKey: try testPrivateKey(5))
+        let wallet = RecordingTestWallet(rootKey: try testPrivateKey(5))
         for level in ["0", "3", "-1"] {
             let script = try await signedPlaintextScript(
                 fields: ["example.com", "1", "false", level, "example protocol", "self"],
@@ -154,7 +162,7 @@ final class PermissionTokenCodecTests: XCTestCase {
             }
         }
 
-        for validLevelOneCounterparty in ["", "self", "anyone"] {
+        for validLevelOneCounterparty in ["self", "anyone"] {
             let script = try await signedPlaintextScript(
                 fields: ["example.com", "0", "false", "1", "example signing", validLevelOneCounterparty],
                 wallet: wallet
@@ -188,7 +196,7 @@ final class PermissionTokenCodecTests: XCTestCase {
     }
 
     func testExactCountsIncludingDSAPTwoFields() async throws {
-        let wallet = RecordingLegacyWallet(rootKey: try testPrivateKey(6))
+        let wallet = RecordingTestWallet(rootKey: try testPrivateKey(6))
         let cases: [(PermissionTokenBasket, [String], Int)] = [
             (.protocolPermission, ["example.com", "0", "false", "1", "example protocol"], 7),
             (.basketAccess, ["example.com", "0"], 4),
@@ -269,6 +277,19 @@ final class PermissionTokenCodecTests: XCTestCase {
         ]
     }
 
+    private func levelOneToken() throws -> PermissionToken {
+        .dpacp(try .init(
+            scope: .init(
+                originator: CanonicalOriginator("example.com"),
+                privileged: false,
+                securityLevel: .application,
+                protocolName: "example signing",
+                counterparty: .anyone
+            ),
+            expiry: 0
+        ))
+    }
+
     private func textFields(_ token: PermissionToken) throws -> [String] {
         try PermissionTokenCodec.semanticFields(for: token).map {
             guard let text = String(bytes: $0, encoding: .utf8) else {
@@ -288,14 +309,14 @@ final class PermissionTokenCodecTests: XCTestCase {
 
     private func signedPlaintextScript(
         fields: [String],
-        wallet: RecordingLegacyWallet
+        wallet: RecordingTestWallet
     ) async throws -> Script {
         try await signedPlaintextScript(fields: fields.map(bytes), wallet: wallet)
     }
 
     private func signedPlaintextScript(
         fields: [[UInt8]],
-        wallet: RecordingLegacyWallet
+        wallet: RecordingTestWallet
     ) async throws -> Script {
         try await PushDrop.lockingScript(
             fields: fields,
@@ -332,17 +353,24 @@ private enum TestWalletError: Error {
     case invalidUTF8
 }
 
-private actor RecordingLegacyWallet:
+private enum TestDecryptionBehavior: Sendable {
+    case identity
+    case fail
+}
+
+private actor RecordingTestWallet:
     WalletPublicKeyProviding,
     WalletCipherOperations,
     WalletSignatureOperations
 {
     private let wallet: ProtoWallet
+    private let decryption: TestDecryptionBehavior
     private(set) var encryptRequests = [WalletEncryptRequest]()
     private(set) var decryptCallCount = 0
 
-    init(rootKey: PrivateKey) {
+    init(rootKey: PrivateKey, decryption: TestDecryptionBehavior = .identity) {
         wallet = ProtoWallet(rootKey: rootKey)
+        self.decryption = decryption
     }
 
     func getPublicKey(_ request: WalletGetPublicKeyRequest) async throws -> WalletGetPublicKeyResult {
@@ -356,7 +384,10 @@ private actor RecordingLegacyWallet:
 
     func decrypt(_ request: WalletDecryptRequest) async throws -> WalletDecryptResult {
         decryptCallCount += 1
-        throw TestWalletError.decryptionFailure
+        switch decryption {
+        case .identity: return .init(plaintext: request.ciphertext)
+        case .fail: throw TestWalletError.decryptionFailure
+        }
     }
 
     func createSignature(_ request: WalletCreateSignatureRequest) async throws -> WalletCreateSignatureResult {

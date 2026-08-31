@@ -56,9 +56,9 @@ public enum PermissionTokenCodec {
 
     /// Decodes a token from the admin basket that identifies its encrypted field schema.
     ///
-    /// For compatibility with the live TypeScript wallet-toolbox, a field whose decrypt call
-    /// fails is treated as a legacy plaintext field. The signed lock, wallet-owned locking key,
-    /// exact field count, and all semantic validation remain mandatory.
+    /// Every field must pass wallet-authenticated decryption. This is an authorization boundary:
+    /// PushDrop's signature covers concatenated bytes but not field boundaries, so treating a
+    /// failed ciphertext as plaintext would allow a signed payload to be repartitioned.
     public static func decode(
         _ script: Script,
         from basket: PermissionTokenBasket,
@@ -91,27 +91,11 @@ public enum PermissionTokenCodec {
         } catch {
             throw PermissionTokenError.invalidSignature
         }
-        var signedPayload = signingPayload(encryptedFields)
-        let primarySignatureIsValid = decoded.publicKey.verify(
+        let signedPayload = signingPayload(encryptedFields)
+        guard decoded.publicKey.verify(
             signature,
             digest: BSVHashing.sha256(signedPayload)
-        )
-        var legacyEmptyLevelOneCounterparty = false
-        if !primarySignatureIsValid,
-           basket == .protocolPermission,
-           encryptedFields[5] == [0] {
-            // Script OP_0 cannot preserve the distinction between an empty byte vector and the
-            // single zero byte returned by Swift PushDrop.decode. The TS encoder signs the
-            // original empty Level-1 counterparty, so retry exactly that one legacy shape.
-            var legacyFields = encryptedFields
-            legacyFields[5] = []
-            signedPayload = signingPayload(legacyFields)
-            legacyEmptyLevelOneCounterparty = decoded.publicKey.verify(
-                signature,
-                digest: BSVHashing.sha256(signedPayload)
-            )
-        }
-        guard primarySignatureIsValid || legacyEmptyLevelOneCounterparty else {
+        ) else {
             throw PermissionTokenError.invalidSignature
         }
 
@@ -142,10 +126,7 @@ public enum PermissionTokenCodec {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // Exact compatibility with WalletPermissionsManager.decryptPermissionTokenField.
-                plaintextFields.append(
-                    legacyEmptyLevelOneCounterparty && index == 5 ? [] : field
-                )
+                throw PermissionTokenError.decryptionFailed(fieldIndex: index)
             }
         }
         try Task.checkCancellation()
