@@ -155,7 +155,9 @@ let package = Package(
         .target(
             name: "ToolboxPermissions",
             dependencies: [
+                .product(name: "BSVCrypto", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVScript", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
             ]
         ),
@@ -235,6 +237,7 @@ let package = Package(
                 "ToolboxPermissions",
                 .product(name: "BSVCore", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVScript", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
             ]
