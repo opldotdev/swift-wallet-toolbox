@@ -11,5 +11,6 @@
 @_exported import ToolboxServices
 @_exported import ToolboxPaymail
 @_exported import ToolboxActions
+@_exported import ToolboxPermissions
 @_exported import ToolboxWallet
 @_exported import ToolboxMonitor
