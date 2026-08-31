@@ -15,4 +15,8 @@ public protocol PermissionTokenWallet:
     func listPermissionTokenOutputs(
         _ request: WalletListOutputsRequest
     ) async throws -> WalletListOutputsResult
+
+    func commitPermissionTokenMutation(
+        _ request: PermissionTokenMutationRequest
+    ) async throws -> PermissionTokenMutationResult
 }
