@@ -149,7 +149,7 @@ public enum ActionSigner {
         }
 
         enum SigningPlan {
-            case brc29(index: Int, key: PrivateKey)
+            case brc29(index: Int, input: StorageActionInput)
             case permissionToken(index: Int, signer: any WalletSignatureOperations)
         }
 
@@ -209,34 +209,88 @@ public enum ActionSigner {
                 continue
             }
 
-            guard let prefix = input.derivationPrefix,
-                  let suffix = input.derivationSuffix else {
+            guard input.derivationPrefix != nil,
+                  input.derivationSuffix != nil else {
                 throw ActionError.unusableInput(
                     "input \(index) is neither a declared permission token nor a derived BRC-29 input"
                 )
             }
-            let sender = try inputSender(
-                input, at: index, fallback: senderPublicKey
-            )
-            let spendingKey = try BRC29.receivingPrivateKey(
-                recipient: identityKey,
-                sender: sender,
-                prefix: prefix,
-                suffix: suffix
-            )
-            let expectedScript = try BRC29.lockingScript(for: spendingKey.publicKey).bytes
-            guard input.sourceLockingScript == expectedScript else {
-                throw ActionError.unusableInput(
-                    "input \(index) is not a BRC-29 output locked to its recorded derivation"
-                )
-            }
-            plans.append(.brc29(index: index, key: spendingKey))
+            plans.append(.brc29(index: index, input: input))
         }
 
         if let missing = declarations.keys.first(where: { !matchedDeclarations.contains($0) }) {
             throw ActionError.unusableInput(
                 "declared permission token is absent from the funded action: \(missing)"
             )
+        }
+
+        // SDK input signers validate the candidate they see, one input at a time. Without this
+        // aggregate projection, an early wallet signature can be requested before a later input
+        // makes the completed transaction exceed its limit. Project every input at the SDK's safe
+        // maximum first, then validate the single completed candidate before deriving or using an
+        // input private key.
+        var projected = transaction
+        let maximumScriptByteCount = Int(min(
+            limits.maximumScriptByteCount,
+            UInt64(Int.max)
+        ))
+        for plan in plans {
+            let index: Int
+            let projectedByteCount: Int
+            switch plan {
+            case .brc29(let inputIndex, _):
+                index = inputIndex
+                projectedByteCount =
+                    TransactionInput.payToPublicKeyHashUnlockingScriptByteCount
+            case .permissionToken(let inputIndex, _):
+                index = inputIndex
+                projectedByteCount = TransactionInput.pushDropUnlockingScriptByteCount
+            }
+            projected.inputs[index].unlockingScript = try Script(
+                bytes: [UInt8](repeating: 0, count: projectedByteCount),
+                maximumByteCount: maximumScriptByteCount
+            )
+        }
+        _ = try projected.serializedByteCount(limits: limits)
+
+        enum ResolvedSigningPlan {
+            case brc29(index: Int, key: PrivateKey)
+            case permissionToken(index: Int, signer: any WalletSignatureOperations)
+        }
+
+        // Resolve every ordinary key before requesting any token signature. A bad derivation or
+        // source script therefore cannot leave an external signer having acted on a transaction
+        // this method will later refuse.
+        var resolvedPlans: [ResolvedSigningPlan] = []
+        resolvedPlans.reserveCapacity(plans.count)
+        for plan in plans {
+            switch plan {
+            case .brc29(let index, let input):
+                guard let prefix = input.derivationPrefix,
+                      let suffix = input.derivationSuffix else {
+                    throw ActionError.unusableInput(
+                        "input \(index) is missing its BRC-29 derivation"
+                    )
+                }
+                let sender = try inputSender(
+                    input, at: index, fallback: senderPublicKey
+                )
+                let spendingKey = try BRC29.receivingPrivateKey(
+                    recipient: identityKey,
+                    sender: sender,
+                    prefix: prefix,
+                    suffix: suffix
+                )
+                let expectedScript = try BRC29.lockingScript(for: spendingKey.publicKey).bytes
+                guard input.sourceLockingScript == expectedScript else {
+                    throw ActionError.unusableInput(
+                        "input \(index) is not a BRC-29 output locked to its recorded derivation"
+                    )
+                }
+                resolvedPlans.append(.brc29(index: index, key: spendingKey))
+            case .permissionToken(let index, let signer):
+                resolvedPlans.append(.permissionToken(index: index, signer: signer))
+            }
         }
 
         let protocolID = try WalletProtocolID.walletInternalAdmin(
@@ -247,7 +301,7 @@ public enum ActionSigner {
 
         // Mutate only this local candidate. If any signer fails, no partly signed transaction is
         // returned to the caller.
-        for plan in plans {
+        for plan in resolvedPlans {
             switch plan {
             case .brc29(let index, let key):
                 try transaction.signPayToPublicKeyHashInput(

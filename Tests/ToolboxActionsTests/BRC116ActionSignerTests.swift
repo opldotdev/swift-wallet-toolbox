@@ -444,6 +444,79 @@ final class BRC116ActionSignerTests: XCTestCase {
         let signatureCount = await token.signer.signatureCount()
         XCTAssertEqual(signatureCount, 0)
     }
+
+    func test_aggregateProjectionRefusesBeforeEitherTokenSignerRuns() async throws {
+        let identity = try key(1)
+        let sender = try key(2).publicKey
+        let first = try await tokenFixture()
+        let second = try await tokenFixture(txid: otherTXID)
+        let requested = [try requestedOutput(satoshis: 0)]
+        let action = funded(
+            requested: requested,
+            inputs: [first.input, second.input]
+        )
+        let generous = try TransactionLimits(
+            maximumTransactionByteCount: 10_000,
+            maximumInputCount: 10,
+            maximumOutputCount: 10,
+            maximumScriptByteCount: 1_000
+        )
+        var oneTokenProjected = try ActionAssembler.assemble(
+            action,
+            requested: requested,
+            changeKey: identity,
+            limits: generous
+        )
+        oneTokenProjected.inputs[0].unlockingScript = try Script(
+            bytes: [UInt8](
+                repeating: 0,
+                count: TransactionInput.pushDropUnlockingScriptByteCount
+            ),
+            maximumByteCount: 1_000
+        )
+        let oneTokenMaximum = try oneTokenProjected.serializedByteCount(limits: generous)
+        var bothTokensProjected = oneTokenProjected
+        bothTokensProjected.inputs[1].unlockingScript = try Script(
+            bytes: [UInt8](
+                repeating: 0,
+                count: TransactionInput.pushDropUnlockingScriptByteCount
+            ),
+            maximumByteCount: 1_000
+        )
+        let bothTokensByteCount = try bothTokensProjected.serializedByteCount(limits: generous)
+        let tight = try TransactionLimits(
+            maximumTransactionByteCount: oneTokenMaximum,
+            maximumInputCount: 10,
+            maximumOutputCount: 10,
+            maximumScriptByteCount: 1_000
+        )
+
+        do {
+            _ = try await ActionSigner.signBRC116PermissionTokenAction(
+                action,
+                requested: requested,
+                identityKey: identity,
+                senderPublicKey: sender,
+                permissionTokenSpends: [first.declaration, second.declaration],
+                maximumFee: 10_000,
+                limits: tight
+            )
+            XCTFail("the completed two-token projection must exceed the one-token limit")
+        } catch {
+            XCTAssertEqual(
+                error as? TransactionError,
+                .transactionTooLarge(
+                    actual: bothTokensByteCount,
+                    maximum: oneTokenMaximum
+                )
+            )
+        }
+
+        let firstSignatureCount = await first.signer.signatureCount()
+        let secondSignatureCount = await second.signer.signatureCount()
+        XCTAssertEqual(firstSignatureCount, 0)
+        XCTAssertEqual(secondSignatureCount, 0)
+    }
 }
 
 private actor CountingSignatureWallet: WalletSignatureOperations {
