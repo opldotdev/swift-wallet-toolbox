@@ -144,6 +144,27 @@ final class OutputVerificationTests: XCTestCase {
         )
     }
 
+    func test_requestedOutputReclassifiedAsStorageChangeIsRefused() throws {
+        let payment = try requested(satoshis: 1_000)
+        let reclassified = StorageActionOutput(
+            vout: 0,
+            satoshis: payment.satoshis,
+            lockingScript: payment.lockingScript,
+            providedBy: .storage,
+            purpose: .change,
+            derivationSuffix: "Su=="
+        )
+
+        XCTAssertThrowsError(try OutputVerification.verify(
+            requested: [payment], returned: [reclassified]
+        )) {
+            XCTAssertEqual(
+                $0 as? ActionError,
+                .storageAlteredOutputs("storage altered output 0")
+            )
+        }
+    }
+
     // MARK: - The second check: what storage added
 
     /// The attack the first check does not catch. Requested outputs untouched, and an extra one

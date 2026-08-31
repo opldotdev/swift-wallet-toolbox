@@ -433,7 +433,7 @@ public struct RemoteWallet: Sendable {
                 funded, requested: requestedOutputs, changeKey: identityKey
             )
             let fundedSourceGraph = try Self.validatedFundedSourceGraph(
-                funded, subject: unsigned
+                funded, subject: unsigned, expectedSourceGraph: inputBEEF
             )
             try Task.checkCancellation()
             let declarations = try mutation.consumed.map { match in
@@ -501,13 +501,15 @@ public struct RemoteWallet: Sendable {
         for match in matches.dropFirst() {
             merged = try merged.merging(match.sourceBEEF, limits: StorageLimits.beef)
         }
+        _ = try merged.merkleRootsByBlockHeight()
         return merged
     }
 
     /// Checks storage's complete input graph against every funded source before any signer runs.
     private static func validatedFundedSourceGraph(
         _ funded: StorageCreateActionResult,
-        subject: Transaction
+        subject: Transaction,
+        expectedSourceGraph: BEEF?
     ) throws -> BEEF {
         let graph: BEEF
         if let bytes = funded.inputBEEF {
@@ -553,6 +555,31 @@ public struct RemoteWallet: Sendable {
         )
         let subjectID = try subject.transactionID(limits: StorageLimits.transaction)
         do {
+            // Storage cannot supply two different claimed roots for one block height. Atomic BEEF
+            // checks exact ancestry, while this cross-path consistency check is deliberately
+            // separate in the SDK.
+            _ = try candidate.merkleRootsByBlockHeight()
+            if let expectedSourceGraph {
+                // Storage may add funding ancestry, but it may not strip or replace proof metadata
+                // from the exact source graph supplied with the request. Normalize both sides via
+                // the graph merger so BUMP leaf unions and raw/raw-with-path spelling compare by
+                // their semantic graph rather than their original wire order.
+                let empty = try BEEF(
+                    version: graph.version,
+                    merklePaths: [],
+                    transactions: [],
+                    limits: StorageLimits.beef
+                )
+                let normalizedReturned = try graph.merging(
+                    empty, limits: StorageLimits.beef
+                )
+                let returnedWithExpected = try graph.merging(
+                    expectedSourceGraph, limits: StorageLimits.beef
+                )
+                guard returnedWithExpected == normalizedReturned else {
+                    throw PermissionTokenMutationError.untrustworthyFundedBEEF
+                }
+            }
             _ = try AtomicBEEF(
                 subjectTransactionID: subjectID,
                 beef: candidate,

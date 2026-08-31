@@ -94,6 +94,17 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
                 include: .entireTransactions, includeTags: true,
                 pagination: WalletPagination(limit: 100), seekPermission: true
             ),
+            try WalletListOutputsRequest(
+                basket: exact.basket, tags: exact.tags, tagQueryMode: .all,
+                include: .entireTransactions, includeCustomInstructions: true,
+                includeTags: true, pagination: WalletPagination(limit: 100),
+                seekPermission: false
+            ),
+            try WalletListOutputsRequest(
+                basket: exact.basket, tags: exact.tags, tagQueryMode: .all,
+                include: .entireTransactions, includeTags: true, includeLabels: true,
+                pagination: WalletPagination(limit: 100), seekPermission: false
+            ),
         ]
 
         for request in invalid {
@@ -284,6 +295,92 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
         XCTAssertEqual(atomic.beef.merklePaths.count, 1)
         let successAbortCount = await transport.abortCount()
         XCTAssertEqual(successAbortCount, 0)
+    }
+
+    func testConflictingBUMPsAcrossConsumedSourcesFailBeforeReservation() async throws {
+        let key = try testIdentityKey()
+        let identity = key.publicKey.compressedBytes.map { String(format: "%02x", $0) }.joined()
+        let bootstrap = ScriptedPermissionTransport()
+        let bootstrapAdapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+            key: key, auth: AuthID(identityKey: identity), transport: bootstrap
+        ))
+        let scope = BasketPermissionScope(
+            originator: try CanonicalOriginator("example.com"), basket: "payments"
+        )
+        let first = try await tokenSource(
+            .dbap(try .init(scope: scope, expiry: 1)),
+            adapter: bootstrapAdapter,
+            proven: true
+        )
+        let second = try await tokenSource(
+            .dbap(try .init(scope: scope, expiry: 2)),
+            adapter: bootstrapAdapter,
+            proven: true
+        )
+        let transport = MutationTransport(sources: [first.fixture, second.fixture])
+        let adapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+            key: key, auth: AuthID(identityKey: identity), transport: transport
+        ))
+        let request = try PermissionTokenMutationRequest(
+            accountID: adapter.permissionAccountID,
+            consumed: [first.match, second.match],
+            created: []
+        )
+
+        do {
+            _ = try await adapter.commitPermissionTokenMutation(request)
+            XCTFail("different roots at one height must fail before reservation")
+        } catch let error as BEEFError {
+            XCTAssertEqual(error, .conflictingMerkleRoot(blockHeight: 1))
+        }
+        let methods = await transport.methods()
+        XCTAssertTrue(methods.isEmpty)
+    }
+
+    func testFundedProofAndRequestedOutputRoleAttacksAbortBeforeProcess() async throws {
+        let failures: [MutationTransport.Failure] = [
+            .stripSourceBUMP, .replaceSourceBUMP, .conflictingBUMP,
+            .reclassifyRequestedOutput,
+        ]
+        for failure in failures {
+            let key = try testIdentityKey()
+            let identity = key.publicKey.compressedBytes.map {
+                String(format: "%02x", $0)
+            }.joined()
+            let bootstrap = ScriptedPermissionTransport()
+            let bootstrapAdapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+                key: key, auth: AuthID(identityKey: identity), transport: bootstrap
+            ))
+            let scope = BasketPermissionScope(
+                originator: try CanonicalOriginator("example.com"), basket: "payments"
+            )
+            let source = try await tokenSource(
+                .dbap(try .init(scope: scope, expiry: 1)),
+                adapter: bootstrapAdapter,
+                proven: true
+            )
+            let replacement = PermissionToken.dbap(try .init(scope: scope, expiry: 0))
+            let transport = MutationTransport(
+                sources: [source.fixture], failure: failure
+            )
+            let adapter = try RemoteWalletPermissionTokenAdapter(wallet: wallet(
+                key: key, auth: AuthID(identityKey: identity), transport: transport
+            ))
+            let request = try PermissionTokenMutationRequest(
+                accountID: adapter.permissionAccountID,
+                consumed: [source.match],
+                created: [replacement]
+            )
+
+            do {
+                _ = try await adapter.commitPermissionTokenMutation(request)
+                XCTFail("storage proof/output-role attack must fail: \(failure)")
+            } catch {}
+            let methods = await transport.methods()
+            XCTAssertFalse(methods.contains("processAction"), "failure: \(failure)")
+            let abortCount = await transport.abortCount()
+            XCTAssertEqual(abortCount, 1, "failure: \(failure)")
+        }
     }
 
     func testFundedSourceOmissionSubstitutionAndUnrelatedGraphAbortBeforeProcess() async throws {
@@ -610,6 +707,8 @@ private actor MutationTransport: AuthenticatedTransport {
         case substituteOutput, process, omitBEEF, unrelatedBEEF
         case substituteInputScript, substituteInputValue, substituteInputOutpoint
         case invalidReference
+        case stripSourceBUMP, replaceSourceBUMP, conflictingBUMP
+        case reclassifyRequestedOutput
     }
 
     private let sources: [String: MutationSourceFixture]
@@ -719,6 +818,11 @@ private actor MutationTransport: AuthenticatedTransport {
             object["vout"] = .number(Double(index))
             object["providedBy"] = .string("you")
             if failure == .substituteOutput { object["satoshis"] = .number(2) }
+            if failure == .reclassifyRequestedOutput {
+                object["providedBy"] = .string("storage")
+                object["purpose"] = .string("change")
+                object["derivationSuffix"] = .string("Su==")
+            }
             return .object(object)
         }
         var object: [String: JSONValue] = [
@@ -728,6 +832,9 @@ private actor MutationTransport: AuthenticatedTransport {
             "inputs": .array(fundedInputs),
             "outputs": .array(outputRows),
         ]
+        if failure == .reclassifyRequestedOutput {
+            object["derivationPrefix"] = .string("Pr==")
+        }
         if failure != .omitBEEF {
             var inputBEEF = arguments["inputBEEF"] ?? .array([])
             if let extraBRC29 {
@@ -756,6 +863,63 @@ private actor MutationTransport: AuthenticatedTransport {
                     limits: StorageLimits.beef
                 )
                 inputBEEF = .array(try expanded.serialized(limits: StorageLimits.beef).map {
+                    .number(Double($0))
+                })
+            }
+            if failure == .stripSourceBUMP || failure == .replaceSourceBUMP
+                || failure == .conflictingBUMP {
+                let bytes = try byteArray(inputBEEF)
+                let graph = try BEEF(bytes: bytes, limits: StorageLimits.beef)
+                let fixture = try XCTUnwrap(sources.values.first)
+                let transactionID = fixture.outpoint.transactionID
+                let transactionHash = try Hash256(transactionID.wireBytes)
+                let paths: [MerklePath]
+                if failure == .stripSourceBUMP {
+                    paths = []
+                } else if failure == .replaceSourceBUMP {
+                    paths = [try MerklePath(
+                        blockHeight: 2,
+                        levels: [[.hash(
+                            offset: 0, hash: transactionHash, isTransactionID: true
+                        )]]
+                    )]
+                } else {
+                    let conflicting = try MerklePath(
+                        blockHeight: 1,
+                        levels: [[
+                            .hash(
+                                offset: 0,
+                                hash: transactionHash,
+                                isTransactionID: true
+                            ),
+                            .hash(
+                                offset: 1,
+                                hash: try Hash256([UInt8](repeating: 0xa5, count: 32)),
+                                isTransactionID: false
+                            ),
+                        ]]
+                    )
+                    paths = graph.merklePaths + [conflicting]
+                }
+                let transactions = try graph.transactions.map { entry -> BEEFTransaction in
+                    guard let transaction = entry.transaction else { return entry }
+                    let entryID = try entry.transactionID(limits: StorageLimits.transaction)
+                    if failure != .stripSourceBUMP, entryID == transactionID {
+                        return .rawWithMerklePath(
+                            transaction: transaction,
+                            merklePathIndex: failure == .replaceSourceBUMP
+                                ? 0 : graph.merklePaths.count
+                        )
+                    }
+                    return .raw(transaction)
+                }
+                let changed = try BEEF(
+                    version: graph.version,
+                    merklePaths: paths,
+                    transactions: transactions,
+                    limits: StorageLimits.beef
+                )
+                inputBEEF = .array(try changed.serialized(limits: StorageLimits.beef).map {
                     .number(Double($0))
                 })
             }

@@ -130,9 +130,11 @@ public actor PermissionTokenRepository {
         )
         try Task.checkCancellation()
         try requireActive(epoch)
-        let result = try await wallet.commitPermissionTokenMutation(request)
-        invalidationEpoch &+= 1
-        return result
+        // Once mutation execution is handed to the wallet, a transport error can be ambiguous:
+        // processAction may have committed remotely before its response was lost. Conservatively
+        // invalidate every older lookup whether the wallet returns success or throws.
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
     }
 
     /// Replaces the exact-scope token, including an expired token that cannot authorize use.
@@ -163,9 +165,8 @@ public actor PermissionTokenRepository {
         try requireActive(epoch)
         try reserveConsumedOutpoints(request.consumed)
         defer { releaseConsumedOutpoints(request.consumed) }
-        let result = try await wallet.commitPermissionTokenMutation(request)
-        invalidationEpoch &+= 1
-        return result
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
     }
 
     /// Revokes one exact account-bound token by consuming it without a replacement.
@@ -179,9 +180,8 @@ public actor PermissionTokenRepository {
         try requireActive(epoch)
         try reserveConsumedOutpoints(request.consumed)
         defer { releaseConsumedOutpoints(request.consumed) }
-        let result = try await wallet.commitPermissionTokenMutation(request)
-        invalidationEpoch &+= 1
-        return result
+        defer { invalidationEpoch &+= 1 }
+        return try await wallet.commitPermissionTokenMutation(request)
     }
 
     private func lookup(
@@ -460,6 +460,9 @@ public actor PermissionTokenRepository {
             transactions: transactions,
             limits: standardBEEFLimits
         )
+        // Atomic relevance/ancestry validation does not by itself reject two otherwise valid
+        // BUMPs that claim different roots for the same block height.
+        _ = try exact.merkleRootsByBlockHeight()
         _ = try AtomicBEEF(
             subjectTransactionID: subject,
             beef: exact,

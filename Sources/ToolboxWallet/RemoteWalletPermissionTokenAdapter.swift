@@ -22,7 +22,9 @@ public struct RemoteWalletPermissionTokenAdapter: PermissionTokenWallet, Sendabl
               request.include == .entireTransactions,
               request.seekPermission == false,
               request.tagQueryMode == .all,
+              request.includeCustomInstructions == nil,
               request.includeTags == true,
+              request.includeLabels == nil,
               request.pagination.limit == 100,
               Self.hasCanonicalTagShape(request) else {
             throw RemoteWalletPermissionTokenAdapterError.invalidListRequest
