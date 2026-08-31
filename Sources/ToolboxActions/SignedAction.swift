@@ -14,18 +14,19 @@ public struct SignedAction: Sendable {
     public let reference: String
     public let transaction: Transaction
     public let transactionID: TransactionID
-    /// The ancestor transactions this one spends, taken from the funded action's proof graph. The
-    /// envelope must carry them, because a verifier cannot check an input it cannot see.
-    let sourceTransactions: [Transaction]
+    /// The validated BRC-95 envelope, including the funded graph exactly as storage supplied it.
+    /// Keeping the envelope rather than flattening it to raw transactions preserves BUMPs,
+    /// BRC-96 transaction-ID anchors, and the original BEEF version.
+    private let envelope: AtomicBEEF
     private let beefLimits: BEEFLimits
-    private let transactionLimits: TransactionLimits
 
     /// Packages a signed transaction using the proof graph from the action that funded it.
     ///
-    /// `funded.inputBEEF` is the graph storage returned. It is parsed here and its transactions
-    /// become the ancestors of the outgoing envelope. When storage returned none, the envelope
-    /// carries the subject transaction alone — valid only when the transaction has no inputs, which
-    /// is why the graph is normally present.
+    /// `funded.inputBEEF` is the graph storage returned. The signed subject is appended without
+    /// changing that graph's version, entries, or BUMPs, then BRC-95 validation proves that every
+    /// retained record belongs to the subject's ancestry and that no ancestor is missing. A funded
+    /// graph that is unrelated, incomplete, internally conflicting, or collides with the subject is
+    /// rejected here, before a process request can be produced.
     public init(
         funded: StorageCreateActionResult,
         transaction: Transaction,
@@ -35,14 +36,36 @@ public struct SignedAction: Sendable {
         self.reference = funded.reference
         self.transaction = transaction
         self.transactionID = try transaction.transactionID(limits: transactionLimits)
-        self.transactionLimits = transactionLimits
         self.beefLimits = beefLimits
+
+        let sourceGraph: BEEF
         if let graph = funded.inputBEEF {
-            let parsed = try BEEF(bytes: graph, limits: beefLimits)
-            self.sourceTransactions = parsed.transactions.compactMap { $0.transaction }
+            sourceGraph = try BEEF(bytes: graph, limits: beefLimits)
         } else {
-            self.sourceTransactions = []
+            sourceGraph = try BEEF(
+                version: .v2,
+                merklePaths: [],
+                transactions: [],
+                limits: beefLimits
+            )
         }
+        let completeGraph = try BEEF(
+            version: sourceGraph.version,
+            merklePaths: sourceGraph.merklePaths,
+            transactions: sourceGraph.transactions + [.raw(transaction)],
+            limits: beefLimits
+        )
+        // Atomic BEEF requires an exact ancestry graph, while this additional check rejects two
+        // otherwise well-formed BUMPs that claim different roots for the same block height.
+        _ = try completeGraph.merkleRootsByBlockHeight()
+        let envelope = try AtomicBEEF(
+            subjectTransactionID: transactionID,
+            beef: completeGraph,
+            limits: beefLimits
+        )
+        // Validate the final outer-envelope byte bound now, not after storage has been called.
+        _ = try envelope.serialized(limits: beefLimits)
+        self.envelope = envelope
     }
 
     /// The BRC-95 envelope to hand back.
@@ -51,16 +74,7 @@ public struct SignedAction: Sendable {
     /// inside it or the envelope is invalid. The SDK refuses to build one with a missing ancestor
     /// rather than producing bytes that fail at the far end.
     public func atomicBEEF() throws -> [UInt8] {
-        let beef = try BEEF(
-            merklePaths: [],
-            transactions: sourceTransactions.map { .raw($0) } + [.raw(transaction)],
-            limits: beefLimits
-        )
-        return try AtomicBEEF(
-            subjectTransactionID: transactionID,
-            beef: beef,
-            limits: beefLimits
-        ).serialized(limits: beefLimits)
+        try envelope.serialized(limits: beefLimits)
     }
 
     /// What storage needs to finalise and send this: the reference, and the signed transaction as
