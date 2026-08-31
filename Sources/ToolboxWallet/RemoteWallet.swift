@@ -10,6 +10,7 @@ import ToolboxPaymail
 import ToolboxBRC29
 import ToolboxStorage
 import ToolboxStorageClient
+import ToolboxServices
 
 /// A wallet backed by remote storage.
 ///
@@ -26,6 +27,7 @@ public struct RemoteWallet: Sendable {
     let storage: StorageClient
     private let identityKey: PrivateKey
     let auth: AuthID
+    let chainInformation: (any ChainInformationService)?
     /// The most this wallet will pay to miners on any single payment, in satoshis. A payment whose
     /// funding would exceed it is refused before signing rather than silently overpaid.
     public let maximumFee: Int64
@@ -34,12 +36,14 @@ public struct RemoteWallet: Sendable {
         storage: StorageClient,
         identityKey: PrivateKey,
         auth: AuthID,
-        maximumFee: Int64 = 100_000
+        maximumFee: Int64 = 100_000,
+        chainInformation: (any ChainInformationService)? = nil
     ) {
         self.storage = storage
         self.identityKey = identityKey
         self.auth = auth
         self.maximumFee = maximumFee
+        self.chainInformation = chainInformation
     }
 
     /// The offline BRC-100 kernel shares this wallet's identity key for every crypto operation.
@@ -55,7 +59,8 @@ public struct RemoteWallet: Sendable {
     public static func restore(
         fromPhrase phrase: String,
         endpoint: URL = RemoteStorage.defaultEndpoint,
-        maximumFee: Int64 = 100_000
+        maximumFee: Int64 = 100_000,
+        chainInformation: (any ChainInformationService)? = nil
     ) throws -> RemoteWallet {
         let identityKey = try MnemonicRestore.identityKey(fromPhrase: phrase)
         let identityHex = identityKey.publicKey.compressedBytes
@@ -67,7 +72,8 @@ public struct RemoteWallet: Sendable {
             storage: storage,
             identityKey: identityKey,
             auth: AuthID(identityKey: identityHex),
-            maximumFee: maximumFee
+            maximumFee: maximumFee,
+            chainInformation: chainInformation
         )
     }
 

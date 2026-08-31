@@ -9,6 +9,12 @@ public enum WalletError: Error, Equatable, Sendable {
     /// provide. Go's toolbox leaves the same eight methods unbuilt; it panics, and this throws.
     case notImplemented(String)
     case identityMismatch
+    /// No chain-information capability was injected into this wallet.
+    case chainInformationServiceUnavailable
+    /// A provider returned a header for a different height than the one requested.
+    case chainHeaderHeightMismatch(requested: UInt32, returned: UInt32)
+    /// A provider returned only hash/root summary metadata, not the 80 bytes BRC-100 requires.
+    case chainHeaderBytesUnavailable(height: UInt32)
     /// A storage reference that is not valid base64, so it cannot be sent back.
     case invalidReference
     /// The payment broadcast, but the recipient paymail host could not be notified. The money is

@@ -1,4 +1,5 @@
 import BSVWallet
+import ToolboxServices
 
 /// Authentication and implementation information that a BRC-100 client can query without
 /// spending. A `RemoteWallet` is already set up with the user's identity key when it is created,
@@ -14,6 +15,34 @@ extension RemoteWallet {
         _ request: WalletWaitForAuthenticationRequest
     ) async throws -> WalletAuthenticatedResult {
         WalletAuthenticatedResult(authenticated: true)
+    }
+
+    public func getHeight(
+        _ request: WalletGetHeightRequest
+    ) async throws -> WalletGetHeightResult {
+        guard let chainInformation else {
+            throw WalletError.chainInformationServiceUnavailable
+        }
+        return WalletGetHeightResult(height: try await chainInformation.currentHeight())
+    }
+
+    public func getHeaderForHeight(
+        _ request: WalletGetHeaderRequest
+    ) async throws -> WalletGetHeaderResult {
+        guard let chainInformation else {
+            throw WalletError.chainInformationServiceUnavailable
+        }
+        let result = try await chainInformation.header(atHeight: request.height)
+        guard result.height == request.height else {
+            throw WalletError.chainHeaderHeightMismatch(
+                requested: request.height,
+                returned: result.height
+            )
+        }
+        guard let serializedBytes = result.serializedBytes else {
+            throw WalletError.chainHeaderBytesUnavailable(height: result.height)
+        }
+        return try WalletGetHeaderResult(header: serializedBytes)
     }
 
     /// Reads the configured chain from the storage settings. This intentionally makes storage
@@ -40,3 +69,4 @@ extension RemoteWallet {
 }
 
 extension RemoteWallet: WalletAuthenticationOperations {}
+extension RemoteWallet: WalletChainInformation {}
