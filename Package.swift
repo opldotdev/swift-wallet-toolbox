@@ -150,14 +150,15 @@ let package = Package(
             ]
         ),
 
-        // BRC-116's transport-neutral policy vocabulary and request classifier. This target owns
-        // no persistence, prompt UI, permission tokens, or wallet calls.
+        // BRC-116's transport-neutral policy, token codec, and account-bound read repository.
+        // Prompt UI and token mutation stay outside this boundary.
         .target(
             name: "ToolboxPermissions",
             dependencies: [
                 .product(name: "BSVCrypto", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVScript", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
             ]
         ),
