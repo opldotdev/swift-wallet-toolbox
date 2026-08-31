@@ -18,6 +18,7 @@ let publicModules = [
     "ToolboxServices",
     "ToolboxPaymail",
     "ToolboxActions",
+    "ToolboxPermissions",
     "ToolboxWallet",
     "ToolboxMonitor",
 ]
@@ -149,6 +150,16 @@ let package = Package(
             ]
         ),
 
+        // BRC-116's transport-neutral policy vocabulary and request classifier. This target owns
+        // no persistence, prompt UI, permission tokens, or wallet calls.
+        .target(
+            name: "ToolboxPermissions",
+            dependencies: [
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVWallet", package: "swift-sdk"),
+            ]
+        ),
+
         // The concrete BRC-100 wallet, composing storage, services and actions.
         .target(
             name: "ToolboxWallet",
@@ -213,6 +224,16 @@ let package = Package(
             name: "ToolboxActionsTests",
             dependencies: [
                 "ToolboxActions", "ToolboxStorage", "ToolboxBRC29",
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
+                .product(name: "BSVWallet", package: "swift-sdk"),
+            ]
+        ),
+        .testTarget(
+            name: "ToolboxPermissionsTests",
+            dependencies: [
+                "ToolboxPermissions",
+                .product(name: "BSVCore", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
