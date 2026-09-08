@@ -216,7 +216,22 @@ final class StorageClientTests: XCTestCase {
             ["type:alias", "id:abc"]
         )
         XCTAssertEqual(arguments["tagQueryMode"]?.stringValue, "all")
-        XCTAssertEqual(arguments["include"]?.stringValue, "locking scripts")
+        XCTAssertNil(arguments["include"])
+        XCTAssertEqual(arguments["includeLockingScripts"]?.boolValue, true)
+        XCTAssertEqual(arguments["includeTransactions"]?.boolValue, false)
+    }
+
+    func test_listOutputsNormalizesTransactionAndAbsentIncludesForStorage() async throws {
+        for include: WalletOutputInclude? in [.entireTransactions, nil] {
+            let transport = FakeTransport(json: #"{"result": {"totalOutputs": 0, "outputs": []}}"#)
+            let client = StorageClient(endpoint: endpoint, transport: transport)
+            _ = try await client.listOutputs(auth, try WalletListOutputsRequest(basket: "bap", include: include))
+            let params = try await transport.sentEnvelopes()[0]["params"]?.arrayValue
+            let arguments = try XCTUnwrap(params?[1])
+            XCTAssertNil(arguments["include"])
+            XCTAssertEqual(arguments["includeLockingScripts"]?.boolValue, false)
+            XCTAssertEqual(arguments["includeTransactions"]?.boolValue, include == .entireTransactions)
+        }
     }
 
     func test_abortActionRequiresTheStorageDecision() async throws {
