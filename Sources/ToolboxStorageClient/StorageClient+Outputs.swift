@@ -57,6 +57,10 @@ extension StorageClient {
             throw StorageClientError.unreadableResponse(method: "listOutputs")
         }
 
+        guard let totalOutputs = UInt32(exactly: total) else {
+            throw StorageClientError.unreadableResponse(method: "listOutputs")
+        }
+
         let outputs = try rows.map { row -> WalletOutput in
             guard let outpointText = row["outpoint"]?.stringValue,
                   let satoshis = row["satoshis"]?.intValue, satoshis >= 0,
@@ -65,9 +69,13 @@ extension StorageClient {
             }
             return try WalletOutput(
                 satoshis: UInt64(satoshis),
-                lockingScript: row["lockingScript"]?.stringValue.flatMap(Self.hexBytes),
+                lockingScript: try optionalHexBytes(
+                    row["lockingScript"], method: "listOutputs"
+                ),
                 spendable: spendable,
-                customInstructions: row["customInstructions"]?.stringValue,
+                customInstructions: try optionalString(
+                    row["customInstructions"], method: "listOutputs"
+                ),
                 tags: try Self.stringArray(row["tags"], method: "listOutputs"),
                 outpoint: try Outpoint(outpointText),
                 labels: try Self.stringArray(row["labels"], method: "listOutputs")
@@ -77,7 +85,7 @@ extension StorageClient {
         let beefBytes = try byteArray(result["BEEF"] ?? result["beef"])
         let beef = try beefBytes.map { try BEEF(bytes: $0, limits: StorageLimits.beef) }
         return try WalletListOutputsResult(
-            totalOutputs: UInt32(max(0, total)),
+            totalOutputs: totalOutputs,
             beef: beef,
             outputs: outputs
         )
@@ -97,6 +105,26 @@ extension StorageClient {
             }
             return string
         }
+    }
+
+    private static func optionalString(
+        _ value: JSONValue?, method: String
+    ) throws -> String? {
+        guard let value, value != .null else { return nil }
+        guard let text = value.stringValue else {
+            throw StorageClientError.unreadableResponse(method: method)
+        }
+        return text
+    }
+
+    private static func optionalHexBytes(
+        _ value: JSONValue?, method: String
+    ) throws -> [UInt8]? {
+        guard let text = try optionalString(value, method: method) else { return nil }
+        guard let bytes = hexBytes(text) else {
+            throw StorageClientError.unreadableResponse(method: method)
+        }
+        return bytes
     }
 
     static func hexBytes(_ text: String) -> [UInt8]? {
