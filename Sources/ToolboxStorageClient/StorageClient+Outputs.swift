@@ -36,9 +36,9 @@ extension StorageClient {
         if request.includeCustomInstructions == true {
             arguments["includeCustomInstructions"] = .bool(true)
         }
-        if let include = request.include {
-            arguments["include"] = .string(include.rawValue)
-        }
+        // Storage consumes validated arguments, not the public BRC-100 include selector.
+        arguments["includeLockingScripts"] = .bool(request.include == .lockingScripts)
+        arguments["includeTransactions"] = .bool(request.include == .entireTransactions)
         if let tagQueryMode = request.tagQueryMode {
             arguments["tagQueryMode"] = .string(tagQueryMode.rawValue)
         }
