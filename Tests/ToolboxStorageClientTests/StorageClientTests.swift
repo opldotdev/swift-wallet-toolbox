@@ -76,6 +76,62 @@ final class StorageClientTests: XCTestCase {
 
     // MARK: - The envelope
 
+    func test_listCertificatesForwardsInventoryFiltersAndPagination() async throws {
+        let transport = FakeTransport(json: #"{"result":{"totalCertificates":0,"certificates":[]}}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        let request = try WalletListCertificatesRequest(
+            certifiers: [], types: [], pagination: .init(limit: 25, offset: 0)
+        )
+        let result = try await client.listCertificates(auth, request)
+        XCTAssertEqual(result.totalCertificates, 0)
+        XCTAssertTrue(result.certificates.isEmpty)
+        let envelope = try await transport.sentEnvelopes()[0]
+        XCTAssertEqual(envelope["method"]?.stringValue, "listCertificates")
+        let params = try XCTUnwrap(envelope["params"]?.arrayValue)
+        XCTAssertEqual(params[0]["identityKey"]?.stringValue, "02aa")
+        XCTAssertEqual(params[1]["certifiers"], .array([]))
+        XCTAssertEqual(params[1]["types"], .array([]))
+        XCTAssertEqual(params[1]["limit"]?.intValue, 25)
+        XCTAssertEqual(params[1]["offset"]?.intValue, 0)
+    }
+
+    func test_listCertificatesDecodesStoredCertificateFields() async throws {
+        let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        let identifier = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        let transport = FakeTransport(json: """
+        {"result":{"totalCertificates":1,"certificates":[{
+          "type":"\(identifier)","serialNumber":"\(identifier)",
+          "subject":"\(key)","certifier":"\(key)",
+          "revocationOutpoint":"\(String(repeating: "0", count: 64)).0",
+          "fields":{"name":"AQI="}
+        }]}}
+        """)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+        let result = try await client.listCertificates(auth, .init(certifiers: [], types: []))
+        XCTAssertEqual(result.totalCertificates, 1)
+        XCTAssertEqual(result.certificates.count, 1)
+        XCTAssertEqual(result.certificates[0].certificate.type.base64, identifier)
+        XCTAssertEqual(result.certificates[0].certificate.fields.count, 1)
+        XCTAssertNil(result.certificates[0].keyring)
+    }
+
+    func test_listCertificatesRejectsMalformedInventory() async throws {
+        for result in [
+            #"{"totalCertificates":-1,"certificates":[]}"#,
+            #"{"totalCertificates":1,"certificates":[{}]}"#,
+            #"{"totalCertificates":0}"#
+        ] {
+            let transport = FakeTransport(json: "{\"result\":\(result)}")
+            let client = StorageClient(endpoint: endpoint, transport: transport)
+            do {
+                _ = try await client.listCertificates(auth, .init(certifiers: [], types: []))
+                XCTFail("Accepted malformed certificate inventory")
+            } catch let error as StorageClientError {
+                XCTAssertEqual(error, .unreadableResponse(method: "listCertificates"))
+            }
+        }
+    }
+
     func test_aCallSendsAJSONRPCEnvelope() async throws {
         let transport = FakeTransport(json: #"{"result": 42}"#)
         let client = StorageClient(endpoint: endpoint, transport: transport)
