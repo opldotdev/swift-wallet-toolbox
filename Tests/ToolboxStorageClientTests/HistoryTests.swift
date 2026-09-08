@@ -230,24 +230,23 @@ final class HistoryTests: XCTestCase {
         XCTAssertThrowsError(try StorageClient.decodeActions(try result("""
             {"totalActions": 1, "actions": [{
               "txid": "8ac7230489e80000000000000000000000000000000000000000000000000001",
-              "satoshis": 1, "status": "levitating", "isOutgoing": false
+              "satoshis": 1, "status": "levitating", "isOutgoing": false,
+              "description": "unknown status", "version": 1, "lockTime": 0
             }]}
             """)))
     }
 
-    func test_failedStatusIsRefusedUntilThePinnedABIRepresentsIt() throws {
+    func test_failedStatusDecodesFromTheCurrentABI() throws {
         let txid = String(repeating: "66", count: 32)
-        XCTAssertThrowsError(try StorageClient.decodeActions(try result("""
+        let decoded = try StorageClient.decodeActions(try result("""
             {"totalActions":1,"actions":[{
               "txid":"\(txid)","satoshis":1,"status":"failed","isOutgoing":false,
               "description":"failed action","version":1,"lockTime":0
             }]}
-            """))) { error in
-            XCTAssertEqual(
-                error as? StorageClientError,
-                .unreadableResponse(method: "listActions")
-            )
-        }
+            """))
+
+        XCTAssertEqual(decoded.actions.count, 1)
+        XCTAssertEqual(decoded.actions.first?.status, .failed)
     }
 
     func test_cancellationIsNotTranslatedIntoAMalformedResponse() async throws {

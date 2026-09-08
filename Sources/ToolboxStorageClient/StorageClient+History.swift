@@ -90,8 +90,8 @@ extension StorageClient {
         )
     }
 
-    /// Kept separate because the pinned Swift ABI currently lacks BRC-100's normative `failed`
-    /// status. Until that upstream enum is corrected, refusing it is safer than changing history.
+    /// Kept separate so unknown wire values fail closed instead of being flattened into a
+    /// different history state. The pinned ABI represents every current BRC-100 status.
     private static func decodeActionStatus(_ text: String) -> WalletActionStatus? {
         WalletActionStatus(rawValue: text)
     }
