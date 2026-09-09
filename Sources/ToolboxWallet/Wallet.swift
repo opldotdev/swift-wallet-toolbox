@@ -20,6 +20,8 @@ public enum WalletError: Error, Equatable, Sendable {
     /// The payment broadcast, but the recipient paymail host could not be notified. The money is
     /// on chain under this txid.
     case paymailDeliveryFailed(txid: String)
+    /// Storage reported a failed broadcast. The action may exist locally; it is not confirmed on chain.
+    case broadcastFailed(txid: String)
     /// An internalize request named a subject transaction the BEEF does not contain.
     case internalizeSubjectMissing
     /// An internalize output index is outside the subject transaction's outputs.

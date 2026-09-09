@@ -289,8 +289,41 @@ final class PaymailTests: XCTestCase {
         let object = try JSONSerialization.jsonObject(with: Data(body)) as? [String: String]
         XCTAssertEqual(object?["beef"], "01abff")
         XCTAssertEqual(object?["reference"], "payment-reference")
+        XCTAssertNil(object?["metadata"])
         let notPosted = await stub.postedBody(to: transactionURL)
         XCTAssertNil(notPosted)
+    }
+
+    func test_deliverEncodesBRC70MetadataWhenProvided() async throws {
+        let receiveURL = "https://pay.example.com/alice/example.com/beef"
+        let stub = StubHTTP(getResponses: [
+            dnsURL: StubResponse(body: #"{"Status":3}"#),
+            fallbackCapabilitiesURL: StubResponse(body: capabilitiesJSON(includeReceive: true)),
+        ], postResponses: [
+            receiveURL: StubResponse(body: ""),
+        ])
+
+        try await Paymail(http: stub).deliver(
+            beef: [0x01],
+            to: paymail,
+            reference: "payment-reference",
+            metadata: PaymailDeliveryMetadata(
+                pubkey: "02ab",
+                signature: "sig",
+                note: "1Sat Wallet send"
+            )
+        )
+
+        let posted = await stub.postedBody(to: receiveURL)
+        let body = try XCTUnwrap(posted)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(body)) as? [String: Any])
+        XCTAssertEqual(object["beef"] as? String, "01")
+        XCTAssertEqual(object["reference"] as? String, "payment-reference")
+        let metadata = try XCTUnwrap(object["metadata"] as? [String: String])
+        XCTAssertEqual(metadata["pubkey"], "02ab")
+        XCTAssertEqual(metadata["signature"], "sig")
+        XCTAssertEqual(metadata["note"], "1Sat Wallet send")
+        XCTAssertNil(metadata["sender"])
     }
 
     func test_deliverRefusesAReceiveTransactionOnlyHost() async throws {

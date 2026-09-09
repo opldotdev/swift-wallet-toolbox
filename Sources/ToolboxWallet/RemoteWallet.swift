@@ -4,6 +4,7 @@ import BSVKeys
 import BSVScript
 import BSVTransaction
 import BSVWallet
+import BSVCompat
 import ToolboxActions
 import ToolboxPermissions
 import ToolboxPaymail
@@ -227,16 +228,29 @@ public struct RemoteWallet: Sendable {
                 )
             }
             let result = try await sign(outputs, description: description, labels: labels)
+            if result.sent.results.contains(where: { $0.status == .failed }) {
+                throw WalletError.broadcastFailed(txid: result.sent.transactionID.displayHex)
+            }
+            let txid = result.sent.transactionID.displayHex
+            let metadata: PaymailDeliveryMetadata?
+            do {
+                metadata = PaymailDeliveryMetadata(
+                    pubkey: Hex.encode(identityKey.publicKey.compressedBytes),
+                    signature: try BitcoinSignedMessage.sign(txid, using: identityKey),
+                    note: description
+                )
+            } catch {
+                metadata = nil
+            }
             do {
                 try await resolver.deliver(
                     beef: try result.signed.atomicBEEF(),
                     to: recipient,
-                    reference: destination.reference
+                    reference: destination.reference,
+                    metadata: metadata
                 )
             } catch {
-                throw WalletError.paymailDeliveryFailed(
-                    txid: result.sent.transactionID.displayHex
-                )
+                throw WalletError.paymailDeliveryFailed(txid: txid)
             }
             return result.sent
         }
