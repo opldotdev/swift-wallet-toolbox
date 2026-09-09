@@ -101,7 +101,12 @@ public struct Paymail: Sendable {
     /// object — not the BEEF this method holds, so sending the BEEF body there always fails. A host
     /// that does not advertise receive-BEEF is refused here rather than sent a request it cannot
     /// accept.
-    public func deliver(beef: [UInt8], to paymail: String, reference: String) async throws {
+    public func deliver(
+        beef: [UInt8],
+        to paymail: String,
+        reference: String,
+        metadata: PaymailDeliveryMetadata? = nil
+    ) async throws {
         let address = try Self.parse(paymail)
         let capabilities = try await capabilities(for: address)
         guard let template = capabilities[Self.receiveBEEFCapability] else {
@@ -112,7 +117,7 @@ public struct Paymail: Sendable {
         }
 
         let url = try Self.capabilityURL(template: template, address: address)
-        let request = DeliveryRequest(beef: Self.hex(beef), reference: reference)
+        let request = DeliveryRequest(beef: Self.hex(beef), reference: reference, metadata: metadata)
         let body = try JSONEncoder().encode(request)
         let response = try await http.post(url, json: Array(body))
         guard (200..<300).contains(response.status) else {
@@ -322,6 +327,34 @@ public struct PaymailProfile: Equatable, Sendable {
     }
 }
 
+/// BRC-70 receive-BEEF metadata. HandCash and other hosts expect pubkey and a
+/// Bitcoin Signed Message of the txid even when sender-validation is off.
+public struct PaymailDeliveryMetadata: Encodable, Sendable {
+    public var sender: String?
+    public var pubkey: String
+    public var signature: String
+    public var note: String?
+
+    public init(sender: String? = nil, pubkey: String, signature: String, note: String? = nil) {
+        self.sender = sender
+        self.pubkey = pubkey
+        self.signature = signature
+        self.note = note
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(sender, forKey: .sender)
+        try container.encode(pubkey, forKey: .pubkey)
+        try container.encode(signature, forKey: .signature)
+        try container.encodeIfPresent(note, forKey: .note)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sender, pubkey, signature, note
+    }
+}
+
 /// A resolved destination and the server reference required for later delivery.
 public struct PaymentDestination: Equatable, Sendable {
     public let reference: String
@@ -455,4 +488,16 @@ private struct SatoshisRequest: Encodable, Sendable {
 private struct DeliveryRequest: Encodable, Sendable {
     let beef: String
     let reference: String
+    let metadata: PaymailDeliveryMetadata?
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(beef, forKey: .beef)
+        try container.encode(reference, forKey: .reference)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case beef, reference, metadata
+    }
 }
