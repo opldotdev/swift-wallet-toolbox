@@ -37,7 +37,7 @@ public struct AuthenticatedResponse: Equatable, Sendable {
     }
 }
 
-public enum AuthTransportError: Error, Equatable, Sendable {
+public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     case notImplemented(String)
     /// The peer never completed the handshake. Carries what it did instead.
     case handshakeFailed(String)
@@ -52,4 +52,23 @@ public enum AuthTransportError: Error, Equatable, Sendable {
     /// The peer is not the one expected. Raised only when a caller named the peer up front, which
     /// is the case worth failing loudly for.
     case unexpectedPeer
+
+    public var errorDescription: String? {
+        switch self {
+        case .sessionExpired:
+            "Couldn't reconnect to storage. Try again."
+        case .responseNotAuthenticated:
+            "The storage server could not be verified."
+        case .handshakeFailed:
+            "Couldn't authenticate with storage. Try again."
+        case .requestMismatch:
+            "The storage server answered a different request."
+        case .transportFailed:
+            "Couldn't reach storage. Try again."
+        case .notImplemented:
+            "This storage operation is not available."
+        case .unexpectedPeer:
+            "Connected to an unexpected storage server."
+        }
+    }
 }

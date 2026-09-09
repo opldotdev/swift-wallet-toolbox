@@ -315,6 +315,11 @@ public struct Paymail: Sendable {
 public struct PaymailProfile: Equatable, Sendable {
     public let name: String?
     public let avatar: URL?
+
+    public init(name: String?, avatar: URL?) {
+        self.name = name
+        self.avatar = avatar
+    }
 }
 
 /// A resolved destination and the server reference required for later delivery.

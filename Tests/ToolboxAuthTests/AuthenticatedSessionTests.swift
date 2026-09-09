@@ -24,6 +24,8 @@ final class AuthenticatedSessionTests: XCTestCase {
         private(set) var pathsSeen: [String] = []
         /// Set to refuse the handshake.
         var refuseHandshake = false
+        /// After a session is open, answer later application requests with an unsigned body.
+        var unsignedReplies = false
 
         init(key: PrivateKey, responseBody: [UInt8] = Array("{\"ok\":true}".utf8),
              responseStatus: Int = 200) {
@@ -34,6 +36,7 @@ final class AuthenticatedSessionTests: XCTestCase {
 
         func setRefusingHandshake(_ refusing: Bool) { refuseHandshake = refusing }
         func setResponseStatus(_ status: Int) { responseStatus = status }
+        func setUnsignedReplies(_ unsigned: Bool) { unsignedReplies = unsigned }
 
         func send(_ request: HTTPRequest) async throws -> HTTPResponse {
             pathsSeen.append(request.url.path)
@@ -56,6 +59,9 @@ final class AuthenticatedSessionTests: XCTestCase {
         }
 
         private func general(_ request: HTTPRequest) async throws -> HTTPResponse {
+            if unsignedReplies {
+                return HTTPResponse(statusCode: 200, body: Array("{\"result\":42}".utf8))
+            }
             let frame = try BRC104HTTPRequestFrame(
                 method: request.method,
                 path: request.url.path,
@@ -238,5 +244,97 @@ final class AuthenticatedSessionTests: XCTestCase {
         } catch {
             XCTFail("unexpected error \(error)")
         }
+    }
+
+    // MARK: - Stale-session recovery
+
+    func test_aStaleAuthenticatorSessionRehandshakesOnce() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await session.testingCloseAuthenticatorSession()
+        let response = try await session.send(method: "POST", path: "/two", body: [0x02])
+
+        XCTAssertEqual(response.statusCode, 200)
+        let paths = await peer.pathsSeen
+        let handshakes = paths.filter { $0.hasSuffix(BRC104HTTPHeaderName.handshakePath) }
+        let application = paths.filter { !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath) }
+        XCTAssertEqual(handshakes.count, 2)
+        XCTAssertEqual(application, ["/one", "/two"])
+    }
+
+    func test_concurrentRecoveryAfterEvictionSharesOneHandshake() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await session.testingCloseAuthenticatorSession()
+
+        async let first = session.send(method: "POST", path: "/two", body: [0x02])
+        async let second = session.send(method: "POST", path: "/three", body: [0x03])
+        _ = try await (first, second)
+
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 2)
+    }
+
+    func test_anUnsignedReplyAfterALiveSessionIsNotRetried() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await peer.setUnsignedReplies(true)
+
+        do {
+            _ = try await session.send(method: "POST", path: "/two", body: [0x02])
+            XCTFail("an unsigned application reply must not be returned")
+        } catch let error as AuthTransportError {
+            guard case .responseNotAuthenticated = error else {
+                return XCTFail("expected responseNotAuthenticated, got \(error)")
+            }
+        }
+
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 1, "an unsigned reply must not start a new session")
+        let application = await peer.pathsSeen.filter {
+            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(application, ["/one", "/two"])
+    }
+
+    func test_cancellationIsNotTreatedAsAStaleSession() async throws {
+        let keys = try keyPair()
+        let session = AuthenticatedSession(
+            baseURL: baseURL,
+            wallet: ProtoWallet(rootKey: keys.client),
+            transport: CancellingTransport()
+        )
+        let task = Task {
+            try await session.send(method: "POST", path: "/", body: [0x01])
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled send must not return a response")
+        } catch is CancellationError {
+            // Fail-closed. Recovery must not swallow cancellation into a retry.
+        } catch let error as AuthTransportError {
+            guard case .handshakeFailed = error else {
+                return XCTFail("cancellation must not become a session retry, got \(error)")
+            }
+        }
+    }
+}
+
+private struct CancellingTransport: HTTPTransport {
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        throw CancellationError()
     }
 }
