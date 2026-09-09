@@ -25,7 +25,8 @@ public struct RemoteWallet: Sendable {
     // Internal so capability extensions can compose the same authenticated storage client without
     // exposing it as part of the public wallet API.
     let storage: StorageClient
-    private let identityKey: PrivateKey
+    let identityKey: PrivateKey
+    let pendingActions = PendingWalletActions()
     let auth: AuthID
     let chainInformation: (any ChainInformationService)?
     /// The most this wallet will pay to miners on any single payment, in satoshis. A payment whose
@@ -268,7 +269,8 @@ public struct RemoteWallet: Sendable {
         derivationPrefix prefix: String,
         derivationSuffix suffix: String,
         description: String,
-        labels: [String] = []
+        labels: [String] = [],
+        beforeBroadcast: (@Sendable (CounterpartyPayment) async throws -> Void)? = nil
     ) async throws -> CounterpartyPayment {
         let payingPublicKey = try BRC29.payingPublicKey(
             recipient: recipientIdentityKey, sender: identityKey, prefix: prefix, suffix: suffix
@@ -303,6 +305,17 @@ public struct RemoteWallet: Sendable {
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
 
+        if let beforeBroadcast {
+            do {
+                try await beforeBroadcast(CounterpartyPayment(
+                    transactionID: signed.transactionID, outputIndex: index,
+                    atomicBEEF: try signed.atomicBEEF(), reference: funded.reference, results: []))
+            } catch {
+                _ = try? await abort(reference: funded.reference)
+                throw error
+            }
+        }
+        try Task.checkCancellation()
         let processed = try await storage.processAction(auth, try signed.processRequest())
         return CounterpartyPayment(
             transactionID: signed.transactionID,
@@ -474,11 +487,12 @@ public struct RemoteWallet: Sendable {
                 transactionID: transactionID,
                 sourceGraph: fundedSourceGraph
             )
+            _ = try atomic.serialized(limits: StorageLimits.beef)
             let processRequest = StorageProcessActionRequest(
                 reference: funded.reference,
                 isNewTx: true,
                 isSendWith: false,
-                rawTX: try atomic.serialized(limits: StorageLimits.beef),
+                rawTX: try transaction.serialized(limits: StorageLimits.transaction),
                 sendWith: []
             )
             try Task.checkCancellation()
@@ -514,7 +528,7 @@ public struct RemoteWallet: Sendable {
     }
 
     /// Checks storage's complete input graph against every funded source before any signer runs.
-    private static func validatedFundedSourceGraph(
+    static func validatedFundedSourceGraph(
         _ funded: StorageCreateActionResult,
         subject: Transaction,
         expectedSourceGraph: BEEF?
@@ -599,7 +613,7 @@ public struct RemoteWallet: Sendable {
         return graph
     }
 
-    private static func atomicBEEF(
+    static func atomicBEEF(
         subject: Transaction,
         transactionID: TransactionID,
         sourceGraph: BEEF
@@ -637,7 +651,7 @@ public struct RemoteWallet: Sendable {
         }
     }
 
-    private static func hexBytes(_ text: String) -> [UInt8]? {
+    static func hexBytes(_ text: String) -> [UInt8]? {
         guard text.count.isMultiple(of: 2) else { return nil }
         var bytes = [UInt8]()
         bytes.reserveCapacity(text.count / 2)

@@ -157,8 +157,8 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
         XCTAssertEqual(methods, ["createAction", "processAction"])
         let recordedAtomicBEEF = await transport.processedAtomicBEEF()
         let atomicBytes = try XCTUnwrap(recordedAtomicBEEF)
-        let atomic = try AtomicBEEF(bytes: atomicBytes, limits: StorageLimits.beef)
-        XCTAssertEqual(atomic.beef.transactions.count, 3)
+        let transaction = try Transaction(bytes: atomicBytes, limits: StorageLimits.transaction)
+        XCTAssertEqual(transaction.inputs.count, 2)
     }
 
     func testPostReservationOutputAndProcessFailuresAbortExactlyOnce() async throws {
@@ -291,8 +291,8 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
 
         let recordedBytes = await transport.processedAtomicBEEF()
         let bytes = try XCTUnwrap(recordedBytes)
-        let atomic = try AtomicBEEF(bytes: bytes, limits: StorageLimits.beef)
-        XCTAssertEqual(atomic.beef.merklePaths.count, 1)
+        let transaction = try Transaction(bytes: bytes, limits: StorageLimits.transaction)
+        XCTAssertEqual(transaction.inputs[0].previousOutput, source.match.outpoint)
         let successAbortCount = await transport.abortCount()
         XCTAssertEqual(successAbortCount, 0)
     }
@@ -451,12 +451,7 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
         _ = try await adapter.commitPermissionTokenMutation(request)
 
         let recorded = await transport.processedAtomicBEEF()
-        let atomic = try AtomicBEEF(
-            bytes: try XCTUnwrap(recorded), limits: StorageLimits.beef
-        )
-        let subject = try XCTUnwrap(try atomic.beef.transaction(
-            for: atomic.subjectTransactionID, limits: StorageLimits.transaction
-        ))
+        let subject = try Transaction(bytes: XCTUnwrap(recorded), limits: StorageLimits.transaction)
         XCTAssertEqual(subject.inputs.count, 2)
         XCTAssertTrue(subject.inputs.allSatisfy { !$0.unlockingScript.bytes.isEmpty })
     }

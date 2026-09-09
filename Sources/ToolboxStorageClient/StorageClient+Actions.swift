@@ -1,4 +1,5 @@
 import Foundation
+import BSVTransaction
 import BSVWallet
 import ToolboxCore
 import ToolboxStorage
@@ -15,10 +16,13 @@ import ToolboxStorage
 extension StorageClient {
 
     public func createAction(
-        _ auth: AuthID, _ request: WalletCreateActionRequest
+        _ auth: AuthID, _ request: WalletCreateActionRequest,
+        includeAllSourceTransactions: Bool = false
     ) async throws -> StorageCreateActionResult {
         let result = try await call(
-            "createAction", [.object(auth.jsonObject), .object(try Self.arguments(for: request))]
+            "createAction", [.object(auth.jsonObject), .object(try Self.arguments(
+                for: request, includeAllSourceTransactions: includeAllSourceTransactions
+            ))]
         )
         return try Self.decodeCreateAction(result)
     }
@@ -26,7 +30,7 @@ extension StorageClient {
     /// Hands a signed transaction back for finalisation and broadcast.
     ///
     /// This is the call that actually sends money. It carries the reference the inputs were
-    /// reserved under and the signed transaction as Atomic BEEF; storage commits its records and,
+    /// reserved under and the raw signed transaction plus its txid; storage commits its records and,
     /// unless the action was `noSend`, broadcasts.
     public func processAction(
         _ auth: AuthID, _ request: StorageProcessActionRequest
@@ -35,13 +39,15 @@ extension StorageClient {
             "reference": .string(request.reference),
             "isNewTx": .bool(request.isNewTx),
             "isSendWith": .bool(request.isSendWith),
-            "isNoSend": .bool(false),
-            "isDelayed": .bool(false),
+            "isNoSend": .bool(request.isNoSend),
+            "isDelayed": .bool(request.isDelayed),
             "sendWith": .array(request.sendWith.map { .string($0) }),
         ]
-        // The signed transaction travels as a JSON byte array, the same shape storage sends BEEF
-        // in. Absent means there is no new transaction, only a batch to send.
+        // Both reference implementations require raw Bitcoin bytes plus their exact txid.
+        // Atomic BEEF belongs to the wallet result, not the storage processAction request.
         if let rawTX = request.rawTX {
+            let transaction = try Transaction(bytes: rawTX, limits: StorageLimits.transaction)
+            arguments["txid"] = .string(try transaction.transactionID(limits: StorageLimits.transaction).displayHex)
             arguments["rawTx"] = .array(rawTX.map { .number(Double($0)) })
         }
 
@@ -67,7 +73,9 @@ extension StorageClient {
     /// Fields the reference client always sends are always sent, including empty collections. The
     /// server reads several of them without checking they exist, so an omitted empty array is a
     /// fault there rather than a default here — `tags` on `listOutputs` proved that the hard way.
-    static func arguments(for request: WalletCreateActionRequest) throws -> [String: JSONValue] {
+    static func arguments(
+        for request: WalletCreateActionRequest, includeAllSourceTransactions: Bool = false
+    ) throws -> [String: JSONValue] {
         let requestedOutputs = request.outputs ?? []
         let requestedInputs = request.inputs ?? []
         let options = request.options
@@ -136,7 +144,7 @@ extension StorageClient {
             "isNoSend": .bool(noSend),
             "isDelayed": .bool(delayed),
             "isTestWerrReviewActions": .bool(false),
-            "includeAllSourceTransactions": .bool(false),
+            "includeAllSourceTransactions": .bool(includeAllSourceTransactions),
         ]
         if let inputBEEF = request.inputBEEF {
             encoded["inputBEEF"] = .array(
@@ -185,7 +193,8 @@ extension StorageClient {
                 unlockingScriptLength: unlockingLength,
                 derivationPrefix: row["derivationPrefix"]?.stringValue,
                 derivationSuffix: row["derivationSuffix"]?.stringValue,
-                senderIdentityKey: row["senderIdentityKey"]?.stringValue
+                senderIdentityKey: row["senderIdentityKey"]?.stringValue,
+                vin: row["vin"]?.intValue.flatMap(UInt32.init(exactly:))
             )
         }
 

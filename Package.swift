@@ -168,6 +168,10 @@ let package = Package(
         .target(
             name: "ToolboxWallet",
             dependencies: [
+                .product(name: "BSVInterpreter", package: "swift-sdk"),
+                "ToolboxAuth",
+                .product(name: "BSVOverlay", package: "swift-sdk"),
+                .product(name: "BSVNetwork", package: "swift-sdk"),
                 "ToolboxCore",
                 "ToolboxBRC29",
                 "ToolboxStorage",

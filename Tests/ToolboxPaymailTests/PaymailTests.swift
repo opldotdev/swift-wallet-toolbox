@@ -80,11 +80,42 @@ final class PaymailTests: XCTestCase {
         XCTAssertFalse(Paymail.isPaymail("not-a-paymail"))
     }
 
+    func test_extensionCapabilitiesDoNotRejectEndpoints() async throws {
+        let body = #"{"capabilities":{"6745385c3fc0":false,"extension":{"flag":true},"2a40af698840":"https://pay.example.com/{alias}/{domain.tld}/destination"}}"#
+        let stub = StubHTTP(getResponses: [
+            dnsURL: StubResponse(body: #"{"Status":3}"#),
+            fallbackCapabilitiesURL: StubResponse(body: body)
+        ], postResponses: [destinationURL: StubResponse(body: destinationJSON())])
+        let result = try await Paymail(http: stub).paymentDestination(paymail: paymail, satoshis: 42)
+        XCTAssertEqual(result.reference, "payment-reference")
+    }
+
+    func test_recipientValidationReadsProfileWithoutRequestingPayment() async throws {
+        let body = #"{"capabilities":{"6745385c3fc0":false,"2a40af698840":"https://example.com/destination","5c55a7fdb7bb":"https://example.com/beef","f12f968c92d6":"https://example.com/profile/{alias}@{domain.tld}"}}"#
+        for status in [200, 404, 503] {
+            let stub = StubHTTP(getResponses: [
+                dnsURL: StubResponse(body: #"{"Status":3}"#),
+                fallbackCapabilitiesURL: StubResponse(body: body),
+                "https://example.com/profile/alice@example.com": StubResponse(status: status, body: #"{"name":"Alice","avatar":"https://images.example.com/alice.png{?s}"}"#)
+            ])
+            do {
+                let profile = try await Paymail(http: stub).recipientProfile(paymail: paymail)
+                XCTAssertEqual(status, 200)
+                XCTAssertEqual(profile.name, "Alice")
+                XCTAssertEqual(profile.avatar?.absoluteString, "https://images.example.com/alice.png?s=180")
+            } catch let error as PaymailError {
+                XCTAssertNotEqual(status, 200)
+                XCTAssertEqual(error, .httpFailure(statusCode: status))
+                XCTAssertFalse(error.localizedDescription.contains("error 4"))
+            }
+        }
+    }
+
     func test_srvDiscoveryUsesTargetHostAndPort() async throws {
         let capabilitiesURL = "https://pay.example.com:8443/.well-known/bsvalias"
         let stub = StubHTTP(getResponses: [
             dnsURL: StubResponse(
-                body: #"{"Status":0,"AD":false,"Answer":[{"data":"10 5 8443 pay.example.com."}]}"#
+                body: #"{"Status":0,"AD":true,"Answer":[{"data":"10 5 8443 pay.example.com."}]}"#
             ),
             capabilitiesURL: StubResponse(body: capabilitiesJSON()),
         ], postResponses: [
@@ -125,6 +156,18 @@ final class PaymailTests: XCTestCase {
 
         let count = await stub.getCount(for: fallbackCapabilitiesURL)
         XCTAssertEqual(count, 1)
+    }
+
+    func test_unsignedSRVSubdomainsAndSuffixImpostorsFallBack() async throws {
+        for host in ["pay.example.com", "evil-example.com"] {
+            let stub = StubHTTP(getResponses: [
+                dnsURL: StubResponse(body: "{\"Status\":0,\"AD\":false,\"Answer\":[{\"data\":\"10 10 443 \(host).\"}]}"),
+                fallbackCapabilitiesURL: StubResponse(body: capabilitiesJSON())
+            ], postResponses: [destinationURL: StubResponse(body: destinationJSON())])
+            _ = try await Paymail(http: stub).paymentDestination(paymail: paymail, satoshis: 42)
+            let count = await stub.getCount(for: fallbackCapabilitiesURL)
+            XCTAssertEqual(count, 1)
+        }
     }
 
     func test_dnssecValidatedCrossDomainSRVTargetIsAccepted() async throws {
@@ -298,6 +341,13 @@ final class PaymailTests: XCTestCase {
     }
 
     /// Resolves only when explicitly requested so the normal suite remains offline.
+    func test_liveRecipientValidation() async throws {
+        let address = ProcessInfo.processInfo.environment["TEST_RUNNER_LIVE_PAYMAIL"]
+        try XCTSkipUnless(address != nil, "set TEST_RUNNER_LIVE_PAYMAIL for read-only verification")
+        let name = try await Paymail().validateRecipient(paymail: try XCTUnwrap(address))
+        XCTAssertNotNil(name)
+    }
+
     func test_livePaymentDestination() async throws {
         let environment = ProcessInfo.processInfo.environment
         let livePaymail = environment["TEST_RUNNER_LIVE_PAYMAIL"]

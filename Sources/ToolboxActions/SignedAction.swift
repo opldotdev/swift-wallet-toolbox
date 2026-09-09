@@ -4,10 +4,11 @@ import ToolboxStorage
 
 /// A signed transaction, packaged for storage to broadcast.
 ///
-/// Storage takes BRC-95 Atomic BEEF: the subject transaction together with exactly the proof graph
+/// Wallet callers receive BRC-95 Atomic BEEF: the subject transaction with exactly the proof graph
 /// needed to verify it, and nothing else. "Exactly" is the part that matters — an envelope
 /// carrying unrelated transactions is refused by a conforming reader, so this builds the graph
 /// from what the action actually spends rather than from whatever happens to be at hand.
+/// Storage finalization separately receives raw transaction bytes and the transaction ID.
 public struct SignedAction: Sendable {
     /// The storage reference the funded action was created under. `processAction` matches the
     /// signed transaction to its reserved inputs by this, so it travels with it.
@@ -77,15 +78,15 @@ public struct SignedAction: Sendable {
         try envelope.serialized(limits: beefLimits)
     }
 
-    /// What storage needs to finalise and send this: the reference, and the signed transaction as
-    /// Atomic BEEF. Without the transaction storage cannot commit or broadcast it, and the inputs
+    /// What storage needs to finalise and send this: the reference and raw signed transaction.
+    /// Without the transaction storage cannot commit or broadcast it, and the inputs
     /// it reserved stay reserved.
     public func processRequest(sendWith: [String] = []) throws -> StorageProcessActionRequest {
         StorageProcessActionRequest(
             reference: reference,
             isNewTx: true,
             isSendWith: !sendWith.isEmpty,
-            rawTX: try atomicBEEF(),
+            rawTX: try transaction.serialized(limits: beefLimits.transactionLimits),
             sendWith: sendWith
         )
     }

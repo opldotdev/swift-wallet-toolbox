@@ -35,13 +35,29 @@ Atomic BEEF packaging. An adversarial review of 2026-08-11 raised 20 findings; a
 see [`docs/reviews/2026-08-11-adversarial.md`](docs/reviews/2026-08-11-adversarial.md).
 
 `RemoteWallet` composes the whole wallet: `restore(fromPhrase:)`, `connect`, `balance`,
-`history`, `receiveAddress`, `pay`, `abort`. Recovery-phrase restore matches Yours Wallet; receive-address
+`history`, `receiveAddress`, `pay`, `abort`, and the `createAction` / `signAction` lifecycle. Recovery-phrase restore matches Yours Wallet; receive-address
 derivation matches the live @1sat deposit convention's paths, checked against vectors from the reference libraries.
 
 Not yet built: the `Services` provider chains and the monitor tasks. See
 [`docs/DESIGN.md`](docs/DESIGN.md) §4.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for what v1 covers, what it defers, and why.
+
+### Transaction approval integration
+
+Permission-aware hosts call `createAction` with `signAndProcess: false`, obtain authoritative
+amounts with `reviewAction(reference:)`, and call `signAction` only after consent. Prepared
+actions retain no keys and signing references are consumed once. Caller inputs, source amounts,
+recipient outputs, wallet change, fees, and unlocking scripts are checked before finalization.
+`abortAction` invalidates the pending reference. Pending actions are local to the wallet instance;
+they are not restored across restart. Hosts must additionally bind consent to their authenticated
+originator, account, and session (as the desktop app does).
+
+`noSend` is preserved. Batch-only actions and nonempty `sendWith` are explicitly rejected by
+this lifecycle until an originator-owned batch ledger is implemented; they never trigger an
+implicit broadcast. Standing monthly spending grants are not inferred from one-time approval.
+Storage finalization sends raw transaction bytes plus the matching txid, as required by both
+reference toolboxes; wallet results and PeerPay delivery continue to use Atomic BEEF.
 
 ## Modules
 
@@ -77,6 +93,33 @@ returned the caller's exact requested outputs. Without that check a storage oper
 output and have the wallet sign it. This is advisory GHSA-36f9-7rg5-cpf8 in the TypeScript toolbox.
 
 ## Building
+
+### MessageBox identity-key payments
+
+`ToolboxWallet` includes the HTTP PeerPay sending path from
+[`@bsv/message-box-client`](https://github.com/bsv-blockchain/ts-stack/tree/main/packages/messaging/message-box-client).
+It reuses SDK cryptography and overlay lookup, authenticated HTTP, and BRC-29 payments.
+Applications supply the default server; recipient `ls_messagebox` advertisements take precedence.
+
+```swift
+let outbox = MessageBoxOutbox(directory: applicationSupport.appendingPathComponent("MessageBoxOutbox"))
+let txid = try await outbox.send(
+    wallet: wallet, to: recipientIdentityKey, satoshis: 1_000,
+    description: "PeerPay payment", fallbackHost: configuredMessageBoxURL
+)
+```
+
+Keep one outbox instance per directory. Signed BEEF and the encrypted delivery envelope are
+saved before broadcast. On a pending-delivery error, use `outbox.retry(wallet:)`, not another
+`send`: retry reuses the saved transaction and message ID, including after an app restart.
+The recipient must understand standard PeerPay payment tokens. Server acceptance is not proof
+that the recipient has internalized the payment.
+
+This slice supports zero-fee delivery. Blocked recipients or quotes requiring an additional
+delivery payment are refused before transaction creation. It does not register receiving hosts,
+poll inboxes, or silently pay delivery fees. Configured endpoints must use HTTPS.
+
+### Tests
 
 ```bash
 swift build
