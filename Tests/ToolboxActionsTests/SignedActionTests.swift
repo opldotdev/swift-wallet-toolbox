@@ -119,14 +119,14 @@ final class SignedActionTests: XCTestCase {
     // MARK: - Finalization
 
     /// The finding this fixes: storage cannot commit or broadcast without the signed transaction,
-    /// and its inputs stay reserved. The request must carry it as Atomic BEEF.
+    /// and its inputs stay reserved. The storage request must carry raw transaction bytes.
     func test_theRequestCarriesTheSignedTransaction() throws {
         let request = try signed(reference: "abc123").processRequest()
 
         XCTAssertEqual(request.reference, "abc123")
         XCTAssertTrue(request.isNewTx)
         XCTAssertNotNil(request.rawTX)
-        XCTAssertEqual(Array(request.rawTX!.prefix(4)), [0x01, 0x01, 0x01, 0x01])
+        XCTAssertNoThrow(try Transaction(bytes: request.rawTX!, limits: WalletTransactionLimits.standard))
     }
 
     func test_sendWithMarksTheRequestAsABatch() throws {

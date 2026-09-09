@@ -43,7 +43,8 @@ extension RemoteWallet {
     public func abortAction(
         _ request: WalletAbortActionRequest
     ) async throws -> WalletAbortActionResult {
-        try await storage.abortAction(auth, request)
+        await pendingActions.remove(request.reference.base64)
+        return try await storage.abortAction(auth, request)
     }
 
     /// Lists the outputs in the requested application basket without applying any 1Sat-specific

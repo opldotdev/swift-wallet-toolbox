@@ -30,6 +30,46 @@ public struct Paymail: Sendable {
         ) != nil
     }
 
+    /// Read-only recipient discovery. Does not request outputs or submit a transaction.
+    /// The public-profile capability supplies name/avatar; PKI is the fallback
+    /// for providers without public profiles. A network failure is never a valid recipient.
+    public func validateRecipient(paymail: String) async throws -> String? {
+        try await recipientProfile(paymail: paymail).name
+    }
+
+    public func recipientProfile(paymail: String) async throws -> PaymailProfile {
+        let address = try Self.parse(paymail)
+        let capabilities = try await capabilities(for: address)
+        let profile = capabilities["f12f968c92d6"]
+        guard let template = profile ?? capabilities["pki"] else {
+            throw PaymailError.capabilityUnsupported(domain: address.domain, capability: "recipient verification")
+        }
+        let response = try await http.get(Self.capabilityURL(template: template, address: address))
+        guard (200..<300).contains(response.status) else {
+            throw PaymailError.httpFailure(statusCode: response.status)
+        }
+        guard response.body.count <= Self.maximumJSONBytes,
+              let value = try? JSONDecoder().decode(JSONValue.self, from: Data(response.body)) else {
+            throw PaymailError.unreadableResponse
+        }
+        if profile != nil {
+            guard let name = value["name"]?.stringValue,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw PaymailError.unreadableResponse
+            }
+            let avatar = value["avatar"]?.stringValue
+                .flatMap { URL(string: $0.replacingOccurrences(of: "{?s}", with: "?s=180")) }
+                .flatMap { $0.scheme?.lowercased() == "https" && $0.host != nil ? $0 : nil }
+            return PaymailProfile(name: name, avatar: avatar)
+        }
+        guard let key = value["pubkey"]?.stringValue,
+              key.count == 66, key.hasPrefix("02") || key.hasPrefix("03"),
+              key.allSatisfy({ $0.isHexDigit }) else {
+            throw PaymailError.unreadableResponse
+        }
+        return PaymailProfile(name: nil, avatar: nil)
+    }
+
     /// Resolves outputs to pay `paymail` for `satoshis`. The returned reference must be used when
     /// the signed transaction is delivered.
     public func paymentDestination(
@@ -144,10 +184,12 @@ public struct Paymail: Sendable {
         guard fields.count >= 4, let port = Int(fields[2]) else {
             throw PaymailError.unreadableResponse
         }
-        let target = Self.withoutTrailingDot(String(fields[3]))
-        let originalDomain = Self.withoutTrailingDot(domain)
+        let target = Self.withoutTrailingDot(String(fields[3])).lowercased()
+        let originalDomain = Self.withoutTrailingDot(domain).lowercased()
         let dnssecValidated = value["AD"]?.boolValue == true
-        guard dnssecValidated || target.hasSuffix(originalDomain) else {
+        // Paymail Host Discovery permits unsigned records only for the domain
+        // itself or www.domain, not arbitrary subdomains or suffix matches.
+        guard dnssecValidated || target == originalDomain || target == "www.\(originalDomain)" else {
             return fallback
         }
         return ServiceEndpoint(host: target, port: port)
@@ -158,7 +200,7 @@ public struct Paymail: Sendable {
             throw PaymailError.notAPaymail(paymail)
         }
         let alias = String(paymail[..<separator])
-        let domain = String(paymail[paymail.index(after: separator)...])
+        let domain = String(paymail[paymail.index(after: separator)...]).lowercased()
         return Address(alias: alias, domain: domain)
     }
 
@@ -172,9 +214,10 @@ public struct Paymail: Sendable {
         var capabilities: [String: String] = [:]
         capabilities.reserveCapacity(object.count)
         for (identifier, value) in object {
-            guard let template = value.stringValue else {
-                throw PaymailError.unreadableResponse
-            }
+            // BRFC extensions may contain flags or structured configuration.
+            // This resolver consumes endpoint templates only; unrelated values
+            // must not invalidate the standard endpoints.
+            guard let template = value.stringValue else { continue }
             capabilities[identifier] = template
         }
         return capabilities
@@ -245,7 +288,8 @@ public struct Paymail: Sendable {
         let rendered = template
             .replacingOccurrences(of: "{alias}", with: address.alias)
             .replacingOccurrences(of: "{domain.tld}", with: address.domain)
-        guard let url = URL(string: rendered) else {
+        guard let url = URL(string: rendered), url.scheme?.lowercased() == "https",
+              url.host != nil, url.user == nil, url.password == nil else {
             throw PaymailError.unreadableResponse
         }
         return url
@@ -266,6 +310,11 @@ public struct Paymail: Sendable {
     private static func withoutTrailingDot(_ value: String) -> String {
         value.last == "." ? String(value.dropLast()) : value
     }
+}
+
+public struct PaymailProfile: Equatable, Sendable {
+    public let name: String?
+    public let avatar: URL?
 }
 
 /// A resolved destination and the server reference required for later delivery.
@@ -348,12 +397,28 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
 #endif
 }
 
-public enum PaymailError: Error, Equatable, Sendable {
+public enum PaymailError: Error, Equatable, Sendable, LocalizedError {
     case notAPaymail(String)
     case capabilityUnsupported(domain: String, capability: String)
     case unreadableResponse
     case httpFailure(statusCode: Int)
     case deliveryFailed(statusCode: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notAPaymail: "Enter a valid paymail address."
+        case .capabilityUnsupported(let domain, let capability):
+            "\(domain) does not advertise the required paymail service (\(capability))."
+        case .unreadableResponse:
+            "The paymail provider returned a response the wallet could not read."
+        case .httpFailure(let status) where status == 404:
+            "The paymail provider could not find that recipient or service. Check the address."
+        case .httpFailure(let status):
+            "The paymail provider could not complete the lookup (HTTP \(status)). Try again."
+        case .deliveryFailed(let status):
+            "The paymail provider did not accept the transaction delivery (HTTP \(status))."
+        }
+    }
 }
 
 private actor CapabilityCache {

@@ -18,7 +18,7 @@ import ToolboxStorage
 /// This is the only storage engine in v1. The TypeScript toolbox's mobile build ships the same
 /// single option — it exports no on-device engine at all. See `docs/DESIGN.md` §5.
 public actor StorageClient {
-    public let endpoint: URL
+    public nonisolated let endpoint: URL
     private let transport: any AuthenticatedTransport
     private var nextID = 1
     private var settings: StorageSettings?

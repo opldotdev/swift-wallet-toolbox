@@ -53,11 +53,12 @@ public struct StorageActionInput: Equatable, Sendable {
     /// this counterparty, so two inputs from different senders derive different keys. Absent means
     /// the wallet paid itself — change — and its own key is the counterparty.
     public let senderIdentityKey: String?
+    public let vin: UInt32?
 
     public init(sourceTXID: String, sourceVout: UInt32, sourceSatoshis: Int64,
                 sourceLockingScript: [UInt8], unlockingScriptLength: UInt32,
                 derivationPrefix: String?, derivationSuffix: String?,
-                senderIdentityKey: String? = nil) {
+                senderIdentityKey: String? = nil, vin: UInt32? = nil) {
         self.sourceTXID = sourceTXID
         self.sourceVout = sourceVout
         self.sourceSatoshis = sourceSatoshis
@@ -66,6 +67,7 @@ public struct StorageActionInput: Equatable, Sendable {
         self.derivationPrefix = derivationPrefix
         self.derivationSuffix = derivationSuffix
         self.senderIdentityKey = senderIdentityKey
+        self.vin = vin
     }
 }
 
@@ -74,17 +76,21 @@ public struct StorageProcessActionRequest: Equatable, Sendable {
     public let reference: String
     public let isNewTx: Bool
     public let isSendWith: Bool
-    /// Atomic BEEF, per BRC-95.
+    /// Raw Bitcoin transaction bytes. Storage already retained the input BEEF at createAction.
     public let rawTX: [UInt8]?
     public let sendWith: [String]
+    public let isNoSend: Bool
+    public let isDelayed: Bool
 
     public init(reference: String, isNewTx: Bool, isSendWith: Bool, rawTX: [UInt8]?,
-                sendWith: [String]) {
+                sendWith: [String], isNoSend: Bool = false, isDelayed: Bool = false) {
         self.reference = reference
         self.isNewTx = isNewTx
         self.isSendWith = isSendWith
         self.rawTX = rawTX
         self.sendWith = sendWith
+        self.isNoSend = isNoSend
+        self.isDelayed = isDelayed
     }
 }
 
