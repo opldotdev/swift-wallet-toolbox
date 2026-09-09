@@ -52,9 +52,9 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                 method: method, path: path, query: query, headers: headers, body: body
             )
         } catch AuthTransportError.sessionExpired {
-            // The SDK evicts a session at its message limit. One controlled re-handshake recovers
-            // rather than failing a call the peer would have answered. A second failure is real.
-            forgetSession()
+            // Typed pre-send eviction only. One re-handshake recovers; a second failure is real.
+            // Never retry after the application request may have been transmitted.
+            await forgetSession()
             return try await attemptSend(
                 method: method, path: path, query: query, headers: headers, body: body
             )
@@ -84,7 +84,9 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                 )
             }
             message = produced
-        } catch let error where isMissingSession(error) {
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error where isRecoverablePreSendSessionError(error) {
             throw AuthTransportError.sessionExpired
         }
 
@@ -103,14 +105,33 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         return try await unwrap(response, expecting: requestID)
     }
 
-    private func forgetSession() {
-        sessionID = nil
+    private func forgetSession() async {
+        if let id = sessionID {
+            sessionID = nil
+            await authenticator.close(id)
+        } else {
+            sessionID = nil
+        }
     }
 
-    /// True when the authenticator refused because the session is gone rather than because the
-    /// request was bad. The distinction decides whether a re-handshake can recover.
-    private nonisolated func isMissingSession(_ error: Error) -> Bool {
-        "\(error)".localizedCaseInsensitiveContains("session")
+    /// True when the authenticator refused before any application request was sent, because the
+    /// local session is gone, not because the request was bad. String-matching is not enough:
+    /// `AuthError.notAuthenticated` describes itself as `notAuthenticated`, not `session`.
+    private nonisolated func isRecoverablePreSendSessionError(_ error: Error) -> Bool {
+        guard let authError = error as? AuthError else { return false }
+        switch authError {
+        case .notAuthenticated, .sessionNotFound, .resourceLimit:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Leaves the cached session ID in place so the next send observes a stale authenticator.
+    func testingCloseAuthenticatorSession() async {
+        if let sessionID {
+            await authenticator.close(sessionID)
+        }
     }
 
     // MARK: - Handshake
@@ -121,7 +142,12 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// first two requests on a cold session would each open one, and the peer would see two
     /// identities where there is one.
     private func establishedSession() async throws -> AuthSessionID {
-        if let sessionID { return sessionID }
+        if let sessionID, let snapshot = await authenticator.session(sessionID),
+            snapshot.state == .authenticated
+        {
+            return sessionID
+        }
+        sessionID = nil
         if let handshake { return try await handshake.value }
 
         let task = Task { try await performHandshake() }
