@@ -26,6 +26,9 @@ final class AuthenticatedSessionTests: XCTestCase {
         var refuseHandshake = false
         /// After a session is open, answer later application requests with an unsigned body.
         var unsignedReplies = false
+        /// Count of application replies to send as an unsigned 401, matching a peer
+        /// that has dropped the session before applying the method.
+        var unauthorizedRemaining = 0
 
         init(key: PrivateKey, responseBody: [UInt8] = Array("{\"ok\":true}".utf8),
              responseStatus: Int = 200) {
@@ -37,6 +40,7 @@ final class AuthenticatedSessionTests: XCTestCase {
         func setRefusingHandshake(_ refusing: Bool) { refuseHandshake = refusing }
         func setResponseStatus(_ status: Int) { responseStatus = status }
         func setUnsignedReplies(_ unsigned: Bool) { unsignedReplies = unsigned }
+        func setUnauthorizedRemaining(_ count: Int) { unauthorizedRemaining = count }
 
         func send(_ request: HTTPRequest) async throws -> HTTPResponse {
             pathsSeen.append(request.url.path)
@@ -59,6 +63,10 @@ final class AuthenticatedSessionTests: XCTestCase {
         }
 
         private func general(_ request: HTTPRequest) async throws -> HTTPResponse {
+            if unauthorizedRemaining > 0 {
+                unauthorizedRemaining -= 1
+                return HTTPResponse(statusCode: 401, body: Array("unauthorized".utf8))
+            }
             if unsignedReplies {
                 return HTTPResponse(statusCode: 200, body: Array("{\"result\":42}".utf8))
             }
@@ -307,6 +315,26 @@ final class AuthenticatedSessionTests: XCTestCase {
             !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
         }
         XCTAssertEqual(application, ["/one", "/two"])
+    }
+
+    func test_anUnauthorizedReplyWithoutAnAuthFrameRehandshakesOnce() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await peer.setUnauthorizedRemaining(1)
+
+        let response = try await session.send(method: "POST", path: "/two", body: [0x02])
+
+        XCTAssertEqual(response.statusCode, 200)
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 2)
+        let application = await peer.pathsSeen.filter {
+            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(application, ["/one", "/two", "/two"])
     }
 
     func test_cancellationIsNotTreatedAsAStaleSession() async throws {

@@ -243,11 +243,15 @@ public struct RemoteWallet: Sendable {
                 metadata = nil
             }
             do {
+                let beef = (try? result.signed.beef()) ?? []
                 try await resolver.deliver(
-                    beef: try result.signed.beef(),
+                    beef: beef,
                     to: recipient,
                     reference: destination.reference,
-                    metadata: metadata
+                    metadata: metadata,
+                    rawTransaction: try result.signed.transaction.serialized(
+                        limits: WalletBEEFLimits.standard.transactionLimits
+                    )
                 )
             } catch {
                 throw WalletError.paymailDeliveryFailed(txid: txid)

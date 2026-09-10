@@ -156,9 +156,29 @@ final class SignedActionTests: XCTestCase {
         let atomic = try action.atomicBEEF()
 
         XCTAssertNotEqual(beef, atomic)
+        XCTAssertEqual(Array(beef.prefix(4)), [0x01, 0x00, 0xBE, 0xEF])
         XCTAssertThrowsError(try AtomicBEEF(bytes: beef, limits: WalletBEEFLimits.standard))
         let parsed = try BEEF(bytes: beef, limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(parsed.version, .v1)
         XCTAssertEqual(parsed.transactions.count, 2, "the ancestor and the subject")
+    }
+
+    func test_paymailBEEFIsBRC62EvenWhenStorageFundedABRC96Graph() throws {
+        let source = try sourceTransaction()
+        let graph = try BEEF(
+            version: .v2,
+            merklePaths: [],
+            transactions: [.raw(source)],
+            limits: WalletBEEFLimits.standard
+        )
+        let value = try parts(source: source, inputBEEF: try serialized(graph))
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+
+        let beef = try action.beef()
+        XCTAssertEqual(Array(beef.prefix(4)), [0x01, 0x00, 0xBE, 0xEF])
+        let parsed = try BEEF(bytes: beef, limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(parsed.version, .v1)
+        XCTAssertEqual(parsed.transactions.count, 2)
     }
 
     func test_preservesTheFundedBEEFVersionAndBUMP() throws {
