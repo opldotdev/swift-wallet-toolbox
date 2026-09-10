@@ -244,7 +244,7 @@ public struct RemoteWallet: Sendable {
             }
             do {
                 try await resolver.deliver(
-                    beef: try result.signed.atomicBEEF(),
+                    beef: try result.signed.beef(),
                     to: recipient,
                     reference: destination.reference,
                     metadata: metadata

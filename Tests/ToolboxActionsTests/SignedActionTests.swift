@@ -150,6 +150,17 @@ final class SignedActionTests: XCTestCase {
         XCTAssertEqual(parsed.beef.transactions.count, 2, "the ancestor and the subject")
     }
 
+    func test_beefBytesAreBRC62NotTheAtomicEnvelope() throws {
+        let action = try signed()
+        let beef = try action.beef()
+        let atomic = try action.atomicBEEF()
+
+        XCTAssertNotEqual(beef, atomic)
+        XCTAssertThrowsError(try AtomicBEEF(bytes: beef, limits: WalletBEEFLimits.standard))
+        let parsed = try BEEF(bytes: beef, limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(parsed.transactions.count, 2, "the ancestor and the subject")
+    }
+
     func test_preservesTheFundedBEEFVersionAndBUMP() throws {
         let source = try sourceTransaction()
         let sourceID = try source.transactionID(limits: WalletTransactionLimits.standard)
