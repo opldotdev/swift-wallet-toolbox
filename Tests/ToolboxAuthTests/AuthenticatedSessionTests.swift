@@ -29,6 +29,11 @@ final class AuthenticatedSessionTests: XCTestCase {
         /// Count of application replies to send as an unsigned 401, matching a peer
         /// that has dropped the session before applying the method.
         var unauthorizedRemaining = 0
+        /// Count of application replies whose `yourNonce` does not match the open session.
+        /// AuthFetch retries `Session not found for nonce`; this is that reply.
+        var unknownSessionNonceRemaining = 0
+        private var generalDepth = 0
+        private(set) var maxGeneralDepth = 0
 
         init(key: PrivateKey, responseBody: [UInt8] = Array("{\"ok\":true}".utf8),
              responseStatus: Int = 200) {
@@ -41,6 +46,8 @@ final class AuthenticatedSessionTests: XCTestCase {
         func setResponseStatus(_ status: Int) { responseStatus = status }
         func setUnsignedReplies(_ unsigned: Bool) { unsignedReplies = unsigned }
         func setUnauthorizedRemaining(_ count: Int) { unauthorizedRemaining = count }
+        func setUnknownSessionNonceRemaining(_ count: Int) { unknownSessionNonceRemaining = count }
+        func peakGeneralDepth() -> Int { maxGeneralDepth }
 
         func send(_ request: HTTPRequest) async throws -> HTTPResponse {
             pathsSeen.append(request.url.path)
@@ -63,6 +70,10 @@ final class AuthenticatedSessionTests: XCTestCase {
         }
 
         private func general(_ request: HTTPRequest) async throws -> HTTPResponse {
+            generalDepth += 1
+            maxGeneralDepth = max(maxGeneralDepth, generalDepth)
+            defer { generalDepth -= 1 }
+            await Task.yield()
             if unauthorizedRemaining > 0 {
                 unauthorizedRemaining -= 1
                 return HTTPResponse(statusCode: 401, body: Array("unauthorized".utf8))
@@ -97,12 +108,17 @@ final class AuthenticatedSessionTests: XCTestCase {
                 return HTTPResponse(statusCode: 500, body: [])
             }
             let responseFrame = try BRC104HTTPFrameCodec.encodeResponse(signed)
+            var headers = Dictionary(
+                responseFrame.headers.map { ($0.name, $0.value) },
+                uniquingKeysWith: { _, last in last }
+            )
+            if unknownSessionNonceRemaining > 0 {
+                unknownSessionNonceRemaining -= 1
+                headers[BRC104HTTPHeaderName.yourNonce] = String(repeating: "A", count: 64)
+            }
             return HTTPResponse(
                 statusCode: responseFrame.status,
-                headers: Dictionary(
-                    responseFrame.headers.map { ($0.name, $0.value) },
-                    uniquingKeysWith: { _, last in last }
-                ),
+                headers: headers,
                 body: responseFrame.body ?? []
             )
         }
@@ -315,6 +331,39 @@ final class AuthenticatedSessionTests: XCTestCase {
             !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
         }
         XCTAssertEqual(application, ["/one", "/two"])
+    }
+
+    func test_aReplyForAnUnknownSessionNonceRehandshakesOnce() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await peer.setUnknownSessionNonceRemaining(1)
+
+        let response = try await session.send(method: "POST", path: "/two", body: [0x02])
+
+        XCTAssertEqual(response.statusCode, 200)
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 2)
+        let application = await peer.pathsSeen.filter {
+            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(application, ["/one", "/two", "/two"])
+    }
+
+    func test_concurrentSendsDoNotOverlapTheHTTPRoundTrip() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        async let first = session.send(method: "POST", path: "/one", body: [0x01])
+        async let second = session.send(method: "POST", path: "/two", body: [0x02])
+        _ = try await (first, second)
+
+        let depth = await peer.peakGeneralDepth()
+        XCTAssertEqual(depth, 1)
     }
 
     func test_anUnauthorizedReplyWithoutAnAuthFrameRehandshakesOnce() async throws {

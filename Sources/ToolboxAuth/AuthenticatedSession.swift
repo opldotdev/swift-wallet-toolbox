@@ -28,6 +28,11 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// Set while a handshake is running, so a second caller waits for the first rather than
     /// starting its own.
     private var handshake: Task<AuthSessionID, Error>?
+    /// Held across the HTTP round-trip so a 401 retry cannot close the authenticator under a
+    /// sibling still waiting for its reply. AuthFetch deletes the peer; Swift must not do that
+    /// while another receive is in flight.
+    private var sending = false
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(
         baseURL: URL,
@@ -47,13 +52,16 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         method: String, path: String, query: String? = nil,
         headers: [String: String] = [:], body: [UInt8]? = nil
     ) async throws -> AuthenticatedResponse {
+        await acquireSend()
+        defer { releaseSend() }
         do {
             return try await attemptSend(
                 method: method, path: path, query: query, headers: headers, body: body
             )
         } catch AuthTransportError.sessionExpired {
-            // Typed pre-send eviction only. One re-handshake recovers; a second failure is real.
-            // Never retry after the application request may have been transmitted.
+            // AuthFetch retries `Session not found for nonce` and unsigned 401. One
+            // re-handshake recovers; a second failure is real. The send lock is still
+            // held, so a sibling cannot receive against the session we are about to drop.
             await forgetSession()
             return try await attemptSend(
                 method: method, path: path, query: query, headers: headers, body: body
@@ -165,32 +173,41 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             throw AuthTransportError.handshakeFailed("the authenticator opened no request")
         }
 
-        let response = try await transport.send(
-            HTTPRequest(
-                method: "POST",
-                url: url(forPath: BRC104HTTPHeaderName.handshakePath, query: nil),
-                headers: ["Content-Type": "application/json"],
-                body: try AuthMessageCodec.encode(request)
-            )
-        )
-        guard (200..<300).contains(response.statusCode) else {
-            throw AuthTransportError.handshakeFailed("the peer answered \(response.statusCode)")
-        }
-
-        let reply: AuthMessage
         do {
-            reply = try AuthMessageCodec.decode(response.body)
-        } catch {
-            throw AuthTransportError.handshakeFailed("the peer's reply could not be read")
-        }
-        // Verifying the reply is the authenticator's job, and it throws when the signature does
-        // not cover our nonce. Reaching the next line means the peer holds the key it claims.
-        _ = try await authenticator.receive(reply)
+            let response = try await transport.send(
+                HTTPRequest(
+                    method: "POST",
+                    url: url(forPath: BRC104HTTPHeaderName.handshakePath, query: nil),
+                    headers: ["Content-Type": "application/json"],
+                    body: try AuthMessageCodec.encode(request)
+                )
+            )
+            guard (200..<300).contains(response.statusCode) else {
+                throw AuthTransportError.handshakeFailed("the peer answered \(response.statusCode)")
+            }
 
-        guard await authenticator.session(session) != nil else {
-            throw AuthTransportError.handshakeFailed("the peer's reply did not open a session")
+            let reply: AuthMessage
+            do {
+                reply = try AuthMessageCodec.decode(response.body)
+            } catch {
+                throw AuthTransportError.handshakeFailed("the peer's reply could not be read")
+            }
+            // Verifying the reply is the authenticator's job, and it throws when the signature does
+            // not cover our nonce. Reaching the next line means the peer holds the key it claims.
+            do {
+                _ = try await authenticator.receive(reply)
+            } catch AuthError.sessionNotFound {
+                throw AuthTransportError.sessionExpired
+            }
+
+            guard await authenticator.session(session) != nil else {
+                throw AuthTransportError.handshakeFailed("the peer's reply did not open a session")
+            }
+            return session
+        } catch {
+            await authenticator.close(session)
+            throw error
         }
-        return session
     }
 
     // MARK: - Unwrapping
@@ -227,7 +244,12 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             )
         }
 
-        let actions = try await authenticator.receive(message)
+        let actions: [AuthPeerAction]
+        do {
+            actions = try await authenticator.receive(message)
+        } catch AuthError.sessionNotFound {
+            throw AuthTransportError.sessionExpired
+        }
         guard case .deliver(let delivered)? = actions.first(where: {
             if case .deliver = $0 { return true }
             return false
@@ -276,5 +298,20 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// secure on every platform this package supports.
     private func randomRequestID() -> [UInt8] {
         (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+    }
+
+    private func acquireSend() async {
+        if sending {
+            await withCheckedContinuation { sendWaiters.append($0) }
+        }
+        sending = true
+    }
+
+    private func releaseSend() {
+        if sendWaiters.isEmpty {
+            sending = false
+        } else {
+            sendWaiters.removeFirst().resume()
+        }
     }
 }
