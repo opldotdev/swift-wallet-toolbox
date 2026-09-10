@@ -78,6 +78,16 @@ public struct SignedAction: Sendable {
         try envelope.serialized(limits: beefLimits)
     }
 
+    /// BRC-62 BEEF for paymail receive-BEEF (`5c55a7fdb7bb`).
+    ///
+    /// HandCash and other hosts parse BEEF magic `4022206465` / `4022206466`.
+    /// Atomic BEEF starts with `0x01010101` and they reject it as an invalid
+    /// transaction. Wallet callers still get the BRC-95 envelope from
+    /// `atomicBEEF()`.
+    public func beef() throws -> [UInt8] {
+        try envelope.beef.serialized(limits: beefLimits)
+    }
+
     /// What storage needs to finalise and send this: the reference and raw signed transaction.
     /// Without the transaction storage cannot commit or broadcast it, and the inputs
     /// it reserved stay reserved.
