@@ -386,6 +386,45 @@ final class AuthenticatedSessionTests: XCTestCase {
         XCTAssertEqual(application, ["/one", "/two", "/two"])
     }
 
+    func test_authFetchBudgetRecoversThreeStaleReplies() async throws {
+        XCTAssertEqual(AuthenticatedSession.sessionRecoveryRetries, 3)
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await peer.setUnauthorizedRemaining(3)
+
+        let response = try await session.send(method: "POST", path: "/two", body: [0x02])
+
+        XCTAssertEqual(response.statusCode, 200)
+        let application = await peer.pathsSeen.filter {
+            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(application, ["/one", "/two", "/two", "/two", "/two"])
+    }
+
+    func test_authFetchBudgetStopsAfterThreeRecoveries() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        _ = try await session.send(method: "POST", path: "/one", body: [0x01])
+        await peer.setUnauthorizedRemaining(4)
+
+        do {
+            _ = try await session.send(method: "POST", path: "/two", body: [0x02])
+            XCTFail("a fourth consecutive stale reply must surface")
+        } catch let error as AuthTransportError {
+            guard case .sessionExpired = error else {
+                return XCTFail("expected sessionExpired, got \(error)")
+            }
+        }
+
+        let application = await peer.pathsSeen.filter {
+            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(application, ["/one", "/two", "/two", "/two", "/two"])
+    }
+
     func test_cancellationIsNotTreatedAsAStaleSession() async throws {
         let keys = try keyPair()
         let session = AuthenticatedSession(
