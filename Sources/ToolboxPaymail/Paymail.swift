@@ -31,6 +31,22 @@ public struct Paymail: Sendable {
         ) != nil
     }
 
+    /// BRC-28/70 `metadata.sender`. A published paymail wins so the host can load a public
+    /// profile (name + avatar). Otherwise a display name or the identity pubkey — never empty.
+    /// HandCash renders `$paymail` when this field is omitted.
+    public static func senderIdentity(
+        paymail: String?,
+        displayName: String?,
+        pubkeyHex: String
+    ) -> String {
+        if let paymail, isPaymail(paymail) { return paymail }
+        if let displayName {
+            let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty, !isPaymail(name) { return name }
+        }
+        return pubkeyHex
+    }
+
     /// Read-only recipient discovery. Does not request outputs or submit a transaction.
     /// The public-profile capability supplies name/avatar; PKI is the fallback
     /// for providers without public profiles. A network failure is never a valid recipient.

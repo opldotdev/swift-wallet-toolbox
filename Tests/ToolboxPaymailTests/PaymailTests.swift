@@ -80,6 +80,35 @@ final class PaymailTests: XCTestCase {
         XCTAssertFalse(Paymail.isPaymail("not-a-paymail"))
     }
 
+    func test_senderIdentityPrefersPaymailThenDisplayNameThenPubkey() {
+        let pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        XCTAssertEqual(
+            Paymail.senderIdentity(
+                paymail: "maya@1sat.app", displayName: "Maya", pubkeyHex: pubkey
+            ),
+            "maya@1sat.app"
+        )
+        XCTAssertEqual(
+            Paymail.senderIdentity(paymail: nil, displayName: "Maya", pubkeyHex: pubkey),
+            "Maya"
+        )
+        XCTAssertEqual(
+            Paymail.senderIdentity(paymail: "  ", displayName: "  ", pubkeyHex: pubkey),
+            pubkey
+        )
+        XCTAssertEqual(
+            Paymail.senderIdentity(paymail: nil, displayName: nil, pubkeyHex: pubkey),
+            pubkey
+        )
+        XCTAssertEqual(
+            Paymail.senderIdentity(
+                paymail: nil, displayName: "maya@example.com", pubkeyHex: pubkey
+            ),
+            pubkey,
+            "a display name that looks like a paymail is not sent as one"
+        )
+    }
+
     func test_extensionCapabilitiesDoNotRejectEndpoints() async throws {
         let body = #"{"capabilities":{"6745385c3fc0":false,"extension":{"flag":true},"2a40af698840":"https://pay.example.com/{alias}/{domain.tld}/destination"}}"#
         let stub = StubHTTP(getResponses: [
@@ -308,6 +337,7 @@ final class PaymailTests: XCTestCase {
             to: paymail,
             reference: "payment-reference",
             metadata: PaymailDeliveryMetadata(
+                sender: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
                 pubkey: "02ab",
                 signature: "sig",
                 note: "1Sat Wallet send"
@@ -320,10 +350,13 @@ final class PaymailTests: XCTestCase {
         XCTAssertEqual(object["beef"] as? String, "01")
         XCTAssertEqual(object["reference"] as? String, "payment-reference")
         let metadata = try XCTUnwrap(object["metadata"] as? [String: String])
+        XCTAssertEqual(
+            metadata["sender"],
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        )
         XCTAssertEqual(metadata["pubkey"], "02ab")
         XCTAssertEqual(metadata["signature"], "sig")
         XCTAssertEqual(metadata["note"], "1Sat Wallet send")
-        XCTAssertNil(metadata["sender"])
     }
 
     func test_deliverRefusesAReceiveTransactionOnlyHostWithoutRawTransaction() async throws {

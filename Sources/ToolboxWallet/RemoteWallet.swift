@@ -208,12 +208,17 @@ public struct RemoteWallet: Sendable {
     /// A paymail whose delivery fails after the money has moved throws `paymailDeliveryFailed`
     /// carrying the txid — the payment is on chain, but the recipient's host was not told, and the
     /// caller must know both facts.
+    ///
+    /// `sender` is the BRC-28/70 metadata handle. Hosts such as HandCash show `$paymail` when it
+    /// is omitted. Pass a paymail when the account has one; otherwise a display name or this
+    /// wallet's identity pubkey. The pubkey and txid signature are always sent.
     @discardableResult
     public func pay(
         to recipient: String,
         satoshis: UInt64,
         description: String,
         labels: [String] = [],
+        sender: String? = nil,
         paymail resolver: Paymail = Paymail()
     ) async throws -> SentPayment {
         if Paymail.isPaymail(recipient) {
@@ -232,10 +237,17 @@ public struct RemoteWallet: Sendable {
                 throw WalletError.broadcastFailed(txid: result.sent.transactionID.displayHex)
             }
             let txid = result.sent.transactionID.displayHex
+            let pubkeyHex = Hex.encode(identityKey.publicKey.compressedBytes)
+            let senderHandle = Paymail.senderIdentity(
+                paymail: sender,
+                displayName: sender,
+                pubkeyHex: pubkeyHex
+            )
             let metadata: PaymailDeliveryMetadata?
             do {
                 metadata = PaymailDeliveryMetadata(
-                    pubkey: Hex.encode(identityKey.publicKey.compressedBytes),
+                    sender: senderHandle,
+                    pubkey: pubkeyHex,
                     signature: try BitcoinSignedMessage.sign(txid, using: identityKey),
                     note: description
                 )
