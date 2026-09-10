@@ -34,6 +34,10 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     private var sending = false
     private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// AuthFetch sets `retryCounter ??= 3` after a stale session, then decrements before
+    /// each recovery attempt. That is three recoveries after the first failure.
+    static let sessionRecoveryRetries = 3
+
     public init(
         baseURL: URL,
         wallet: any AuthenticationWallet,
@@ -54,18 +58,20 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     ) async throws -> AuthenticatedResponse {
         await acquireSend()
         defer { releaseSend() }
-        do {
-            return try await attemptSend(
-                method: method, path: path, query: query, headers: headers, body: body
-            )
-        } catch AuthTransportError.sessionExpired {
-            // AuthFetch retries `Session not found for nonce` and unsigned 401. One
-            // re-handshake recovers; a second failure is real. The send lock is still
-            // held, so a sibling cannot receive against the session we are about to drop.
-            await forgetSession()
-            return try await attemptSend(
-                method: method, path: path, query: query, headers: headers, body: body
-            )
+        var remaining = Self.sessionRecoveryRetries
+        while true {
+            do {
+                return try await attemptSend(
+                    method: method, path: path, query: query, headers: headers, body: body
+                )
+            } catch AuthTransportError.sessionExpired {
+                // AuthFetch retries `Session not found for nonce` and unsigned 401.
+                // The send lock stays held so a sibling cannot receive against the
+                // session we are about to drop.
+                guard remaining > 0 else { throw AuthTransportError.sessionExpired }
+                remaining -= 1
+                await forgetSession()
+            }
         }
     }
 
