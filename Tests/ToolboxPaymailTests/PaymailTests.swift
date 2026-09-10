@@ -326,10 +326,9 @@ final class PaymailTests: XCTestCase {
         XCTAssertNil(metadata["sender"])
     }
 
-    func test_deliverRefusesAReceiveTransactionOnlyHost() async throws {
-        // The receive-transaction capability takes a raw transaction under `hex`, not the BEEF this
-        // method holds, so a host advertising only it must be refused rather than sent a BEEF body it
-        // cannot accept.
+    func test_deliverRefusesAReceiveTransactionOnlyHostWithoutRawTransaction() async throws {
+        // BEEF posted to receive-transaction is the wrong body. Without raw transaction
+        // bytes there is nothing this method can send that host.
         let capabilities = """
             {"capabilities":{
               "\(Self.receiveTransactionCapability)":"https://pay.example.com/{alias}/{domain.tld}/transaction"
@@ -344,12 +343,64 @@ final class PaymailTests: XCTestCase {
             try await Paymail(http: stub).deliver(
                 beef: [0x01], to: paymail, reference: "payment-reference"
             )
-            XCTFail("a receive-transaction-only host must be refused")
+            XCTFail("a receive-transaction-only host must be refused without raw bytes")
         } catch let error as PaymailError {
             XCTAssertEqual(
                 error, .capabilityUnsupported(domain: "example.com", capability: Self.receiveBEEFCapability)
             )
         }
+    }
+
+    func test_deliverFallsBackToReceiveTransactionWhenBeefIsRejected() async throws {
+        let receiveURL = "https://pay.example.com/alice/example.com/beef"
+        let hexURL = "https://pay.example.com/alice/example.com/transaction"
+        let stub = StubHTTP(getResponses: [
+            dnsURL: StubResponse(body: #"{"Status":3}"#),
+            fallbackCapabilitiesURL: StubResponse(body: capabilitiesJSON(includeReceive: true)),
+        ], postResponses: [
+            receiveURL: StubResponse(status: 400, body: #"{"message":"Invalid transaction"}"#),
+            hexURL: StubResponse(body: #"{"txid":"ab","note":""}"#),
+        ])
+
+        try await Paymail(http: stub).deliver(
+            beef: [0x01, 0x00, 0xBE, 0xEF],
+            to: paymail,
+            reference: "payment-reference",
+            rawTransaction: [0x01, 0x00, 0x00, 0x00]
+        )
+
+        let hexPosted = await stub.postedBody(to: hexURL)
+        let hexBody = try XCTUnwrap(hexPosted)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(hexBody)) as? [String: Any])
+        XCTAssertEqual(object["hex"] as? String, "01000000")
+        XCTAssertEqual(object["reference"] as? String, "payment-reference")
+    }
+
+    func test_deliverUsesReceiveTransactionWhenThatIsTheOnlyCapability() async throws {
+        let hexURL = "https://pay.example.com/alice/example.com/transaction"
+        let capabilities = """
+            {"capabilities":{
+              "\(Self.receiveTransactionCapability)":"https://pay.example.com/{alias}/{domain.tld}/transaction"
+            }}
+            """
+        let stub = StubHTTP(getResponses: [
+            dnsURL: StubResponse(body: #"{"Status":3}"#),
+            fallbackCapabilitiesURL: StubResponse(body: capabilities),
+        ], postResponses: [
+            hexURL: StubResponse(body: #"{"txid":"ab","note":""}"#),
+        ])
+
+        try await Paymail(http: stub).deliver(
+            beef: [],
+            to: paymail,
+            reference: "payment-reference",
+            rawTransaction: [0xAB]
+        )
+
+        let posted = await stub.postedBody(to: hexURL)
+        let body = try XCTUnwrap(posted)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(body)) as? [String: Any])
+        XCTAssertEqual(object["hex"] as? String, "ab")
     }
 
     func test_deliveryHTTPFailureUsesDeliveryError() async throws {

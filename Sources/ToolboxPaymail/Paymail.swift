@@ -12,6 +12,7 @@ import ToolboxCore
 public struct Paymail: Sendable {
     private static let destinationCapability = "2a40af698840"
     private static let receiveBEEFCapability = "5c55a7fdb7bb"
+    private static let receiveTransactionCapability = "5f1323cddf31"
     private static let maximumJSONBytes = 16 << 20
     private static let maximumHexCharacters = 32 << 20
 
@@ -94,31 +95,60 @@ public struct Paymail: Sendable {
         return try Self.decodeDestination(response.body)
     }
 
-    /// Delivers an Atomic BEEF transaction to the recipient's paymail host.
+    /// Delivers a payment to the recipient's paymail host.
     ///
-    /// Only the receive-BEEF capability is used. The older receive-transaction capability
-    /// (`5f1323cddf31`) takes a different request — the raw transaction under `hex`, with a metadata
-    /// object — not the BEEF this method holds, so sending the BEEF body there always fails. A host
-    /// that does not advertise receive-BEEF is refused here rather than sent a request it cannot
-    /// accept.
+    /// BRC-70 receive-BEEF (`5c55a7fdb7bb`) is tried first when advertised, with BRC-62
+    /// BEEF bytes. BRC-28 receive-transaction (`5f1323cddf31`) takes the raw transaction
+    /// under `hex` — that is what `@bsv/paymail` `sendTransactionP2P` sends, and what
+    /// HandCash has accepted for years. A host that advertises only receive-transaction
+    /// is reached through `rawTransaction`; posting BEEF there always fails.
     public func deliver(
         beef: [UInt8],
         to paymail: String,
         reference: String,
-        metadata: PaymailDeliveryMetadata? = nil
+        metadata: PaymailDeliveryMetadata? = nil,
+        rawTransaction: [UInt8]? = nil
     ) async throws {
         let address = try Self.parse(paymail)
         let capabilities = try await capabilities(for: address)
-        guard let template = capabilities[Self.receiveBEEFCapability] else {
-            throw PaymailError.capabilityUnsupported(
-                domain: address.domain,
-                capability: Self.receiveBEEFCapability
-            )
+        let beefTemplate = capabilities[Self.receiveBEEFCapability]
+        let hexTemplate = capabilities[Self.receiveTransactionCapability]
+
+        var beefError: Error?
+        if let template = beefTemplate, !beef.isEmpty {
+            do {
+                try await postDelivery(
+                    url: try Self.capabilityURL(template: template, address: address),
+                    body: try JSONEncoder().encode(
+                        DeliveryRequest(beef: Self.hex(beef), reference: reference, metadata: metadata)
+                    )
+                )
+                return
+            } catch {
+                beefError = error
+            }
         }
 
-        let url = try Self.capabilityURL(template: template, address: address)
-        let request = DeliveryRequest(beef: Self.hex(beef), reference: reference, metadata: metadata)
-        let body = try JSONEncoder().encode(request)
+        if let rawTransaction, !rawTransaction.isEmpty, let template = hexTemplate {
+            try await postDelivery(
+                url: try Self.capabilityURL(template: template, address: address),
+                body: try JSONEncoder().encode(
+                    HexDeliveryRequest(
+                        hex: Self.hex(rawTransaction), reference: reference, metadata: metadata
+                    )
+                )
+            )
+            return
+        }
+
+        if let beefError { throw beefError }
+        throw PaymailError.capabilityUnsupported(
+            domain: address.domain,
+            capability: beefTemplate == nil ? Self.receiveBEEFCapability : Self.receiveTransactionCapability
+        )
+    }
+
+    private func postDelivery(url: URL, body: Data) async throws {
         let response = try await http.post(url, json: Array(body))
         guard (200..<300).contains(response.status) else {
             throw PaymailError.deliveryFailed(statusCode: response.status)
@@ -499,5 +529,22 @@ private struct DeliveryRequest: Encodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case beef, reference, metadata
+    }
+}
+
+private struct HexDeliveryRequest: Encodable, Sendable {
+    let hex: String
+    let reference: String
+    let metadata: PaymailDeliveryMetadata?
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(hex, forKey: .hex)
+        try container.encode(reference, forKey: .reference)
+        try container.encodeIfPresent(metadata, forKey: .metadata)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hex, reference, metadata
     }
 }

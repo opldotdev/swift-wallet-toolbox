@@ -80,12 +80,22 @@ public struct SignedAction: Sendable {
 
     /// BRC-62 BEEF for paymail receive-BEEF (`5c55a7fdb7bb`).
     ///
-    /// HandCash and other hosts parse BEEF magic `4022206465` / `4022206466`.
-    /// Atomic BEEF starts with `0x01010101` and they reject it as an invalid
-    /// transaction. Wallet callers still get the BRC-95 envelope from
-    /// `atomicBEEF()`.
+    /// BRC-70 and `Transaction.toBEEF()` in `@bsv/sdk` emit version
+    /// `4022206465` (`0100BEEF`). Storage's funded graph is often BRC-96 v2
+    /// (`0200BEEF`). HandCash's receive-beef parser is the BRC-62 reader:
+    /// v2 bytes are rejected after the payment is already on chain.
+    /// Atomic BEEF (`0x01010101`) is still `atomicBEEF()`.
     public func beef() throws -> [UInt8] {
-        try envelope.beef.serialized(limits: beefLimits)
+        let graph = envelope.beef
+        if graph.version == .v1 {
+            return try graph.serialized(limits: beefLimits)
+        }
+        return try BEEF(
+            version: .v1,
+            merklePaths: graph.merklePaths,
+            transactions: graph.transactions,
+            limits: beefLimits
+        ).serialized(limits: beefLimits)
     }
 
     /// What storage needs to finalise and send this: the reference and raw signed transaction.

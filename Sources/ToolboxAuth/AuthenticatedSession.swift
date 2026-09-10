@@ -203,6 +203,13 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     private func unwrap(
         _ response: HTTPResponse, expecting requestID: [UInt8]
     ) async throws -> AuthenticatedResponse {
+        // A 401 with no auth frame is the peer saying the session is gone before the
+        // application method ran. AuthFetch retries that case. A 200 with no auth frame
+        // is an unsigned application reply and is not retried.
+        if response.statusCode == 401, response.header(BRC104HTTPHeaderName.version) == nil {
+            throw AuthTransportError.sessionExpired
+        }
+
         let frame = try BRC104HTTPResponseFrame(
             status: response.statusCode,
             headers: response.headers.map { BRC104Header(name: $0.key, value: $0.value) },
