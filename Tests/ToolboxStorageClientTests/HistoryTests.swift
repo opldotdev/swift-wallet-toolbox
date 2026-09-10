@@ -163,60 +163,8 @@ final class HistoryTests: XCTestCase {
         XCTAssertEqual(decoded.actions[0].outputs, [])
     }
 
-    func test_malformedRequiredAndNestedFieldsAreRefused() throws {
-        let txid = String(repeating: "44", count: 32)
-        let sourceTxid = String(repeating: "55", count: 32)
-        let malformed = [
-            #"{"totalActions":-1,"actions":[]}"#,
-            #"{"totalActions":4294967296,"actions":[]}"#,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"version":1,"lockTime":0
-            }]}
-            """,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"description":"bad inputs","version":1,"lockTime":0,
-              "inputs":{}
-            }]}
-            """,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"description":"bad source amount","version":1,"lockTime":0,
-              "inputs":[{"sourceOutpoint":"\(sourceTxid).0","sourceSatoshis":-1,
-                "inputDescription":"input","sequenceNumber":0}]
-            }]}
-            """,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"description":"bad input script","version":1,"lockTime":0,
-              "inputs":[{"sourceOutpoint":"\(sourceTxid).0","sourceSatoshis":1,
-                "sourceLockingScript":"xyz","inputDescription":"input","sequenceNumber":0}]
-            }]}
-            """,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"description":"missing tags","version":1,"lockTime":0,
-              "outputs":[{"satoshis":1,"spendable":true,"outputIndex":0,
-                "outputDescription":"output","basket":"apps"}]
-            }]}
-            """,
-            """
-            {"totalActions":1,"actions":[{
-              "txid":"\(txid)","satoshis":0,"status":"completed",
-              "isOutgoing":false,"description":"bad custom instructions","version":1,"lockTime":0,
-              "outputs":[{"satoshis":1,"spendable":true,"customInstructions":7,"tags":[],
-                "outputIndex":0,"outputDescription":"output","basket":"apps"}]
-            }]}
-            """,
-        ]
-
-        for json in malformed {
+    func test_aBrokenPageEnvelopeIsRefused() throws {
+        for json in [#"{"totalActions":-1,"actions":[]}"#, #"{"totalActions":4294967296,"actions":[]}"#] {
             XCTAssertThrowsError(try StorageClient.decodeActions(try result(json))) { error in
                 XCTAssertEqual(
                     error as? StorageClientError,
@@ -226,14 +174,62 @@ final class HistoryTests: XCTestCase {
         }
     }
 
-    func test_anUnknownStatusIsRefused() throws {
-        XCTAssertThrowsError(try StorageClient.decodeActions(try result("""
+    func test_anEmptyTxidRowDoesNotHideAConfirmedSend() throws {
+        let sent = String(repeating: "aa", count: 32)
+        let decoded = try StorageClient.decodeActions(try result("""
+            {"totalActions":2,"actions":[
+              {"txid":"","satoshis":0,"status":"unsigned","isOutgoing":true,
+               "description":"leftover","version":1,"lockTime":0},
+              {"txid":"\(sent)","satoshis":-63011,"status":"completed","isOutgoing":true,
+               "description":"1Sat Wallet send","version":1,"lockTime":0}
+            ]}
+            """))
+
+        XCTAssertEqual(decoded.totalActions, 2)
+        XCTAssertEqual(decoded.actions.map(\.transactionID.displayHex), [sent])
+        XCTAssertEqual(decoded.actions[0].satoshis, -63011)
+        XCTAssertTrue(decoded.actions[0].isOutgoing)
+    }
+
+    func test_malformedNestedDetailsAreDroppedWithoutHidingTheAction() throws {
+        let txid = String(repeating: "44", count: 32)
+        let sourceTxid = String(repeating: "55", count: 32)
+        let decoded = try StorageClient.decodeActions(try result("""
+            {"totalActions":1,"actions":[{
+              "txid":"\(txid)","satoshis":-7,"status":"completed",
+              "isOutgoing":true,"description":"1Sat Wallet send","version":1,"lockTime":0,
+              "inputs":{"not":"an array"},
+              "outputs":[{"satoshis":1,"spendable":true,"outputIndex":0,
+                "outputDescription":"output","basket":"apps"}]
+            }]}
+            """))
+
+        XCTAssertEqual(decoded.actions.count, 1)
+        XCTAssertEqual(decoded.actions[0].transactionID.displayHex, txid)
+        XCTAssertNil(decoded.actions[0].inputs)
+        XCTAssertNil(decoded.actions[0].outputs)
+        XCTAssertEqual(
+            (try? StorageClient.decodeActions(try result("""
+                {"totalActions":1,"actions":[{
+                  "txid":"\(txid)","satoshis":0,"status":"completed",
+                  "isOutgoing":false,"description":"bad source amount","version":1,"lockTime":0,
+                  "inputs":[{"sourceOutpoint":"\(sourceTxid).0","sourceSatoshis":-1,
+                    "inputDescription":"input","sequenceNumber":0}]
+                }]}
+                """)))?.actions.first?.transactionID.displayHex,
+            txid
+        )
+    }
+
+    func test_anUnknownStatusIsSkipped() throws {
+        let decoded = try StorageClient.decodeActions(try result("""
             {"totalActions": 1, "actions": [{
               "txid": "8ac7230489e80000000000000000000000000000000000000000000000000001",
               "satoshis": 1, "status": "levitating", "isOutgoing": false,
               "description": "unknown status", "version": 1, "lockTime": 0
             }]}
-            """)))
+            """))
+        XCTAssertTrue(decoded.actions.isEmpty)
     }
 
     func test_failedStatusDecodesFromTheCurrentABI() throws {
@@ -263,6 +259,19 @@ final class HistoryTests: XCTestCase {
         } catch is CancellationError {
             // Expected: listActions must not turn cooperative cancellation into protocol failure.
         }
+    }
+
+    func test_missingDescriptionAndVersionStillDecode() throws {
+        let txid = String(repeating: "77", count: 32)
+        let decoded = try StorageClient.decodeActions(try result("""
+            {"totalActions":1,"actions":[{
+              "txid":"\(txid)","satoshis":1,"status":"completed","isOutgoing":false
+            }]}
+            """))
+        XCTAssertEqual(decoded.actions.count, 1)
+        XCTAssertEqual(decoded.actions[0].description, "")
+        XCTAssertEqual(decoded.actions[0].version, 0)
+        XCTAssertEqual(decoded.actions[0].lockTime, 0)
     }
 
     func test_anEmptyHistoryDecodes() throws {

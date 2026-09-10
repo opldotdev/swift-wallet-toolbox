@@ -49,44 +49,45 @@ extension StorageClient {
         return try Self.decodeActions(result)
     }
 
+    /// TypeScript `listActionsKnex` returns unsigned leftovers as `txid: tx.txid || ''`.
+    /// One such row used to fail the whole page, so a confirmed send on the same page
+    /// never reached history. Skip a row that cannot be a `WalletAction`; keep the rest.
     static func decodeActions(_ result: JSONValue) throws -> WalletListActionsResult {
         guard let total = result["totalActions"]?.intValue,
               let totalActions = UInt32(exactly: total),
               let rows = result["actions"]?.arrayValue else {
             throw StorageClientError.unreadableResponse(method: "listActions")
         }
-        let actions = try rows.map { row -> WalletAction in
-            guard let txidText = row["txid"]?.stringValue,
-                  let satoshis = row["satoshis"]?.intValue,
-                  let statusText = row["status"]?.stringValue,
-                  let status = decodeActionStatus(statusText),
-                  let isOutgoing = row["isOutgoing"]?.boolValue,
-                  let description = row["description"]?.stringValue,
-                  let version = row["version"]?.intValue.flatMap(UInt32.init(exactly:)),
-                  let lockTime = row["lockTime"]?.intValue.flatMap(UInt32.init(exactly:)) else {
-                throw StorageClientError.unreadableResponse(method: "listActions")
-            }
-            do {
-                return try WalletAction(
-                    transactionID: try TransactionID(displayHex: txidText),
-                    satoshis: Int64(satoshis),
-                    status: status,
-                    isOutgoing: isOutgoing,
-                    description: description,
-                    labels: try stringArray(row["labels"], method: "listActions"),
-                    version: version,
-                    lockTime: lockTime,
-                    inputs: try decodeActionInputs(row["inputs"]),
-                    outputs: try decodeActionOutputs(row["outputs"])
-                )
-            } catch let error as StorageClientError {
-                throw error
-            } catch {
-                throw StorageClientError.unreadableResponse(method: "listActions")
-            }
-        }
         return try WalletListActionsResult(
-            totalActions: totalActions, actions: actions
+            totalActions: totalActions,
+            actions: rows.compactMap(decodeActionRow)
+        )
+    }
+
+    private static func decodeActionRow(_ row: JSONValue) -> WalletAction? {
+        let txidText = row["txid"]?.stringValue ?? ""
+        guard let transactionID = try? TransactionID(displayHex: txidText) else { return nil }
+        guard let statusText = row["status"]?.stringValue,
+              let status = decodeActionStatus(statusText) else { return nil }
+        let satoshis = row["satoshis"]?.intValue ?? 0
+        let isOutgoing = row["isOutgoing"]?.boolValue ?? false
+        let description = row["description"]?.stringValue ?? ""
+        let version = row["version"]?.intValue.flatMap(UInt32.init(exactly:)) ?? 0
+        let lockTime = row["lockTime"]?.intValue.flatMap(UInt32.init(exactly:)) ?? 0
+        let labels = try? stringArray(row["labels"], method: "listActions")
+        let inputs = try? decodeActionInputs(row["inputs"])
+        let outputs = try? decodeActionOutputs(row["outputs"])
+        return try? WalletAction(
+            transactionID: transactionID,
+            satoshis: Int64(satoshis),
+            status: status,
+            isOutgoing: isOutgoing,
+            description: description,
+            labels: labels,
+            version: version,
+            lockTime: lockTime,
+            inputs: inputs,
+            outputs: outputs
         )
     }
 
