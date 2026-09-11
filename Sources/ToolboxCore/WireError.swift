@@ -11,7 +11,7 @@ import Foundation
 /// The names are the wire format, so they keep their original spelling. They are not this
 /// library's error style: everything raised locally uses a Swift error enum in the module that
 /// raises it, following `swift-sdk`. This type exists to translate at the boundary, once.
-public enum WireError: Error, Equatable, Sendable {
+public enum WireError: Error, Equatable, Sendable, LocalizedError {
     case badRequest(String)
     case broadcastUnavailable(String)
     case insufficientFunds(String)
@@ -47,6 +47,10 @@ public enum WireError: Error, Equatable, Sendable {
         case .unauthorized: "WERR_UNAUTHORIZED"
         case .unrecognized(let name, _): name
         }
+    }
+
+    public var errorDescription: String? {
+        message.isEmpty ? wireName : message
     }
 
     public var message: String {
