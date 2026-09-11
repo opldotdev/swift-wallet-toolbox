@@ -136,10 +136,19 @@ public actor StorageClient {
     }
 }
 
-public enum StorageClientError: Error, Equatable, Sendable {
+public enum StorageClientError: Error, Equatable, Sendable, LocalizedError {
     /// The server answered, but not in this protocol.
     case unreadableResponse(method: String)
     case httpFailure(method: String, statusCode: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unreadableResponse(let method):
+            "Storage \(method) could not be read."
+        case .httpFailure(_, let statusCode):
+            "Storage returned HTTP \(statusCode)."
+        }
+    }
 }
 
 extension AuthID {

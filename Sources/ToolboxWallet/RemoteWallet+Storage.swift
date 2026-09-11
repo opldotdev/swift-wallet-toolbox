@@ -8,20 +8,22 @@ extension RemoteWallet {
         _ request: WalletListActionsRequest
     ) async throws -> WalletListActionsResult {
         let result = try await storage.listActions(auth, request)
-        let actions = try result.actions.map { action in
-            let outputs = try action.outputs?.map { output in
-                try WalletActionOutput(
-                    satoshis: output.satoshis,
-                    lockingScript: output.lockingScript,
-                    spendable: output.spendable,
-                    customInstructions: nil,
-                    tags: output.tags,
-                    outputIndex: output.outputIndex,
-                    outputDescription: output.outputDescription,
-                    basket: output.basket
-                )
+        let actions: [WalletAction] = result.actions.compactMap { action in
+            let outputs = action.outputs.map { rows in
+                rows.compactMap { output in
+                    try? WalletActionOutput(
+                        satoshis: output.satoshis,
+                        lockingScript: output.lockingScript,
+                        spendable: output.spendable,
+                        customInstructions: nil,
+                        tags: output.tags,
+                        outputIndex: output.outputIndex,
+                        outputDescription: output.outputDescription,
+                        basket: output.basket
+                    )
+                }
             }
-            return try WalletAction(
+            return try? WalletAction(
                 transactionID: action.transactionID,
                 satoshis: action.satoshis,
                 status: action.status,
@@ -34,7 +36,23 @@ extension RemoteWallet {
                 outputs: outputs
             )
         }
-        return try WalletListActionsResult(totalActions: result.totalActions, actions: actions)
+        do {
+            return try WalletListActionsResult(totalActions: result.totalActions, actions: actions)
+        } catch {
+            let stripped = actions.compactMap { action in
+                try? WalletAction(
+                    transactionID: action.transactionID,
+                    satoshis: action.satoshis,
+                    status: action.status,
+                    isOutgoing: action.isOutgoing,
+                    description: action.description,
+                    labels: action.labels,
+                    version: action.version,
+                    lockTime: action.lockTime
+                )
+            }
+            return try WalletListActionsResult(totalActions: result.totalActions, actions: stripped)
+        }
     }
 
     /// Abandons an unfinished action and returns storage's actual decision. A signed `noSend`
