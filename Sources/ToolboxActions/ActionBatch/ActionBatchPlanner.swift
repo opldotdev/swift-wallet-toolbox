@@ -409,7 +409,8 @@ enum ActionBatchPlanner {
     }
 
     /// The description bounds of `validateCreateActionArgs` (`@bsv/sdk` `validateStringLength`
-    /// with 5 and 2000 UTF-8 bytes) for the action, each input and each output.
+    /// with 5 and 2000 UTF-8 bytes) for the action, each input and each output, and its label,
+    /// tag and basket bounds (`validateIdentifier`, 1 to 300 bytes after trimming).
     ///
     /// Storage runs that validator again over every member's metadata when the batch commits
     /// (`validateActionMetadata`), which is after the whole chain is staged. Checking here refuses
@@ -421,6 +422,23 @@ enum ActionBatchPlanner {
         }
         for output in request.outputs ?? [] {
             try validateDescription(output.outputDescription, name: "outputDescription")
+            if let basket = output.basket { try validateIdentifier(basket, name: "basket") }
+            for tag in output.tags { try validateIdentifier(tag, name: "tag") }
+        }
+        for label in request.labels ?? [] { try validateIdentifier(label, name: "label") }
+    }
+
+    static let identifierBytes = 1...300
+
+    /// `validateIdentifier` for labels, tags and baskets: trimmed and lowercased, 1 to 300 UTF-8
+    /// bytes.
+    private static func validateIdentifier(_ text: String, name: String) throws {
+        let bytes = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().utf8.count
+        if bytes < identifierBytes.lowerBound {
+            throw WireError.invalidParameter(name: name, message: "at least \(identifierBytes.lowerBound) length.")
+        }
+        if bytes > identifierBytes.upperBound {
+            throw WireError.invalidParameter(name: name, message: "no more than \(identifierBytes.upperBound) length.")
         }
     }
 

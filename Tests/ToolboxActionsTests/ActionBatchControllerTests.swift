@@ -756,6 +756,24 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
             (try WalletCreateActionRequest(
                 description: "sigma anchor", inputs: [input], outputs: [try output("anchor")], options: noSend
              ), "inputDescription", "at least 5 length."),
+            // Labels, tags and baskets are trimmed before their 1...300 byte bound.
+            (try WalletCreateActionRequest(
+                description: "sigma anchor", outputs: [try output("anchor")], labels: ["  "], options: noSend
+             ), "label", "at least 1 length."),
+            (try WalletCreateActionRequest(
+                description: "sigma anchor",
+                outputs: [try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 2, outputDescription: "anchor", tags: [" "])],
+                options: noSend
+             ), "tag", "at least 1 length."),
+            (try WalletCreateActionRequest(
+                description: "sigma anchor",
+                outputs: [try WalletCreateActionOutput(
+                    lockingScript: anchorScript, satoshis: 2, outputDescription: "anchor",
+                    basket: String(repeating: "b", count: 301)
+                )],
+                options: noSend,
+                limits: try WalletABILimits(maximumTextUTF8ByteCount: 4_000)
+             ), "basket", "no more than 300 length."),
         ]
         for (request, name, message) in cases {
             do {
