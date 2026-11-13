@@ -420,7 +420,8 @@ public struct WalletPermissionClassifier: Sendable {
         originator: CanonicalOriginator,
         missing: MissingPermissionBehavior
     ) -> Result<PermissionRequirement, PermissionPolicyRejection> {
-        if basket == "default" || basket.hasPrefix("admin") {
+        if basket == "default" || basket.hasPrefix("admin")
+            || basket == Self.basketPrefixOutputsSpecOp {
             return .failure(.reservedBasket(basket))
         }
         if basket.hasPrefix("p ") {
@@ -516,6 +517,12 @@ public struct WalletPermissionClassifier: Sendable {
               text.utf8.allSatisfy({ (48...57).contains($0) }) else { return nil }
         return UInt64(text)
     }
+
+    /// `ListOutputsSpecOp.basketPrefixOutputs` in `ToolboxStorage`, which this module does not
+    /// import. It lists every `p` basket in a namespace past that namespace's permission module,
+    /// so it is admin-only, as `WalletPermissionsManager.isAdminBasket` has it.
+    static let basketPrefixOutputsSpecOp =
+        "b9184a72141e6a4d3d148c67a6d0ad92864a4d85290579ea5bef8bd62eb01b6f"
 
     private static func scheme(in name: String) -> String {
         let parts = name.split(separator: " ", omittingEmptySubsequences: true)

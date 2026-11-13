@@ -240,6 +240,10 @@ final class PermissionClassifierSemanticsTests: XCTestCase {
         let basketCases: [(String, PermissionPolicyRejection)] = [
             ("default", .reservedBasket("default")),
             ("admin tokens", .reservedBasket("admin tokens")),
+            (
+                "b9184a72141e6a4d3d148c67a6d0ad92864a4d85290579ea5bef8bd62eb01b6f",
+                .reservedBasket("b9184a72141e6a4d3d148c67a6d0ad92864a4d85290579ea5bef8bd62eb01b6f")
+            ),
             ("p btms tokens", .unsupportedPermissionScheme(kind: "basket", scheme: "btms")),
         ]
         for (basket, expected) in basketCases {
