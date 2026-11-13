@@ -25,6 +25,9 @@ public struct MessageBoxIncomingPayment: Sendable, Equatable {
 public struct MessageBoxAcceptedPayment: Sendable, Equatable {
     /// The payment as the server listed it at the time of acceptance.
     public let payment: MessageBoxIncomingPayment
+    /// True when the message also carried a MessageBox recipient payment with wallet-payment
+    /// outputs, and the wallet internalized it.
+    public let recipientPaymentInternalized: Bool
     /// False when the payment was internalized but the server did not confirm the message's
     /// removal. The funds are in the wallet either way; a later acknowledge removes it.
     public let acknowledged: Bool
@@ -33,12 +36,17 @@ public struct MessageBoxAcceptedPayment: Sendable, Equatable {
 /// The TS `PeerPayClient` errors for accepting a payment, with its messages.
 public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
     case invalidMessageID, alreadyProcessing, notInInbox, settlementFailed
+    /// The message's envelope carried a payment that could not be read or internalized. TS
+    /// reports this as the `failed` payment outcome; the message is not acknowledged.
+    case recipientPaymentFailed
     public var errorDescription: String? {
         switch self {
         case .invalidMessageID: "Incoming payment message ID is invalid"
         case .alreadyProcessing: "Payment message is already being processed by this client"
         case .notInInbox: "Incoming payment is not present exactly once in the authenticated inbox"
         case .settlementFailed: "BRC-29 settlement failed recipient, amount, transaction, or wallet validation."
+        case .recipientPaymentFailed:
+            "The payment this message carried could not be internalized, so the message was not acknowledged."
         }
     }
 }
@@ -88,6 +96,12 @@ extension MessageBoxClient {
     /// BRC-29 wallet payment with the message sender as `senderIdentityKey`, labelled `peerpay`;
     /// only then is the message acknowledged. A failed acknowledgement is reported in the result,
     /// not thrown, because the funds are already in the wallet.
+    ///
+    /// A message stored with a `{"message", "payment"}` envelope also carries the recipient's
+    /// MessageBox payment. TS `listMessages` internalizes that payment's wallet-payment outputs
+    /// while listing; here it is internalized first, the same way, and the message is not
+    /// acknowledged if that payment cannot be read or the wallet does not accept it, because the
+    /// message holds the only copy of it.
     public func accept(_ payment: MessageBoxIncomingPayment, wallet: RemoteWallet) async throws -> MessageBoxAcceptedPayment {
         try await accept(payment, receiver: wallet)
     }
@@ -96,12 +110,18 @@ extension MessageBoxClient {
         let messageId = try MessageBoxIncomingPayment.boundedMessageID(payment.messageId)
         guard await activePayments.begin(messageId) else { throw MessageBoxPaymentError.alreadyProcessing }
         do {
-            let incoming = try await freshIncomingPayment(messageId)
+            let (incoming, envelopePayment) = try await freshIncomingPayment(messageId)
+            var recipientPaymentInternalized = false
+            if let request = try Self.recipientPaymentRequest(envelopePayment) {
+                try await Self.internalizeRecipientPayment(request, into: receiver)
+                recipientPaymentInternalized = true
+            }
             try await Self.internalize(incoming, into: receiver)
             var acknowledged = true
             do { try await acknowledge(messageIds: [incoming.messageId]) } catch { acknowledged = false }
             await activePayments.end(messageId)
-            return MessageBoxAcceptedPayment(payment: incoming, acknowledged: acknowledged)
+            return MessageBoxAcceptedPayment(payment: incoming, recipientPaymentInternalized: recipientPaymentInternalized,
+                acknowledged: acknowledged)
         } catch {
             await activePayments.end(messageId)
             throw error
@@ -109,15 +129,80 @@ extension MessageBoxClient {
     }
 
     /// TS `findIncomingPaymentsByMessageId`: one page of at most two, asked for by message ID.
-    private func freshIncomingPayment(_ messageId: String) async throws -> MessageBoxIncomingPayment {
+    /// Returns the payment and the envelope payment the message carries, if any.
+    private func freshIncomingPayment(_ messageId: String) async throws -> (MessageBoxIncomingPayment, JSONValue?) {
         let rows = try await listRows(messageBox: Self.paymentInbox, pageSize: 2, maxPages: 1, limit: 2,
             messageId: messageId, skipMalformed: true)
-        var matches: [MessageBoxIncomingPayment] = []
+        var matches: [(MessageBoxIncomingPayment, JSONValue?)] = []
         for row in rows where row.message.messageId == messageId {
-            if let payment = await incomingPayment(row) { matches.append(payment) }
+            if let payment = await incomingPayment(row) { matches.append((payment, row.message.payment)) }
         }
         guard matches.count == 1 else { throw MessageBoxPaymentError.notInInbox }
         return matches[0]
+    }
+
+    /// TS `snapshotIncomingPayment`: the envelope payment as an internalize request for its
+    /// wallet-payment outputs, or nil when there is no payment or it has no such outputs (TS
+    /// `no-wallet-outputs`, which internalizes nothing). A payment that cannot be read throws.
+    static func recipientPaymentRequest(_ value: JSONValue?) throws -> WalletInternalizeActionRequest? {
+        guard let value else { return nil }
+        do {
+            guard case .object(let payment) = value,
+                  let tx = MessageBoxIncomingPayment.byteArray(payment["tx"]), !tx.isEmpty,
+                  tx.count <= MessageBoxIncomingPayment.maximumRecipientPaymentBytes,
+                  case .array(let items)? = payment["outputs"],
+                  items.count <= MessageBoxIncomingPayment.maximumRecipientPaymentOutputs else {
+                throw MessageBoxPaymentError.recipientPaymentFailed
+            }
+            var outputs: [WalletInternalizeOutput] = []
+            for item in items {
+                guard case .object(let output) = item else { throw MessageBoxPaymentError.recipientPaymentFailed }
+                guard output["protocol"] == .string("wallet payment") else { continue }
+                guard case .number(let number)? = output["outputIndex"], number.rounded() == number,
+                      let index = UInt32(exactly: number),
+                      case .object(let remittance)? = output["paymentRemittance"],
+                      case .string(let prefix)? = remittance["derivationPrefix"],
+                      case .string(let suffix)? = remittance["derivationSuffix"],
+                      case .string(let sender)? = remittance["senderIdentityKey"] else {
+                    throw MessageBoxPaymentError.recipientPaymentFailed
+                }
+                outputs.append(WalletInternalizeOutput(outputIndex: index, remittance: .walletPayment(
+                    try WalletPaymentRemittance(
+                        derivationPrefix: WalletBase64Data(base64: prefix),
+                        derivationSuffix: WalletBase64Data(base64: suffix),
+                        senderIdentityKey: PublicKey(Hex.decode(sender, maximumDecodedByteCount: 33))))))
+            }
+            let description: String
+            switch payment["description"] {
+            case .none, .some(.null):
+                description = "MessageBox recipient payment"
+            case .string(let text)? where MessageBoxIncomingPayment.isExactDescription(text):
+                description = text
+            default:
+                throw MessageBoxPaymentError.recipientPaymentFailed
+            }
+            guard !outputs.isEmpty else { return nil }
+            return try WalletInternalizeActionRequest(
+                transaction: AtomicBEEF(bytes: tx, limits: StorageLimits.beef),
+                description: description, outputs: outputs)
+        } catch {
+            throw MessageBoxPaymentError.recipientPaymentFailed
+        }
+    }
+
+    /// TS `internalizeRecipientPayment`: the wallet must report the payment accepted.
+    static func internalizeRecipientPayment(
+        _ request: WalletInternalizeActionRequest, into wallet: some MessageBoxReceivingWallet
+    ) async throws {
+        do {
+            guard try await wallet.internalizeAction(request).accepted else {
+                throw MessageBoxPaymentError.recipientPaymentFailed
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw MessageBoxPaymentError.recipientPaymentFailed
+        }
     }
 
     private func incomingPayment(_ row: ListedRow) async -> MessageBoxIncomingPayment? {
@@ -137,7 +222,7 @@ extension MessageBoxClient {
                   !token.transaction.isEmpty,
                   token.transaction.count <= MessageBoxIncomingPayment.maximumSettlementTransactionBytes,
                   token.amount >= 1, token.amount <= MessageBoxIncomingPayment.maximumSatoshis,
-                  token.outputIndex >= 0, token.outputIndex <= 0xffff_ffff else {
+                  let outputIndex = UInt32(exactly: token.outputIndex) else {
                 throw MessageBoxPaymentError.settlementFailed
             }
             let sender = try PublicKey(Hex.decode(payment.sender, maximumDecodedByteCount: 33))
@@ -160,7 +245,7 @@ extension MessageBoxClient {
                 senderIdentityKey: sender)
             let request = try WalletInternalizeActionRequest(
                 transaction: atomic, description: "BRC-29 payment received", labels: ["peerpay"],
-                outputs: [WalletInternalizeOutput(outputIndex: UInt32(token.outputIndex), remittance: .walletPayment(remittance))])
+                outputs: [WalletInternalizeOutput(outputIndex: outputIndex, remittance: .walletPayment(remittance))])
             guard try await wallet.internalizeAction(request).accepted else {
                 throw MessageBoxPaymentError.settlementFailed
             }
@@ -178,6 +263,9 @@ extension MessageBoxIncomingPayment {
     static let maximumSettlementTransactionBytes = 4 * 1024 * 1024
     static let maximumSatoshis: UInt64 = 2_100_000_000_000_000
     static let maximumDerivationLength = 399
+    /// TS `MAX_PAYMENT_BEEF_BYTES` and `MAX_PAYMENT_OUTPUTS` for an envelope payment.
+    static let maximumRecipientPaymentBytes = 32 * 1024 * 1024
+    static let maximumRecipientPaymentOutputs = 101
     /// `Number.MAX_SAFE_INTEGER`.
     static let maximumSafeInteger: Double = 9_007_199_254_740_991
 
@@ -228,15 +316,17 @@ extension MessageBoxIncomingPayment {
         }
         guard let transaction, !transaction.isEmpty, transaction.count <= maximumTransactionBytes,
               let amount = safeInteger(payment["amount"]), amount > 0 else { return nil }
-        var outputIndex: Double = 0
+        // An index the platform's Int cannot hold (arm64_32 above Int32.max) is refused, not trapped.
+        var outputIndex = 0
         if let value = payment["outputIndex"], value != .null {
-            guard let index = safeInteger(value), index >= 0, index <= 0xffff_ffff else { return nil }
-            outputIndex = index
+            guard let index = safeInteger(value), index >= 0, index <= 0xffff_ffff,
+                  let exact = Int(exactly: index) else { return nil }
+            outputIndex = exact
         }
         guard let prefix = derivation(instructions["derivationPrefix"]),
               let suffix = derivation(instructions["derivationSuffix"]) else { return nil }
         return MessageBoxPaymentToken(derivationPrefix: prefix, derivationSuffix: suffix,
-            transaction: transaction, amount: UInt64(amount), outputIndex: Int(outputIndex))
+            transaction: transaction, amount: UInt64(amount), outputIndex: outputIndex)
     }
 
     /// TS `boundedDerivation`, applied when a settlement is accepted.
@@ -245,6 +335,13 @@ extension MessageBoxIncomingPayment {
             && !value.unicodeScalars.contains(where: {
                 $0.value <= 0x1f || $0.value == 0x7f || $0.properties.isWhitespace
             })
+    }
+
+    /// TS `exactBoundedText(description, 50, forbidControls)`.
+    static func isExactDescription(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 50
+            && value.trimmingCharacters(in: .whitespacesAndNewlines) == value
+            && !value.unicodeScalars.contains(where: { $0.value <= 0x1f || (0x7f...0x9f).contains($0.value) })
     }
 
     private static func parseJSON(_ text: String) -> JSONValue? {
@@ -260,7 +357,7 @@ extension MessageBoxIncomingPayment {
 
     /// TS `normalizeBRC100ByteArray`: an array of bytes, or the historical `{"0": …, "1": …}`
     /// object with contiguous keys from zero and at least one byte.
-    private static func byteArray(_ value: JSONValue?) -> [UInt8]? {
+    static func byteArray(_ value: JSONValue?) -> [UInt8]? {
         switch value {
         case .array(let items)?:
             var bytes: [UInt8] = []

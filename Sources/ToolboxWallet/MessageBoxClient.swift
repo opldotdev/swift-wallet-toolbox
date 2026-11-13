@@ -283,7 +283,9 @@ public struct MessageBoxEnvelope: Codable, Sendable, Equatable {
 ///
 /// When the server stored the message in a `{"message": …, "payment": …}` envelope, `body` is
 /// the wrapped message and `payment` the envelope's payment record, as TS `listMessages` returns
-/// them. Nothing here internalizes that payment: it stays on the message until the caller does.
+/// them. Listing does not internalize that payment; ``MessageBoxClient/accept(_:wallet:)`` does,
+/// before it acknowledges the message. A row whose envelope payment is not an object cannot be
+/// read, as in TS `listMessages`.
 public struct MessageBoxMessage: Sendable, Equatable {
     public let messageId: String
     public let body: String
@@ -310,16 +312,17 @@ public struct MessageBoxMessage: Sendable, Equatable {
         } else {
             throw MessageBoxError.invalidResponse
         }
-        let (body, payment) = Self.unwrap(stored)
+        let (body, payment) = try Self.unwrap(stored)
         self.init(messageId: id, body: body, sender: sender.lowercased(),
             createdAt: row["created_at"] as? String ?? row["createdAt"] as? String, payment: payment)
     }
 
     /// TS `listMessages`: a body that parses to an object with its own `message` key is an
     /// envelope. A string message is the body as it stands; a null message leaves the envelope as
-    /// the body; any other message is kept as JSON text. A payment that is not an object is
-    /// dropped and does not cost the message its body.
-    static func unwrap(_ stored: String) -> (body: String, payment: JSONValue?) {
+    /// the body; any other message is kept as JSON text. A payment that is present and not null
+    /// must be an object, or the row is refused: dropping it would let the message be
+    /// acknowledged, and so deleted, with the only copy of the payment.
+    static func unwrap(_ stored: String) throws -> (body: String, payment: JSONValue?) {
         guard let parsed = try? JSONSerialization.jsonObject(with: Data(stored.utf8), options: [.fragmentsAllowed]),
               let envelope = parsed as? [String: Any], let wrapped = envelope["message"] else {
             return (stored, nil)
@@ -331,10 +334,11 @@ public struct MessageBoxMessage: Sendable, Equatable {
             withJSONObject: wrapped, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes]) {
             body = String(decoding: data, as: UTF8.self)
         }
-        var payment: JSONValue?
-        if let record = envelope["payment"] as? [String: Any],
-           let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
-            payment = try? JSONDecoder().decode(JSONValue.self, from: data)
+        guard let value = envelope["payment"], !(value is NSNull) else { return (body, nil) }
+        guard let record = value as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
+              let payment = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            throw MessageBoxError.invalidResponse
         }
         return (body, payment)
     }
