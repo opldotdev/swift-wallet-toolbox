@@ -70,7 +70,9 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         ])
         let client = try MessageBoxClient(host: URL(string: "https://mb.example/base")!,
             wallet: ProtoWallet(rootKey: key(1)), transport: transport)
-        let messages = try await client.listMessages(messageBox: "transaction-delivery", pageSize: 1)
+        let listing = try await client.listMessages(messageBox: "transaction-delivery", pageSize: 1)
+        XCTAssertFalse(listing.truncated)
+        let messages = listing.messages
         XCTAssertEqual(messages.map(\.messageId), ["a", "b"])
         XCTAssertEqual(messages[1].body, #"{"x":1}"#)
         XCTAssertEqual(messages[0].createdAt, "2026-11-13T00:00:00Z")
@@ -93,8 +95,9 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         ])
         let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
             wallet: ProtoWallet(rootKey: key(1)), transport: transport)
-        let messages = try await client.listMessages(messageBox: "inbox", pageSize: 2)
-        XCTAssertEqual(messages.map(\.messageId), ["a", "c"])
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 2)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["a", "c"])
+        XCTAssertFalse(listing.truncated)
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
         XCTAssertEqual(offsets, [0, 1, 3])
@@ -110,23 +113,53 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         ])
         let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
             wallet: ProtoWallet(rootKey: key(1)), transport: transport)
-        let messages = try await client.listMessages(messageBox: "inbox", pageSize: 5)
-        XCTAssertEqual(messages.map(\.messageId), ["a", "b", "c"])
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 5)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b", "c"])
+        XCTAssertFalse(listing.truncated)
         // 7 is taken; a repeated 7 does not move forward, so the count is used; a boolean cursor is ignored.
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
         XCTAssertEqual(offsets, [0, 7, 8, 9])
     }
 
-    func test_emptyPagesThatNeverEndHitTheCap() async throws {
+    func test_emptyPagesThatNeverEndStopAtTheCapAsTruncated() async throws {
         let transport = ScriptedTransport(Array(repeating: #"{"status":"success","hasMore":true,"messages":[]}"#, count: 3))
         let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
             wallet: ProtoWallet(rootKey: key(1)), transport: transport)
-        do { _ = try await client.listMessages(messageBox: "inbox", pageSize: 4, maxPages: 3); XCTFail("should hit the cap") }
-        catch MessageBoxError.tooManyPages {}
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 4, maxPages: 3)
+        XCTAssertEqual(listing, MessageBoxListing(messages: [], truncated: true))
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
         XCTAssertEqual(offsets, [0, 4, 8])
+    }
+
+    func test_theLastAllowedPageWithMoreReturnsItsRowsAsTruncated() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let transport = ScriptedTransport([
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"a","body":"one","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"b","body":"two","sender":"\#(sender)"}]}"#,
+        ])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 1, maxPages: 2)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b"])
+        XCTAssertTrue(listing.truncated)
+        // Exactly the allowed pages are asked for, never a third.
+        let count = await transport.requests.count
+        XCTAssertEqual(count, 2)
+    }
+
+    func test_aListingThatEndsUnderThePageCapIsNotTruncated() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let transport = ScriptedTransport([
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"a","body":"one","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":false,"messages":[{"messageId":"b","body":"two","sender":"\#(sender)"}]}"#,
+        ])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 1, maxPages: 3)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b"])
+        XCTAssertFalse(listing.truncated)
     }
 
     func test_malformedListingsAreRefused() async throws {
