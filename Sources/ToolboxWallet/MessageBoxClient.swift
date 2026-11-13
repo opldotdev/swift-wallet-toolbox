@@ -102,12 +102,20 @@ public struct MessageBoxClient: Sendable {
     /// are returned with `truncated` set. Acknowledging them lets the next listing reach the rest;
     /// messages left on the server are passed over by listing again from the listing's
     /// `nextOffset`.
+    ///
+    /// A row that cannot be read as a message (no message ID, a sender that is not a key, a body
+    /// that is neither text nor JSON) fails the listing with ``MessageBoxError/invalidResponse``.
+    /// With `skipMalformed`, it is left out and counted in the listing's `skipped` instead, so one
+    /// such row does not hide every message on the server; the listing is then not
+    /// ``MessageBoxListing/isComplete``. A skipped row stays on the server and counts in
+    /// `nextOffset`. TS `listMessagesLite` has no such rows: it keeps whatever the server sent.
     public func listMessages(
-        messageBox: String, pageSize: Int = 100, maxPages: Int = 100, offset: Int = 0
+        messageBox: String, pageSize: Int = 100, maxPages: Int = 100, offset: Int = 0, skipMalformed: Bool = false
     ) async throws -> MessageBoxListing {
-        let listed = try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages, offset: offset)
+        let listed = try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages, offset: offset,
+            skipMalformed: skipMalformed)
         return MessageBoxListing(messages: listed.rows.map(\.message), truncated: listed.truncated,
-            nextOffset: listed.nextOffset)
+            nextOffset: listed.nextOffset, skipped: listed.skipped)
     }
 
     /// One listed row: the message, and its sender exactly as the server sent it.
@@ -118,7 +126,8 @@ public struct MessageBoxClient: Sendable {
 
     /// The paging loop behind every listing. `limit` caps the rows taken in total, as TS
     /// `fetchMessagePages` does, and `messageId` asks the server for that one message. A row that
-    /// cannot be read fails the listing, or is left out with `skipMalformed`.
+    /// cannot be read fails the listing, or is left out and counted in `skipped` with
+    /// `skipMalformed`.
     ///
     /// It stops at the first of: a page without `hasMore`, `limit` rows taken, or `maxPages`
     /// pages read. TS throws when the last allowed page still has more; here the rows read so far
@@ -133,11 +142,12 @@ public struct MessageBoxClient: Sendable {
     func listRows(
         messageBox: String, pageSize: Int, maxPages: Int, limit: Int? = nil, offset start: Int = 0,
         messageId: String? = nil, skipMalformed: Bool = false
-    ) async throws -> (rows: [ListedRow], truncated: Bool, nextOffset: Int) {
+    ) async throws -> (rows: [ListedRow], truncated: Bool, nextOffset: Int, skipped: Int) {
         try Self.requireBoxName(messageBox)
         guard pageSize > 0, maxPages > 0, limit.map({ $0 > 0 }) ?? true,
               start >= 0, Int64(start) <= Self.maximumListOffset else { throw MessageBoxError.invalidMessage }
         var rows: [ListedRow] = []
+        var skipped = 0
         var received = 0
         var offset = start
         for _ in 0..<maxPages {
@@ -157,14 +167,16 @@ public struct MessageBoxClient: Sendable {
                 if let row = item as? [String: Any], let sender = row["sender"] as? String,
                    let message = try? MessageBoxMessage(row: row) {
                     rows.append(ListedRow(message: message, rawSender: sender))
-                } else if !skipMalformed {
+                } else if skipMalformed {
+                    skipped += 1
+                } else {
                     throw MessageBoxError.invalidResponse
                 }
             }
             let hasMore = object["hasMore"] as? Bool == true
             let cut = taken.count < page.count
             let full = limit.map { received >= $0 } ?? false
-            if !hasMore || cut || full { return (rows, hasMore || cut, offset + taken.count) }
+            if !hasMore || cut || full { return (rows, hasMore || cut, offset + taken.count, skipped) }
             // Prefer the server's cursor when it moves forward; otherwise step by what we saw,
             // or by a full page when the page came back empty, so an empty page never stalls.
             if let next = Self.integer(object["nextOffset"]), next > offset {
@@ -173,11 +185,16 @@ public struct MessageBoxClient: Sendable {
                 offset += page.isEmpty ? pageSize : page.count
             }
         }
-        return (rows, true, offset)
+        return (rows, true, offset, skipped)
     }
 
     /// `Number.MAX_SAFE_INTEGER`, the largest offset TS sends.
     static let maximumListOffset: Int64 = 9_007_199_254_740_991
+
+    /// This client's identity key, the one messages to it are encrypted for.
+    func identityKey() async throws -> PublicKey {
+        try await wallet.getPublicKey(WalletGetPublicKeyRequest(selection: .identity)).publicKey
+    }
 
     /// Removes delivered messages from this server. Only acknowledge a message once whatever it
     /// carried has been made durable: the server deletes it.
@@ -310,10 +327,10 @@ public struct MessageBoxEnvelope: Codable, Sendable, Equatable {
 ///
 /// When the server stored the message in a `{"message": …, "payment": …}` envelope, `body` is
 /// the wrapped message and `payment` the envelope's payment record, as TS `listMessages` returns
-/// them. Listing does not internalize that payment; ``MessageBoxClient/accept(_:wallet:)`` does,
-/// before it acknowledges the message, and ``MessageBoxClient/internalizeEnvelopePayment(of:wallet:)``
-/// does it for any other message. A row whose envelope payment is not an object cannot be read,
-/// as in TS `listMessages`.
+/// them. Listing does not internalize that payment; ``MessageBoxClient/accept(_:wallet:beforeAcknowledge:)``
+/// does, before it acknowledges the message, and ``MessageBoxClient/internalizeEnvelopePayment(of:wallet:)``
+/// does it for any other message. An envelope payment that is not an object is kept as it was
+/// stored; it can never be internalized, and the envelope step reports it unreadable.
 public struct MessageBoxMessage: Sendable, Equatable {
     public let messageId: String
     public let body: String
@@ -348,8 +365,10 @@ public struct MessageBoxMessage: Sendable, Equatable {
     /// TS `listMessages`: a body that parses to an object with its own `message` key is an
     /// envelope. A string message is the body as it stands; a null message leaves the envelope as
     /// the body; any other message is kept as JSON text. A payment that is present and not null
-    /// must be an object, or the row is refused: dropping it would let the message be
-    /// acknowledged, and so deleted, with the only copy of the payment.
+    /// is kept even when it is not an object. TS `listMessagesLite` drops such a payment and keeps
+    /// the message; here it stays, so the envelope step reports it unreadable instead of the
+    /// message being acknowledged as if it carried nothing. Only a payment that cannot be
+    /// represented as JSON makes the row unreadable.
     static func unwrap(_ stored: String) throws -> (body: String, payment: JSONValue?) {
         guard let parsed = try? JSONSerialization.jsonObject(with: Data(stored.utf8), options: [.fragmentsAllowed]),
               let envelope = parsed as? [String: Any], let wrapped = envelope["message"] else {
@@ -363,18 +382,22 @@ public struct MessageBoxMessage: Sendable, Equatable {
             body = String(decoding: data, as: UTF8.self)
         }
         guard let value = envelope["payment"], !(value is NSNull) else { return (body, nil) }
-        guard let record = value as? [String: Any],
-              let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
-              let payment = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+        // Wrapped in an array so a payment that is a bare string or number decodes too.
+        guard let data = try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys]),
+              let decoded = try? JSONDecoder().decode([JSONValue].self, from: data),
+              decoded.count == 1 else {
             throw MessageBoxError.invalidResponse
         }
-        return (body, payment)
+        return (body, decoded[0])
     }
 }
 
 /// One listing of a box. `truncated` is true when the server has more than was read: the page
 /// cap or the row limit was reached while it still reported more. Acknowledge what was handled
 /// and list again to read the rest, or list from `nextOffset` to read past messages left there.
+/// `skipped` counts rows a `skipMalformed` listing left out; check ``isComplete`` before treating
+/// the listing as the whole box. Skipped rows stay in the box, so a caller paging through it
+/// lists on until `truncated` is false, not until `isComplete` is true.
 public struct MessageBoxListing: Sendable, Equatable {
     public let messages: [MessageBoxMessage]
     public let truncated: Bool
@@ -382,9 +405,17 @@ public struct MessageBoxListing: Sendable, Equatable {
     /// reads on from there while the messages before it stay on the server; each message
     /// acknowledged since moves the rest one place earlier, so subtract those, or list from 0.
     public let nextOffset: Int
+    /// Rows the server returned that could not be read as messages and were left out, with
+    /// `skipMalformed`. They stay on the server and are counted in `nextOffset`. Always 0 without
+    /// `skipMalformed`, which throws on such a row instead.
+    public let skipped: Int
 
-    public init(messages: [MessageBoxMessage], truncated: Bool, nextOffset: Int) {
-        self.messages = messages; self.truncated = truncated; self.nextOffset = nextOffset
+    /// True when this listing holds every message the server listed: it was not truncated and no
+    /// row was skipped.
+    public var isComplete: Bool { !truncated && skipped == 0 }
+
+    public init(messages: [MessageBoxMessage], truncated: Bool, nextOffset: Int, skipped: Int = 0) {
+        self.messages = messages; self.truncated = truncated; self.nextOffset = nextOffset; self.skipped = skipped
     }
 }
 
