@@ -191,6 +191,11 @@ public struct MessageBoxClient: Sendable {
     /// `Number.MAX_SAFE_INTEGER`, the largest offset TS sends.
     static let maximumListOffset: Int64 = 9_007_199_254_740_991
 
+    /// This client's identity key, the one messages to it are encrypted for.
+    func identityKey() async throws -> PublicKey {
+        try await wallet.getPublicKey(WalletGetPublicKeyRequest(selection: .identity)).publicKey
+    }
+
     /// Removes delivered messages from this server. Only acknowledge a message once whatever it
     /// carried has been made durable: the server deletes it.
     public func acknowledge(messageIds: [String]) async throws {
@@ -391,7 +396,8 @@ public struct MessageBoxMessage: Sendable, Equatable {
 /// cap or the row limit was reached while it still reported more. Acknowledge what was handled
 /// and list again to read the rest, or list from `nextOffset` to read past messages left there.
 /// `skipped` counts rows a `skipMalformed` listing left out; check ``isComplete`` before treating
-/// the listing as the whole box.
+/// the listing as the whole box. Skipped rows stay in the box, so a caller paging through it
+/// lists on until `truncated` is false, not until `isComplete` is true.
 public struct MessageBoxListing: Sendable, Equatable {
     public let messages: [MessageBoxMessage]
     public let truncated: Bool
