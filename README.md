@@ -109,6 +109,15 @@ let txid = try await outbox.send(
 )
 ```
 
+`MessageBoxOutbox(directory:)` finds advertisements on mainnet trackers. A testnet wallet passes
+its network, as `networkPreset: 'testnet'` does in the reference `MessageBoxClient`:
+
+```swift
+let outbox = MessageBoxOutbox(directory: outboxDirectory, network: .testnet)
+```
+
+`init(directory:discovery:)` takes a prebuilt `MessageBoxDiscovery` instead.
+
 Keep one outbox instance per directory. Signed BEEF and the encrypted delivery envelope are
 saved before broadcast. On a pending-delivery error, use `outbox.retry(wallet:)`, not another
 `send`: retry reuses the saved transaction and message ID, including after an app restart.
