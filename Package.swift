@@ -239,6 +239,7 @@ let package = Package(
             name: "ToolboxActionsTests",
             dependencies: [
                 "ToolboxActions", "ToolboxStorage", "ToolboxBRC29",
+                .product(name: "BSVInterpreter", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVScript", package: "swift-sdk"),
                 .product(name: "BSVTransaction", package: "swift-sdk"),

@@ -136,7 +136,7 @@ extension StorageClient {
                     (options?.noSendChange ?? []).map { .string($0.description) }
                 ),
                 "randomizeOutputs": .bool(options?.randomizeOutputs ?? true),
-            ]),
+            ].merging(trustSelf(options?.trustSelf)) { $1 }),
             "isSignAction": .bool(true),
             "isSendWith": .bool(!sendWith.isEmpty),
             "isNewTx": .bool(isNewTx),
@@ -152,6 +152,13 @@ extension StorageClient {
             )
         }
         return encoded
+    }
+
+    /// `trustSelf: 'known'` lets storage leave out of the returned BEEF the proofs the wallet
+    /// already holds. The reference client sends it only when set; absent means "verify all".
+    private static func trustSelf(_ value: WalletTrustSelf?) -> [String: JSONValue] {
+        guard let value else { return [:] }
+        return ["trustSelf": .string(value.rawValue)]
     }
 
     private static func unlockingLength(of unlocking: WalletInputUnlocking) -> UInt32 {
