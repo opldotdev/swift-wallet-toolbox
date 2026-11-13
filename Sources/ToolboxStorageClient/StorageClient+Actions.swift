@@ -111,7 +111,8 @@ extension StorageClient {
 
         let isNewTx = !requestedOutputs.isEmpty || !requestedInputs.isEmpty
         let noSend = options?.noSend ?? false
-        let delayed = options?.acceptDelayedBroadcast ?? false
+        // Unset means true in the reference client, so storage hears the same flags it would there.
+        let delayed = options?.acceptDelayedBroadcast ?? true
         let sendWith = (options?.sendWith ?? []).map { JSONValue.string($0.displayHex) }
 
         var encoded: [String: JSONValue] = [

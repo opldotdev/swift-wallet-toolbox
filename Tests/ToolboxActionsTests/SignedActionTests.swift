@@ -136,6 +136,43 @@ final class SignedActionTests: XCTestCase {
         XCTAssertEqual(request.sendWith, ["aa", "bb"])
     }
 
+    /// A noSend action processed with `isNoSend: false` is broadcast by storage on its own, before
+    /// the batch it was held back for. The flags must reach the request as given.
+    func test_noSendAndDelayedReachTheRequest() throws {
+        let held = try signed().processRequest(isNoSend: true)
+        XCTAssertTrue(held.isNoSend)
+        XCTAssertFalse(held.isDelayed)
+
+        let delayed = try signed().processRequest(isDelayed: true)
+        XCTAssertFalse(delayed.isNoSend)
+        XCTAssertTrue(delayed.isDelayed)
+    }
+
+    /// Built from the createAction options, the flags are the ones the reference wallet passes
+    /// to storage: unset noSend is false, unset acceptDelayedBroadcast is true.
+    func test_theRequestFollowsTheCreateActionOptions() throws {
+        let defaults = try signed().processRequest(options: nil)
+        XCTAssertFalse(defaults.isNoSend)
+        XCTAssertTrue(defaults.isDelayed)
+        XCTAssertFalse(defaults.isSendWith)
+        XCTAssertEqual(defaults.sendWith, [])
+
+        let held = try signed().processRequest(
+            options: try WalletCreateActionOptions(acceptDelayedBroadcast: false, noSend: true)
+        )
+        XCTAssertTrue(held.isNoSend)
+        XCTAssertFalse(held.isDelayed)
+
+        let anchor = try TransactionID(displayHex: String(repeating: "ab", count: 32))
+        let batch = try signed().processRequest(
+            options: try WalletCreateActionOptions(sendWith: [anchor])
+        )
+        XCTAssertTrue(batch.isSendWith)
+        XCTAssertEqual(batch.sendWith, [anchor.displayHex])
+        XCTAssertFalse(batch.isNoSend)
+        XCTAssertTrue(batch.isDelayed)
+    }
+
     // MARK: - The envelope
 
     /// The envelope round-trips through the SDK's own reader and names our transaction as its
