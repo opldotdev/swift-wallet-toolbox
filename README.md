@@ -128,6 +128,42 @@ This slice supports zero-fee delivery. Blocked recipients or quotes requiring an
 delivery payment are refused before transaction creation. It does not register receiving hosts,
 poll inboxes, or silently pay delivery fees. Configured endpoints must use HTTPS.
 
+### MessageBox incoming payments
+
+`MessageBoxClient.accept(_:wallet:beforeAcknowledge:)` takes a PeerPay token, then any envelope
+payment the message carried, then acknowledges. `internalizeEnvelopePayment(of:wallet:)` runs the
+envelope step alone. When the envelope payment is not taken, the step throws
+`recipientPaymentFailed(reason)` and `accept` throws `envelopePaymentNotTaken`, whose `reason`
+is a `MessageBoxPaymentError.RecipientPaymentFailure`:
+
+| Reason | Meaning | What to do with the message |
+|---|---|---|
+| `.unreadable` | The payment cannot be read, or does not pay this wallet. | Acknowledge it; nothing is lost. |
+| `.refused` | The wallet declined: another identity, past `StorageLimits`, `accepted: false`, or storage rejected the internalize. | Keep it. Offer to drop it only on the user's word. |
+| `.unavailable(error)` | The wallet did not decide; may be transient: network, timeout, transport or authentication failures, a storage server error, or a key that could not be read. | Keep it and retry. It can repeat, so after several failed retries offer to drop it, as for `.refused`. |
+
+`.unavailable` does not promise that a retry succeeds. TS storage reports some failures that will
+repeat for this payment as `WERR_INTERNAL` (for example "Could not determine transaction index"),
+and `WERR_REVIEW_ACTIONS` covers a double spend as well as a broadcaster outage. The error is
+carried as thrown, so `if case .unavailable(let error) = reason, error is WireError` tells a
+storage error from a network one.
+
+Two details of the classification: an HTTP 4xx from storage counts as `.refused`, but a proxy's
+error page has no auth frame and arrives as `AuthTransportError.responseNotAuthenticated`, which
+is `.unavailable`; and a key that could not be read only happens with a custom wallet, because
+`RemoteWallet` derives keys in memory.
+
+A cancellation is thrown as `CancellationError`, never as a reason: `CancellationError` itself,
+or any wallet failure while the task is cancelled, such as the `URLError(.cancelled)` a cancelled
+request throws. `URLError(.cancelled)` in a task that was not cancelled (a rejected authentication
+challenge, an invalidated session) is `.unavailable`. After a cancellation the wallet may or may
+not have taken the payment, so keep the message and retry; storage merges a repeat internalize.
+
+Breaking change: `.unavailable` is new. Network, transport and authentication failures, storage
+server errors, `WERR_UNAUTHORIZED`, `WERR_REVIEW_ACTIONS` and key failures used to be `.refused`,
+and a cancelled request could be too. `accept` now checks the wallet is the client's identity
+before the envelope step, as the step alone does.
+
 ### Tests
 
 ```bash

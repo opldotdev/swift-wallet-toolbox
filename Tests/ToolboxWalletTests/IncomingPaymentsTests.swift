@@ -4,6 +4,7 @@ import BSVCore
 import BSVKeys
 import BSVScript
 import BSVTransaction
+import BSVAuth
 import BSVWallet
 import ToolboxAuth
 import ToolboxBRC29
@@ -52,8 +53,11 @@ private actor LoggingTransport: AuthenticatedTransport {
 
 /// Derives keys with a real wallet and records what it is asked to internalize.
 private struct StubReceiver: MessageBoxReceivingWallet {
-    /// `locked` refuses to derive keys, as a wallet that locked does.
-    enum Outcome: Sendable { case accepted, refused, fails, locked }
+    /// `refused` answers `accepted: false`; `fails` cannot reach storage; `locked` also refuses to
+    /// derive keys, as a wallet that locked does; `cancelled` throws what a cancelled `URLSession`
+    /// request throws, here in a task that was not cancelled; `failsOnceCancelled` waits for its
+    /// task to be cancelled, then throws the same `URLError(.cancelled)`.
+    enum Outcome: Sendable { case accepted, refused, fails, locked, cancelled, failsOnceCancelled }
     let keys: ProtoWallet
     let log: EventLog
     var outcome: Outcome = .accepted
@@ -62,6 +66,8 @@ private struct StubReceiver: MessageBoxReceivingWallet {
     var envelopeOutcome: Outcome? = nil
     /// The derived-key request, counted from 1, that fails as a locked wallet would.
     var failDerivation: Int? = nil
+    /// Thrown when the wallet is asked to internalize an envelope payment, in place of its outcome.
+    var envelopeError: (any Error)? = nil
 
     /// Logs `identity` for the identity key and `getPublicKey` for a derived key.
     func getPublicKey(_ request: WalletGetPublicKeyRequest) async throws -> WalletGetPublicKeyResult {
@@ -79,16 +85,35 @@ private struct StubReceiver: MessageBoxReceivingWallet {
     func internalizeAction(_ request: WalletInternalizeActionRequest) async throws -> WalletInternalizeActionResult {
         await log.add("internalizeAction")
         await log.keep(request)
-        switch request.labels == ["peerpay"] ? outcome : (envelopeOutcome ?? outcome) {
+        let isToken = request.labels == ["peerpay"]
+        if !isToken, let envelopeError { throw envelopeError }
+        switch isToken ? outcome : (envelopeOutcome ?? outcome) {
         case .accepted: return WalletInternalizeActionResult(accepted: true)
         case .refused: return WalletInternalizeActionResult(accepted: false)
         case .fails, .locked: throw URLError(.cannotConnectToHost)
+        case .cancelled: throw URLError(.cancelled)
+        case .failsOnceCancelled:
+            while !Task.isCancelled { await Task.yield() }
+            throw URLError(.cancelled)
         }
     }
 }
 
 /// What a caller's wallet-lock check throws.
 private struct WalletLocked: Error {}
+
+/// A `RecipientPaymentFailure` without the error `unavailable` carries, to compare in tables.
+private enum FailureKind: Equatable {
+    case unreadable, refused, unavailable
+
+    init(_ failure: MessageBoxPaymentError.RecipientPaymentFailure) {
+        switch failure {
+        case .unreadable: self = .unreadable
+        case .refused: self = .refused
+        case .unavailable: self = .unavailable
+        }
+    }
+}
 
 /// Counts calls to a caller's check.
 private actor CallCounter {
@@ -537,10 +562,11 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
 
         XCTAssertTrue(result.recipientPaymentInternalized)
         XCTAssertTrue(result.acknowledged)
-        // The token first, then the envelope payment's ownership check and internalize.
+        // The token first, then the wallet's identity, then the envelope payment's ownership check
+        // and internalize.
         let events = await log.events
-        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "getPublicKey", "internalizeAction",
-                                "acknowledgeMessage"])
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey",
+                                "internalizeAction", "acknowledgeMessage"])
 
         let internalized = await log.internalized
         XCTAssertEqual(internalized.count, 2)
@@ -560,23 +586,26 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
 
     func test_anEnvelopePaymentTheWalletDoesNotTakeStillLetsTheTokenIn() async throws {
         let f = try await fixture(envelope: try recipientPayment())
-        for outcome in [StubReceiver.Outcome.refused, .fails] {
+        // The wallet answered no; or storage could not be reached, which decided nothing.
+        let cases: [(outcome: StubReceiver.Outcome, kind: FailureKind)] = [(.refused, .refused), (.fails, .unavailable)]
+        for test in cases {
             let log = EventLog()
             let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
             let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
             do {
                 _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
-                    log: log, envelopeOutcome: outcome), beforeAcknowledge: { await log.add("beforeAcknowledge") })
-                XCTFail("\(outcome) must not be acknowledged")
+                    log: log, envelopeOutcome: test.outcome), beforeAcknowledge: { await log.add("beforeAcknowledge") })
+                XCTFail("\(test.outcome) must not be acknowledged")
             } catch MessageBoxPaymentError.envelopePaymentNotTaken(let notTaken) {
-                XCTAssertEqual(notTaken.reason, .refused)
+                XCTAssertEqual(FailureKind(notTaken.reason), test.kind)
                 XCTAssertEqual(notTaken.payment, f.payment)
                 XCTAssertEqual(notTaken.message.messageId, "p1")
                 XCTAssertNotNil(notTaken.message.payment)
             }
-            // The token is in; the envelope payment was asked for and refused; nothing is acknowledged.
+            // The token is in; the envelope payment was asked for and not taken; nothing is acknowledged.
             let events = await log.events
-            XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "getPublicKey", "internalizeAction"])
+            XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey",
+                                    "internalizeAction"])
             let internalized = await log.internalized
             XCTAssertEqual(internalized.first?.labels, ["peerpay"])
             let paths = await transport.requests.map(\.path)
@@ -605,7 +634,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         try await client.acknowledge(messageIds: [notTaken.message.messageId])
         let events = await log.events
         XCTAssertEqual(events, [
-            "listMessages", "getPublicKey", "internalizeAction", "getPublicKey", "internalizeAction",
+            "listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey", "internalizeAction",
             "identity", "getPublicKey", "internalizeAction", "acknowledgeMessage",
         ])
         let internalized = await log.internalized
@@ -641,9 +670,10 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(paths, ["/listMessages", "/listMessages", "/acknowledgeMessage"])
     }
 
-    func test_aKeyDerivationThatFailsOnTheEnvelopeStepOnlyIsRefused() async throws {
+    func test_aKeyDerivationThatFailsOnTheEnvelopeStepOnlyIsUnavailable() async throws {
         // The token's key derives; the envelope payment's does not, as when the wallet locks
-        // between the two. That is worth retrying, so it is refused, not unreadable.
+        // between the two. Nothing was decided about the payment, so it is unavailable, carrying
+        // the wallet's error: neither unreadable nor refused.
         let f = try await fixture(envelope: try recipientPayment())
         let log = EventLog()
         let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
@@ -653,10 +683,11 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
                 log: log, failDerivation: 2))
             XCTFail("must not be acknowledged")
         } catch MessageBoxPaymentError.envelopePaymentNotTaken(let notTaken) {
-            XCTAssertEqual(notTaken.reason, .refused)
+            guard case .unavailable(let error) = notTaken.reason else { return XCTFail("\(notTaken.reason)") }
+            XCTAssertTrue(error is WalletLocked)
         }
         let events = await log.events
-        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "getPublicKey"])
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey"])
 
         // The envelope step on its own, failing at its one derivation.
         let (message, stepClient) = try await listedMessage(
@@ -666,7 +697,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
                 receiver: StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: EventLog(), failDerivation: 1))
             XCTFail("must not be taken")
         } catch MessageBoxPaymentError.recipientPaymentFailed(let reason) {
-            XCTAssertEqual(reason, .refused)
+            XCTAssertEqual(FailureKind(reason), .unavailable)
         }
     }
 
@@ -702,7 +733,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(notTaken.reason, .refused)
         }
         let acceptEvents = await acceptLog.events
-        XCTAssertEqual(acceptEvents, ["listMessages", "getPublicKey", "internalizeAction"])
+        XCTAssertEqual(acceptEvents, ["listMessages", "getPublicKey", "internalizeAction", "identity"])
 
         // A truncated transaction of ordinary size is still unreadable.
         let (short, shortClient) = try await listedMessage(body: ["message": "paymail",
@@ -744,9 +775,9 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             try recipientPayment(extra: ["description": "fee\u{1}"]),
             try recipientPayment(extra: ["description": String(repeating: "d", count: 51)]),
         ]
-        // Each is read before the wallet is asked anything about it; a payment that is not an
-        // object is kept by the listing and unreadable here.
-        let tokenOnly = ["listMessages", "getPublicKey", "internalizeAction"]
+        // Each is read before the wallet is asked anything about it but its identity; a payment
+        // that is not an object is kept by the listing and unreadable here.
+        let tokenOnly = ["listMessages", "getPublicKey", "internalizeAction", "identity"]
         var cases: [(envelope: Any, events: [String])] = unreadable.map { (envelope: $0 as Any, events: tokenOnly) }
         cases.append((envelope: [1] as Any, events: tokenOnly))
         // Pays a key this wallet does not hold: refused by the ownership check, not the wallet.
@@ -789,7 +820,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(result.recipientPaymentInternalized)
         XCTAssertTrue(result.acknowledged)
         let events = await log.events
-        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "acknowledgeMessage"])
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "acknowledgeMessage"])
     }
 
     // MARK: - Envelope payments on other messages
@@ -868,7 +899,8 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         let events = await log.events
         XCTAssertEqual(events, [
             "listMessages", "identity", "getPublicKey", "internalizeAction",
-            "listMessages", "getPublicKey", "internalizeAction", "getPublicKey", "internalizeAction", "acknowledgeMessage",
+            "listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey", "internalizeAction",
+            "acknowledgeMessage",
         ])
         let internalized = await log.internalized
         XCTAssertEqual(internalized.count, 3)
@@ -877,12 +909,12 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
     }
 
     func test_aFailedEnvelopePaymentSaysWhetherItCanBeRetried() async throws {
-        typealias Failure = MessageBoxPaymentError.RecipientPaymentFailure
-        let cases: [(envelope: [String: Any], outcome: StubReceiver.Outcome, reason: Failure, events: [String])] = [
-            // The wallet refused, failed or is locked: worth retrying.
+        let cases: [(envelope: [String: Any], outcome: StubReceiver.Outcome, reason: FailureKind, events: [String])] = [
+            // The wallet answered no.
             (try recipientPayment(), .refused, .refused, ["listMessages", "identity", "getPublicKey", "internalizeAction"]),
-            (try recipientPayment(), .fails, .refused, ["listMessages", "identity", "getPublicKey", "internalizeAction"]),
-            (try recipientPayment(), .locked, .refused, ["listMessages", "identity"]),
+            // Storage could not be reached, or the wallet locked: nothing was decided.
+            (try recipientPayment(), .fails, .unavailable, ["listMessages", "identity", "getPublicKey", "internalizeAction"]),
+            (try recipientPayment(), .locked, .unavailable, ["listMessages", "identity"]),
             // Never takeable: unreadable, or paying a key this wallet does not hold.
             (try recipientPayment(remittance: false), .accepted, .unreadable, ["listMessages", "identity"]),
             (try recipientPayment(payTo: try key(9).publicKey), .accepted, .unreadable,
@@ -898,11 +930,239 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
                 try await client.acknowledge(messageIds: [message.messageId])
                 XCTFail("\(test.outcome) must not be acknowledged")
             } catch MessageBoxPaymentError.recipientPaymentFailed(let reason) {
-                XCTAssertEqual(reason, test.reason, "\(test.outcome)")
+                XCTAssertEqual(FailureKind(reason), test.reason, "\(test.outcome)")
             }
             let events = await log.events
             XCTAssertEqual(events, test.events, "\(test.outcome)")
         }
+    }
+
+    func test_whatTheWalletThrowsSaysWhetherItDecided() async throws {
+        // Errors that mean the wallet or storage gave no decision about the payment are
+        // unavailable and carry the error; errors that are the wallet's or storage's own answer
+        // are refused.
+        let cases: [(error: any Error, kind: FailureKind)] = [
+            (URLError(.notConnectedToInternet), .unavailable),
+            (URLError(.timedOut), .unavailable),
+            (URLError(.networkConnectionLost), .unavailable),
+            (URLError(.cancelled), .unavailable),
+            (AuthTransportError.transportFailed("reset"), .unavailable),
+            (AuthTransportError.sessionExpired, .unavailable),
+            (AuthTransportError.responseNotAuthenticated("no frame"), .unavailable),
+            (AuthError.invalidSignature, .unavailable),
+            (AuthError.peerMismatch, .unavailable),
+            (AuthError.invalidNonce, .unavailable),
+            (AuthError.replay, .unavailable),
+            (StorageClientError.unreadableResponse(method: "internalizeAction"), .unavailable),
+            (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 503), .unavailable),
+            (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 429), .unavailable),
+            (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 408), .unavailable),
+            (WireError.internalFailure("database down"), .unavailable),
+            (WireError.notActive("switching"), .unavailable),
+            (WireError.broadcastUnavailable("no broadcaster"), .unavailable),
+            (WireError.reviewActions("broadcast failed"), .unavailable),
+            (WireError.unauthorized("session"), .unavailable),
+            (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 413), .refused),
+            (WireError.invalidParameter(name: "tx", message: "bad"), .refused),
+            (WireError.badRequest("no"), .refused),
+            (WireError.unrecognized(name: "WERR_NEW", message: "new"), .refused),
+            (WalletError.outputIsNotBRC29Payment(outputIndex: 0), .refused),
+            (WalletError.internalizeSubjectMissing, .refused),
+        ]
+        for test in cases {
+            let log = EventLog()
+            let (message, client) = try await listedMessage(
+                body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: log)
+            let receiver = StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log, envelopeError: test.error)
+            do {
+                try await client.internalizeEnvelopePayment(of: message, receiver: receiver)
+                XCTFail("\(test.error) must not be taken")
+            } catch MessageBoxPaymentError.recipientPaymentFailed(let reason) {
+                XCTAssertEqual(FailureKind(reason), test.kind, "\(test.error)")
+                if case .unavailable(let carried) = reason {
+                    XCTAssertEqual(String(reflecting: carried), String(reflecting: test.error))
+                }
+            }
+            let events = await log.events
+            XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction"], "\(test.error)")
+        }
+
+        // The carried error is the one thrown, so a caller can tell a storage error from a
+        // network one.
+        let (message, client) = try await listedMessage(
+            body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: EventLog())
+        do {
+            try await client.internalizeEnvelopePayment(of: message, receiver: StubReceiver(keys: ProtoWallet(rootKey: try key(1)),
+                log: EventLog(), envelopeError: WireError.internalFailure("Could not determine transaction index")))
+            XCTFail("must not be taken")
+        } catch MessageBoxPaymentError.recipientPaymentFailed(.unavailable(let error)) {
+            XCTAssertEqual(error as? WireError, .internalFailure("Could not determine transaction index"))
+        }
+
+        // An `NSError` in the URL domain is a network failure like the `URLError` it stands for,
+        // and not a cancellation outside a cancelled task.
+        XCTAssertTrue(MessageBoxClient.isUndecided(NSError(domain: NSURLErrorDomain, code: URLError.Code.timedOut.rawValue)))
+        XCTAssertTrue(MessageBoxClient.isUndecided(NSError(domain: NSURLErrorDomain, code: URLError.Code.cancelled.rawValue)))
+        XCTAssertFalse(MessageBoxClient.isCancellation(NSError(domain: NSURLErrorDomain, code: URLError.Code.cancelled.rawValue)))
+    }
+
+    func test_unavailableFailuresCompareByTheirError() {
+        typealias Failure = MessageBoxPaymentError.RecipientPaymentFailure
+        let failures: [Failure] = [
+            .unreadable, .refused,
+            .unavailable(WireError.internalFailure("x")), .unavailable(WireError.internalFailure("y")),
+            .unavailable(WireError.notActive("x")),
+            .unavailable(WalletLocked()),
+            .unavailable(URLError(.timedOut)), .unavailable(URLError(.notConnectedToInternet)),
+            .unavailable(NSError(domain: "storage", code: 1)), .unavailable(NSError(domain: "storage", code: 2)),
+        ]
+        // Reflexive, for Equatable errors, errors that are not Equatable, and NSErrors alike.
+        for failure in failures {
+            XCTAssertEqual(failure, failure, "\(failure)")
+        }
+        // Symmetric, and distinct failures are not equal.
+        for (i, left) in failures.enumerated() {
+            for (j, right) in failures.enumerated() {
+                XCTAssertEqual(left == right, right == left, "\(left) vs \(right)")
+                if i != j { XCTAssertNotEqual(left, right, "\(left) vs \(right)") }
+            }
+        }
+        // Equal values, not the same instance.
+        XCTAssertEqual(Failure.unavailable(WireError.internalFailure("x")), .unavailable(WireError.internalFailure("x")))
+        XCTAssertEqual(Failure.unavailable(WalletLocked()), .unavailable(WalletLocked()))
+        XCTAssertEqual(Failure.unavailable(NSError(domain: "storage", code: 1, userInfo: ["a": 1])),
+            .unavailable(NSError(domain: "storage", code: 1)))
+    }
+
+    func test_aCancelledRequestIsACancellationOnlyInACancelledTask() async throws {
+        // `URLError(.cancelled)` in a task that was not cancelled is how `URLSession` reports a
+        // rejected authentication challenge or an invalidated session: not a decision, not a
+        // cancellation.
+        let log = EventLog()
+        let (message, client) = try await listedMessage(
+            body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: log)
+        do {
+            try await client.internalizeEnvelopePayment(of: message,
+                receiver: StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log, outcome: .cancelled))
+            XCTFail("a failed wallet call must not be a result")
+        } catch MessageBoxPaymentError.recipientPaymentFailed(let reason) {
+            guard case .unavailable(let error) = reason else { return XCTFail("\(reason)") }
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+        }
+        var events = await log.events
+        XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction"])
+
+        // The same error from a request in a cancelled task is a cancellation.
+        let receiver = StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log, outcome: .failsOnceCancelled)
+        let step = Task { try await client.internalizeEnvelopePayment(of: message, receiver: receiver) }
+        // Cancel once the wallet is internalizing, so nothing before it sees the cancellation.
+        while await log.events.count < 7 { await Task.yield() }
+        step.cancel()
+        do {
+            _ = try await step.value
+            XCTFail("a wallet call failing in a cancelled task must not be a result")
+        } catch is CancellationError {}
+        events = await log.events
+        XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction",
+                                "identity", "getPublicKey", "internalizeAction"])
+
+        // In a cancelled task any failure is a cancellation; outside one only `CancellationError` is.
+        XCTAssertTrue(MessageBoxClient.isCancellation(CancellationError()))
+        XCTAssertFalse(MessageBoxClient.isCancellation(URLError(.cancelled)))
+        XCTAssertFalse(MessageBoxClient.isCancellation(URLError(.timedOut)))
+        let inCancelledTask = Task { () -> [Bool] in
+            while !Task.isCancelled { await Task.yield() }
+            return [MessageBoxClient.isCancellation(URLError(.cancelled)), MessageBoxClient.isCancellation(WalletLocked())]
+        }
+        inCancelledTask.cancel()
+        let cancelled = await inCancelledTask.value
+        XCTAssertEqual(cancelled, [true, true])
+    }
+
+    func test_acceptReportsAFailureInACancelledTaskAsACancellation() async throws {
+        // On the envelope payment: the token is in, the message stays, and this is not
+        // `envelopePaymentNotTaken`.
+        let f = try await fixture(envelope: try recipientPayment())
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        let receiver = StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log, envelopeOutcome: .failsOnceCancelled)
+        let payment = f.payment
+        let accepting = Task {
+            try await client.accept(payment, receiver: receiver, beforeAcknowledge: { await log.add("beforeAcknowledge") })
+        }
+        while await log.events.count < 6 { await Task.yield() }
+        accepting.cancel()
+        do {
+            _ = try await accepting.value
+            XCTFail("must not be acknowledged")
+        } catch is CancellationError {}
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey",
+                                "internalizeAction"])
+        let paths = await transport.requests.map(\.path)
+        XCTAssertEqual(paths, ["/listMessages"])
+
+        // On the token: a cancellation, not `settlementFailed`; and the message is free to accept again.
+        let tokenLog = EventLog()
+        let tokenTransport = LoggingTransport(log: tokenLog, [
+            (200, try listing([f.row])), (200, try listing([f.row])), (200, #"{"status":"success"}"#),
+        ])
+        let tokenClient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: tokenTransport)
+        let tokenReceiver = StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: tokenLog, outcome: .failsOnceCancelled)
+        let tokenAccepting = Task { try await tokenClient.accept(payment, receiver: tokenReceiver) }
+        while await tokenLog.events.count < 3 { await Task.yield() }
+        tokenAccepting.cancel()
+        do {
+            _ = try await tokenAccepting.value
+            XCTFail("must not be acknowledged")
+        } catch is CancellationError {}
+        let again = try await tokenClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+            log: tokenLog))
+        XCTAssertTrue(again.acknowledged)
+
+        // The same `URLError(.cancelled)` outside a cancelled task leaves the envelope payment
+        // unavailable and the token a settlement failure.
+        let plainLog = EventLog()
+        let plainClient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver),
+            transport: LoggingTransport(log: plainLog, [(200, try listing([f.row])), (200, try listing([f.row]))]))
+        do {
+            _ = try await plainClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+                log: plainLog, envelopeOutcome: .cancelled))
+            XCTFail("must not be acknowledged")
+        } catch MessageBoxPaymentError.envelopePaymentNotTaken(let notTaken) {
+            XCTAssertEqual(FailureKind(notTaken.reason), .unavailable)
+        }
+        do {
+            _ = try await plainClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+                log: plainLog, outcome: .cancelled))
+            XCTFail("must not be acknowledged")
+        } catch MessageBoxPaymentError.settlementFailed {}
+    }
+
+    func test_acceptRefusesTheEnvelopePaymentForAnotherWallet() async throws {
+        // The client is key 1. The token pays key 5, so a key-5 wallet takes it; the envelope
+        // payment was sent to the client's identity, so the key-5 wallet is refused it before it
+        // is derived or internalized, and the message is kept.
+        let other = try key(5)
+        let f = try await fixture(payTo: other.publicKey, envelope: try recipientPayment())
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        do {
+            _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: other), log: log),
+                beforeAcknowledge: { await log.add("beforeAcknowledge") })
+            XCTFail("another wallet must not take the envelope payment")
+        } catch MessageBoxPaymentError.envelopePaymentNotTaken(let notTaken) {
+            XCTAssertEqual(notTaken.reason, .refused)
+            XCTAssertEqual(notTaken.payment, f.payment)
+        }
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity"])
+        let internalized = await log.internalized
+        XCTAssertEqual(internalized.map(\.labels), [["peerpay"]])
+        let paths = await transport.requests.map(\.path)
+        XCTAssertEqual(paths, ["/listMessages"])
     }
 
     func test_aMessageWithNoEnvelopePaymentIsANoOp() async throws {
@@ -982,8 +1242,8 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(result.recipientPaymentInternalized)
         XCTAssertEqual(result.payment, f.payment)
         let events = await log.events
-        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "getPublicKey", "internalizeAction",
-                                "beforeAcknowledge"])
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "identity", "getPublicKey",
+                                "internalizeAction", "beforeAcknowledge"])
         let paths = await transport.requests.map(\.path)
         XCTAssertEqual(paths, ["/listMessages"])
 
@@ -1185,8 +1445,12 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             "Incoming payment is not present exactly once in the authenticated inbox")
         XCTAssertEqual(MessageBoxPaymentError.settlementFailed.errorDescription,
             "BRC-29 settlement failed recipient, amount, transaction, or wallet validation.")
-        XCTAssertNotEqual(MessageBoxPaymentError.recipientPaymentFailed(.unreadable).errorDescription,
-            MessageBoxPaymentError.recipientPaymentFailed(.refused).errorDescription)
+        let descriptions = [
+            MessageBoxPaymentError.recipientPaymentFailed(.unreadable),
+            .recipientPaymentFailed(.refused),
+            .recipientPaymentFailed(.unavailable(URLError(.notConnectedToInternet))),
+        ].map(\.errorDescription)
+        XCTAssertEqual(Set(descriptions).count, 3)
     }
 
     // Generated from the TS source by running `paymentFromMessage` over each stored body.
