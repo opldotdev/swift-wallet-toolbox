@@ -15,11 +15,17 @@ public actor MessageBoxOutbox {
     private var active: Set<String> = []
 
     /// Looks up recipients' hosts on mainnet trackers. A testnet wallet uses
-    /// `init(directory:discovery:)` with `MessageBoxDiscovery(network: .testnet)`.
+    /// `init(directory:network:)` with `.testnet`.
     public init(directory: URL) {
-        self.directory = directory
-        self.resolveHost = { try await MessageBoxDiscovery().host(for: $0, fallback: $1) }
-        self.makeClient = { try MessageBoxClient(host: $0, wallet: $1) }
+        self.init(directory: directory, network: .mainnet)
+    }
+
+    /// Looks up recipients' hosts on `network`'s SLAP trackers, which must match the wallet's
+    /// chain. Discovery is built per lookup, so a tracker error surfaces from `send`.
+    public init(directory: URL, network: BitcoinNetwork) {
+        self.init(directory: directory,
+            resolveHost: { try await MessageBoxDiscovery(network: network).host(for: $0, fallback: $1) },
+            makeClient: { try MessageBoxClient(host: $0, wallet: $1) })
     }
 
     /// Looks up recipients' hosts with `discovery`, whose network must match the wallet's chain.
