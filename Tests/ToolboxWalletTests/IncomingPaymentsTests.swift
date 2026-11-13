@@ -30,7 +30,7 @@ private actor LoggingTransport: AuthenticatedTransport {
 
     init(log: EventLog, _ responses: [(status: Int, body: String)], holdFirst: Bool = false) {
         self.log = log
-        self.responses = responses.map { AuthenticatedResponse(statusCode: /bin/bash.status, headers: [:], body: Array(/bin/bash.body.utf8)) }
+        self.responses = responses.map { AuthenticatedResponse(statusCode: $0.status, headers: [:], body: Array($0.body.utf8)) }
         self.holdFirst = holdFirst
     }
 
