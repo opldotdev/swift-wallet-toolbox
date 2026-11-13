@@ -128,6 +128,28 @@ This slice supports zero-fee delivery. Blocked recipients or quotes requiring an
 delivery payment are refused before transaction creation. It does not register receiving hosts,
 poll inboxes, or silently pay delivery fees. Configured endpoints must use HTTPS.
 
+### MessageBox incoming payments
+
+`MessageBoxClient.accept(_:wallet:beforeAcknowledge:)` takes a PeerPay token, then any envelope
+payment the message carried, then acknowledges. `internalizeEnvelopePayment(of:wallet:)` runs the
+envelope step alone. When the envelope payment is not taken, the step throws
+`recipientPaymentFailed(reason)` and `accept` throws `envelopePaymentNotTaken`, whose `reason`
+is a `MessageBoxPaymentError.RecipientPaymentFailure`:
+
+| Reason | Meaning | What to do with the message |
+|---|---|---|
+| `.unreadable` | The payment cannot be read, or does not pay this wallet. | Acknowledge it; nothing is lost. |
+| `.refused` | The wallet declined: another identity, past `StorageLimits`, or storage rejected the internalize. | Keep it. Offer to drop it only on the user's word. |
+| `.unavailable(error)` | Nothing was decided: network, timeout, transport, a storage server error, or a wallet that could not derive a key. | Keep it and retry. |
+
+A cancellation in any form (`CancellationError`, `URLError(.cancelled)`, a cancelled task) is
+thrown as `CancellationError`, never as a reason. The wallet may or may not have taken the
+payment then, so keep the message and retry; storage merges a repeat internalize.
+
+Breaking change: `.unavailable` is new. Network failures, storage server errors and key
+derivation failures used to be `.refused`, and a cancelled request could be too. `accept` now
+checks the wallet is the client's identity before the envelope step, as the step alone does.
+
 ### Tests
 
 ```bash
