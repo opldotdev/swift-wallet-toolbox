@@ -15,6 +15,17 @@ private struct AdvertisementResolver: OverlayLookupResolving {
     }
 }
 
+/// Records which hosts the resolver asks, and answers every lookup with no outputs.
+private actor RecordingFacilitator: LookupFacilitator {
+    var services: [String] = []
+    var hosts: [String] = []
+    func lookup(question: LookupQuestion, at host: OverlayHost) async throws -> LookupAnswer {
+        services.append(question.service.rawValue)
+        hosts.append(host.rawValue)
+        return try LookupAnswer(outputList: [])
+    }
+}
+
 final class MessageBoxDiscoveryTests: XCTestCase, @unchecked Sendable {
     private func key(_ value: UInt8) throws -> PublicKey {
         try PrivateKey(Array(repeating: 0, count: 31) + [value]).publicKey
@@ -44,6 +55,33 @@ final class MessageBoxDiscoveryTests: XCTestCase, @unchecked Sendable {
                 fallback: URL(string: "https://default.example")!)
             XCTAssertEqual(host.host, "default.example")
         }
+    }
+
+    func test_trackersMatchTypeScriptNetworkPresets() {
+        XCTAssertEqual(MessageBoxDiscovery.slapTrackers(for: .mainnet), ["https://overlay-us-1.bsvb.tech",
+            "https://overlay-eu-1.bsvb.tech", "https://overlay-ap-1.bsvb.tech", "https://users.bapp.dev"])
+        XCTAssertEqual(MessageBoxDiscovery.slapTrackers(for: .testnet), ["https://testnet-users.bapp.dev"])
+        XCTAssertNoThrow(try MessageBoxDiscovery())
+        XCTAssertNoThrow(try MessageBoxDiscovery(network: .testnet))
+    }
+
+    func test_testnetDiscoveryAsksOnlyTestnetTrackersThenFallsBack() async throws {
+        let facilitator = RecordingFacilitator()
+        let host = try await MessageBoxDiscovery(network: .testnet, facilitator: facilitator)
+            .host(for: key(2), fallback: URL(string: "https://default.example")!)
+        XCTAssertEqual(host.host, "default.example")
+        let hosts = await facilitator.hosts, services = await facilitator.services
+        XCTAssertFalse(hosts.isEmpty)
+        XCTAssertEqual(Set(hosts), ["https://testnet-users.bapp.dev"])
+        XCTAssertEqual(Set(services), ["ls_slap"])
+    }
+
+    func test_mainnetDiscoveryAsksOnlyMainnetTrackers() async throws {
+        let facilitator = RecordingFacilitator()
+        _ = try await MessageBoxDiscovery(network: .mainnet, facilitator: facilitator)
+            .host(for: key(2), fallback: URL(string: "https://default.example")!)
+        let hosts = await facilitator.hosts
+        XCTAssertEqual(Set(hosts), Set(MessageBoxDiscovery.mainnetSLAPTrackers))
     }
 
     func test_privateAndReservedOverlayHostsAreRejectedWithoutRestrictingExplicitHTTPSConfiguration() throws {

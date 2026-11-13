@@ -14,10 +14,25 @@ public actor MessageBoxOutbox {
     private let makeClient: @Sendable (URL, ProtoWallet) throws -> MessageBoxClient
     private var active: Set<String> = []
 
+    /// Looks up recipients' hosts on mainnet trackers. A testnet wallet uses
+    /// `init(directory:discovery:)` with `MessageBoxDiscovery(network: .testnet)`.
     public init(directory: URL) {
         self.directory = directory
         self.resolveHost = { try await MessageBoxDiscovery().host(for: $0, fallback: $1) }
         self.makeClient = { try MessageBoxClient(host: $0, wallet: $1) }
+    }
+
+    /// Looks up recipients' hosts with `discovery`, whose network must match the wallet's chain.
+    public init(directory: URL, discovery: MessageBoxDiscovery) {
+        self.init(directory: directory, discovery: discovery,
+            makeClient: { try MessageBoxClient(host: $0, wallet: $1) })
+    }
+
+    init(directory: URL, discovery: MessageBoxDiscovery,
+        makeClient: @escaping @Sendable (URL, ProtoWallet) throws -> MessageBoxClient) {
+        self.init(directory: directory,
+            resolveHost: { try await discovery.host(for: $0, fallback: $1) },
+            makeClient: makeClient)
     }
 
     init(directory: URL,

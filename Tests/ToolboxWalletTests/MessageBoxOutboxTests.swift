@@ -2,6 +2,9 @@ import XCTest
 import Foundation
 import BSVCore
 import BSVKeys
+import BSVOverlay
+import BSVScript
+import BSVTransaction
 import BSVWallet
 import ToolboxAuth
 import ToolboxStorage
@@ -55,6 +58,12 @@ private actor OutboxWallet: MessageBoxPayingWallet {
         XCTAssertEqual(pending.reference, "original-reference")
         XCTAssertEqual(pending.atomicBEEF, [1, 1, 1, 1])
     }
+}
+
+/// Answers ls_messagebox with one advertisement, as an overlay would.
+private struct OutboxAdvertisementResolver: OverlayLookupResolving {
+    let answer: LookupAnswer
+    func resolve(_ question: LookupQuestion) async throws -> LookupAnswer { answer }
 }
 
 final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
@@ -122,6 +131,33 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         let creates = await wallet.creates, resumes = await wallet.resumes
         XCTAssertEqual(creates, 1)
         XCTAssertEqual(resumes, 1)
+    }
+
+    func test_injectedDiscoverySelectsTheAdvertisedHost() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payee = try recipient()
+        let script = try PushDrop.lockingScript(
+            fields: [payee.compressedBytes, Array("https://testnet-box.example/mb".utf8)],
+            publicKey: PrivateKey(Array(repeating: 0, count: 31) + [1]).publicKey,
+            lockPosition: .beforeCompatibility)
+        let transaction = Transaction(version: 1, inputs: [],
+            outputs: [TransactionOutput(satoshis: 1, lockingScript: script)], lockTime: 0)
+        let beef = try BEEF(version: .v2, merklePaths: [], transactions: [.raw(transaction)],
+            limits: StorageLimits.beef)
+        let item = try OutputListItem(beef: beef.serialized(limits: StorageLimits.beef), outputIndex: 0)
+        let discovery = MessageBoxDiscovery(resolver: OutboxAdvertisementResolver(
+            answer: try LookupAnswer(outputList: [item])))
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        let outbox = MessageBoxOutbox(directory: directory, discovery: discovery,
+            makeClient: { try MessageBoxClient(host: $0, wallet: $1, transport: transport) })
+        do {
+            _ = try await outbox.send(wallet: wallet, to: payee, satoshis: 10,
+                description: "Test PeerPay", fallbackHost: URL(string: "https://fallback.example")!)
+            XCTFail("Delivery must fail")
+        } catch MessageBoxOutboxError.pending {}
+        let stored = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(stored?.host.absoluteString, "https://testnet-box.example/mb")
     }
 
     func test_paidDeliveryIsRefusedBeforeCreatingAnyPayment() async throws {
