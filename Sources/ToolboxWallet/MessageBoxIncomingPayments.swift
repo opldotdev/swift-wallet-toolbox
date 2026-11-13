@@ -3,6 +3,7 @@ import BSVCore
 import BSVKeys
 import BSVScript
 import BSVTransaction
+import BSVAuth
 import BSVWallet
 import ToolboxAuth
 import ToolboxBRC29
@@ -80,9 +81,12 @@ public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
 
     /// Why an envelope payment was not internalized.
     ///
-    /// A cancellation is none of these: when the task is cancelled, or a wallet call fails with
-    /// `CancellationError` or `URLError(.cancelled)`, the envelope step throws `CancellationError`
-    /// instead, and the wallet may or may not have taken the payment.
+    /// A cancellation is none of these: when a wallet call fails with `CancellationError`, or
+    /// fails in any way while the task is cancelled (a cancelled `URLSession` request throws
+    /// `URLError(.cancelled)`), the envelope step throws `CancellationError` instead, and the
+    /// wallet may or may not have taken the payment. `URLError(.cancelled)` in a task that was
+    /// not cancelled (a rejected authentication challenge, an invalidated session) is
+    /// `unavailable`.
     public enum RecipientPaymentFailure: Sendable, Equatable {
         /// The payment cannot be read, or a wallet-payment output in it is not this wallet's to
         /// claim. It can never be internalized, so nothing is lost by acknowledging the message.
@@ -92,16 +96,22 @@ public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
         /// the internalize. Asking the same wallet again is unlikely to change the answer, but the
         /// message holds the only copy of the payment: keep it unless the user chooses to drop it.
         case refused
-        /// Nothing decided about the payment: the wallet or its storage could not be asked or did
-        /// not answer. That covers network and timeout errors, transport and authentication
-        /// failures, storage server errors (`WERR_INTERNAL`, `WERR_NOT_ACTIVE`,
-        /// `WERR_BROADCAST_UNAVAILABLE`, HTTP 408, 429 and 5xx), and a wallet that could not
-        /// derive a key or report its identity, as when it locked. Carries the error. Keep the
-        /// message and run the step again later.
+        /// The wallet did not decide; the failure may be transient. The wallet or its storage could
+        /// not be asked or gave no decision about the payment: network and timeout errors, a
+        /// `URLError(.cancelled)` outside a cancelled task, transport and authentication failures
+        /// (`AuthTransportError`, `AuthError`, `WERR_UNAUTHORIZED`), storage server errors
+        /// (`WERR_INTERNAL`, `WERR_NOT_ACTIVE`, `WERR_BROADCAST_UNAVAILABLE`, `WERR_REVIEW_ACTIONS`,
+        /// HTTP 408, 429 and 5xx), and a wallet that could not report its identity or derive a key.
+        ///
+        /// Retrying may not resolve it: TS storage reports some failures that will repeat for this
+        /// payment as `WERR_INTERNAL`, and `WERR_REVIEW_ACTIONS` covers a double spend as well as
+        /// a broadcaster outage. The error is carried as thrown, so a caller can inspect it (`error
+        /// is WireError`, say) and decide how many retries to allow before offering to drop it.
         case unavailable(any Error)
 
-        /// Two `unavailable` failures are equal when their errors are equal values of one
-        /// `Equatable` type; errors that are not `Equatable` never compare equal.
+        /// Two `unavailable` failures are equal when their errors are: two `NSError`s with the
+        /// same domain and code; values an `Equatable` type, tried both ways, says are equal; or
+        /// values of the same type that reflect the same. The relation is reflexive and symmetric.
         public static func == (lhs: Self, rhs: Self) -> Bool {
             switch (lhs, rhs) {
             case (.unreadable, .unreadable), (.refused, .refused): true
@@ -111,8 +121,13 @@ public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
         }
 
         private static func sameError(_ left: any Error, _ right: any Error) -> Bool {
-            guard let left = left as? any Equatable else { return false }
-            return left.isEqualToError(right)
+            if type(of: left) is NSError.Type, type(of: right) is NSError.Type {
+                return left._domain == right._domain && left._code == right._code
+            }
+            if let equatable = left as? any Equatable, equatable.isEqualToError(right) { return true }
+            if let equatable = right as? any Equatable, equatable.isEqualToError(left) { return true }
+            return ObjectIdentifier(type(of: left)) == ObjectIdentifier(type(of: right))
+                && String(reflecting: left) == String(reflecting: right)
         }
     }
 
@@ -127,7 +142,7 @@ public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
         case .recipientPaymentFailed(.refused):
             "The wallet did not internalize the payment this message carried, so the message was not acknowledged."
         case .recipientPaymentFailed(.unavailable):
-            "The wallet could not be reached to internalize the payment this message carried, so the message was not acknowledged. Try again."
+            "The wallet did not decide on the payment this message carried, so the message was not acknowledged. It may work later."
         case .envelopePaymentNotTaken:
             "The payment was internalized, but not the payment its message carried, so the message was not acknowledged."
         }
@@ -148,8 +163,8 @@ private extension Equatable {
 /// When `reason` is `unavailable` or `refused`, run
 /// ``MessageBoxClient/internalizeEnvelopePayment(of:wallet:)`` on `message` again later and
 /// acknowledge once it returns, or accept the payment again: wallet storage merges the token it
-/// already holds. `unavailable` is worth retrying as is; `refused` is the wallet's answer, which
-/// the same wallet is unlikely to change. When `reason` is `unreadable`, the envelope payment can
+/// already holds. `unavailable` may be transient, but may also repeat; `refused` is the wallet's
+/// answer, which the same wallet is unlikely to change. When `reason` is `unreadable`, the envelope payment can
 /// never be taken; acknowledge `message` to clear it from the inbox.
 public struct MessageBoxEnvelopePaymentNotTaken: Sendable, Equatable {
     /// The payment whose token the wallet internalized.
@@ -237,9 +252,9 @@ extension MessageBoxClient {
     /// is asked of the wallet, the wallet must be this client's identity, as in
     /// ``internalizeEnvelopePayment(of:wallet:)``; a different wallet is `refused`.
     ///
-    /// A cancellation in any form (`CancellationError`, `URLError(.cancelled)`, or the task being
-    /// cancelled while a wallet call fails) throws `CancellationError`; the wallet may or may not
-    /// have taken the payment then, and the message is not acknowledged.
+    /// A cancellation (`CancellationError`, or any wallet failure while the task is cancelled,
+    /// such as the `URLError(.cancelled)` a cancelled request throws) throws `CancellationError`;
+    /// the wallet may or may not have taken the payment then, and the message is not acknowledged.
     ///
     /// `beforeAcknowledge`, when given, runs after everything is internalized and right before
     /// the acknowledgement. If it throws, the message is not acknowledged and the result reports
@@ -320,13 +335,13 @@ extension MessageBoxClient {
     /// with `unreadable`, the payment cannot be read or pays an output this wallet cannot claim:
     /// it can never be taken, and acknowledging loses nothing. With `refused`, the wallet declined
     /// it (another identity, past the limits, or storage rejected the internalize); with
-    /// `unavailable`, the wallet or its storage could not be asked or did not answer (network,
-    /// timeout, transport, a storage server error, or a wallet that could not derive a key, as when
-    /// it locked). Either way do not acknowledge, because the message holds the only copy of that
-    /// payment; run the step again later. It throws `CancellationError` when the task was
-    /// cancelled or a wallet call failed with `CancellationError` or `URLError(.cancelled)`; the
-    /// wallet may or may not have taken the payment then, so keep the message and run the step
-    /// again. ``accept(_:wallet:beforeAcknowledge:)`` does this step itself for PeerPay payments.
+    /// `unavailable`, the wallet did not decide (network, timeout, transport or authentication,
+    /// a storage server error, or a wallet that could not derive a key), which may be transient
+    /// but may also repeat. Either way do not acknowledge on your own, because the message holds
+    /// the only copy of that payment; run the step again later. It throws `CancellationError`
+    /// when a wallet call failed with `CancellationError` or failed in any way while the task was
+    /// cancelled; the wallet may or may not have taken the payment then, so keep the message and
+    /// run the step again. ``accept(_:wallet:beforeAcknowledge:)`` does this step itself for PeerPay payments.
     ///
     /// Unlike `accept`, this step has no in-flight guard: two calls for the same message both
     /// ask the wallet to internalize. It relies on wallet storage merging a repeat internalize of
@@ -372,8 +387,9 @@ extension MessageBoxClient {
     /// `RemoteWallet.internalizeAction`'s ownership check, run first so that a payment this
     /// wallet can never claim is reported `unreadable`, not `refused`: every wallet-payment output
     /// must be in the subject transaction and locked to the BRC-29 key the wallet derives for its
-    /// sender, prefix and suffix. A wallet that cannot derive the key (it locked, say) is
-    /// `unavailable`: deriving a key is not a decision about the payment.
+    /// sender, prefix and suffix. A wallet that cannot derive the key is `unavailable`: deriving a
+    /// key is not a decision about the payment. `RemoteWallet` derives keys in memory, so this
+    /// arises only with a custom wallet.
     static func requireRecipientPaymentOwned(
         _ request: WalletInternalizeActionRequest, by wallet: some MessageBoxReceivingWallet
     ) async throws {
@@ -539,22 +555,27 @@ extension MessageBoxClient {
         return MessageBoxPaymentError.recipientPaymentFailed(.unavailable(error))
     }
 
-    /// Cancellation in any form: `CancellationError`, `URLError(.cancelled)` (what a cancelled
-    /// `URLSession` request throws), or any failure while the current task is cancelled.
+    /// A cancellation: `CancellationError`, or any failure while the current task is cancelled,
+    /// which covers the `URLError(.cancelled)` a cancelled `URLSession` request throws. A
+    /// `URLError(.cancelled)` in a task that was not cancelled is not one: `URLSession` also
+    /// reports a rejected authentication challenge or an invalidated session that way.
     static func isCancellation(_ error: any Error) -> Bool {
-        error is CancellationError || Task.isCancelled || urlErrorCode(error) == .cancelled
+        error is CancellationError || Task.isCancelled
     }
 
-    /// True when `error` says the wallet's storage could not be asked or did not answer, so it
-    /// decided nothing: a `URLError`; any `AuthTransportError`, since no authenticated reply
-    /// arrived; a reply that was not this protocol, or HTTP 408, 429 or 5xx without a JSON-RPC
-    /// error; and the storage errors that report the server's own state, not the request
-    /// (`WERR_INTERNAL`, `WERR_NOT_ACTIVE`, `WERR_BROADCAST_UNAVAILABLE`). Everything else the
-    /// wallet throws is its answer.
+    /// True when `error` says the wallet's storage gave no decision about the payment: a
+    /// `URLError`; any `AuthTransportError` or `AuthError`, since no authenticated reply arrived; a
+    /// reply that was not this protocol, or HTTP 408, 429 or 5xx without a JSON-RPC error; and
+    /// the storage errors that are about the server or the session, not the payment
+    /// (`WERR_INTERNAL`, `WERR_NOT_ACTIVE`, `WERR_BROADCAST_UNAVAILABLE`, `WERR_UNAUTHORIZED`,
+    /// and `WERR_REVIEW_ACTIONS`, which TS storage throws when the broadcast during internalize
+    /// fails for any reason, a broadcaster outage included). Everything else the wallet throws is
+    /// its answer. A proxy's HTTP error rarely reaches the status rule: without an auth frame it
+    /// arrives as `AuthTransportError.responseNotAuthenticated`.
     static func isUndecided(_ error: any Error) -> Bool {
-        if urlErrorCode(error) != nil { return true }
+        if isURLError(error) { return true }
         switch error {
-        case is AuthTransportError:
+        case is AuthTransportError, is AuthError:
             return true
         case let error as StorageClientError:
             switch error {
@@ -563,7 +584,7 @@ extension MessageBoxClient {
             }
         case let error as WireError:
             switch error {
-            case .internalFailure, .notActive, .broadcastUnavailable: return true
+            case .internalFailure, .notActive, .broadcastUnavailable, .reviewActions, .unauthorized: return true
             default: return false
             }
         default:
@@ -571,12 +592,10 @@ extension MessageBoxClient {
         }
     }
 
-    /// The `URLError` code of `error`, also when it arrives as an `NSError` in the URL error
-    /// domain, as FoundationNetworking can report it.
-    private static func urlErrorCode(_ error: any Error) -> URLError.Code? {
-        if let error = error as? URLError { return error.code }
-        guard error._domain == NSURLErrorDomain else { return nil }
-        return URLError.Code(rawValue: error._code)
+    /// A `URLError`, also when it arrives as an `NSError` in the URL error domain, as
+    /// FoundationNetworking can report it.
+    private static func isURLError(_ error: any Error) -> Bool {
+        error is URLError || error._domain == NSURLErrorDomain
     }
 
     private func incomingPayment(_ row: ListedRow) async -> MessageBoxIncomingPayment? {
@@ -585,7 +604,7 @@ extension MessageBoxClient {
     }
 
     /// TS `Brc29RemittanceModule.acceptSettlement` as PeerPay configures it. Any failure is the
-    /// one settlement error, as in TS, except a cancellation in any form, which throws
+    /// one settlement error, as in TS, except a cancellation (``isCancellation(_:)``), which throws
     /// `CancellationError`.
     static func internalize(_ payment: MessageBoxIncomingPayment, into wallet: some MessageBoxReceivingWallet) async throws {
         do {

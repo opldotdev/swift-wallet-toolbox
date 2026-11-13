@@ -4,6 +4,7 @@ import BSVCore
 import BSVKeys
 import BSVScript
 import BSVTransaction
+import BSVAuth
 import BSVWallet
 import ToolboxAuth
 import ToolboxBRC29
@@ -54,8 +55,8 @@ private actor LoggingTransport: AuthenticatedTransport {
 private struct StubReceiver: MessageBoxReceivingWallet {
     /// `refused` answers `accepted: false`; `fails` cannot reach storage; `locked` also refuses to
     /// derive keys, as a wallet that locked does; `cancelled` throws what a cancelled `URLSession`
-    /// request throws; `failsOnceCancelled` waits for its task to be cancelled, then fails with an
-    /// error that is not a cancellation.
+    /// request throws, here in a task that was not cancelled; `failsOnceCancelled` waits for its
+    /// task to be cancelled, then throws the same `URLError(.cancelled)`.
     enum Outcome: Sendable { case accepted, refused, fails, locked, cancelled, failsOnceCancelled }
     let keys: ProtoWallet
     let log: EventLog
@@ -93,7 +94,7 @@ private struct StubReceiver: MessageBoxReceivingWallet {
         case .cancelled: throw URLError(.cancelled)
         case .failsOnceCancelled:
             while !Task.isCancelled { await Task.yield() }
-            throw WalletLocked()
+            throw URLError(.cancelled)
         }
     }
 }
@@ -937,15 +938,21 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
     }
 
     func test_whatTheWalletThrowsSaysWhetherItDecided() async throws {
-        // Errors that mean storage was never asked or never answered are unavailable and carry
-        // the error; errors that are the wallet's or storage's own answer are refused.
+        // Errors that mean the wallet or storage gave no decision about the payment are
+        // unavailable and carry the error; errors that are the wallet's or storage's own answer
+        // are refused.
         let cases: [(error: any Error, kind: FailureKind)] = [
             (URLError(.notConnectedToInternet), .unavailable),
             (URLError(.timedOut), .unavailable),
             (URLError(.networkConnectionLost), .unavailable),
+            (URLError(.cancelled), .unavailable),
             (AuthTransportError.transportFailed("reset"), .unavailable),
             (AuthTransportError.sessionExpired, .unavailable),
             (AuthTransportError.responseNotAuthenticated("no frame"), .unavailable),
+            (AuthError.invalidSignature, .unavailable),
+            (AuthError.peerMismatch, .unavailable),
+            (AuthError.invalidNonce, .unavailable),
+            (AuthError.replay, .unavailable),
             (StorageClientError.unreadableResponse(method: "internalizeAction"), .unavailable),
             (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 503), .unavailable),
             (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 429), .unavailable),
@@ -953,6 +960,8 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             (WireError.internalFailure("database down"), .unavailable),
             (WireError.notActive("switching"), .unavailable),
             (WireError.broadcastUnavailable("no broadcaster"), .unavailable),
+            (WireError.reviewActions("broadcast failed"), .unavailable),
+            (WireError.unauthorized("session"), .unavailable),
             (StorageClientError.httpFailure(method: "internalizeAction", statusCode: 413), .refused),
             (WireError.invalidParameter(name: "tx", message: "bad"), .refused),
             (WireError.badRequest("no"), .refused),
@@ -978,37 +987,72 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction"], "\(test.error)")
         }
 
-        // An `NSError` in the URL domain is a network failure like the `URLError` it stands for.
+        // The carried error is the one thrown, so a caller can tell a storage error from a
+        // network one.
+        let (message, client) = try await listedMessage(
+            body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: EventLog())
+        do {
+            try await client.internalizeEnvelopePayment(of: message, receiver: StubReceiver(keys: ProtoWallet(rootKey: try key(1)),
+                log: EventLog(), envelopeError: WireError.internalFailure("Could not determine transaction index")))
+            XCTFail("must not be taken")
+        } catch MessageBoxPaymentError.recipientPaymentFailed(.unavailable(let error)) {
+            XCTAssertEqual(error as? WireError, .internalFailure("Could not determine transaction index"))
+        }
+
+        // An `NSError` in the URL domain is a network failure like the `URLError` it stands for,
+        // and not a cancellation outside a cancelled task.
         XCTAssertTrue(MessageBoxClient.isUndecided(NSError(domain: NSURLErrorDomain, code: URLError.Code.timedOut.rawValue)))
-        XCTAssertTrue(MessageBoxClient.isCancellation(NSError(domain: NSURLErrorDomain, code: URLError.Code.cancelled.rawValue)))
+        XCTAssertTrue(MessageBoxClient.isUndecided(NSError(domain: NSURLErrorDomain, code: URLError.Code.cancelled.rawValue)))
+        XCTAssertFalse(MessageBoxClient.isCancellation(NSError(domain: NSURLErrorDomain, code: URLError.Code.cancelled.rawValue)))
     }
 
     func test_unavailableFailuresCompareByTheirError() {
         typealias Failure = MessageBoxPaymentError.RecipientPaymentFailure
+        let failures: [Failure] = [
+            .unreadable, .refused,
+            .unavailable(WireError.internalFailure("x")), .unavailable(WireError.internalFailure("y")),
+            .unavailable(WireError.notActive("x")),
+            .unavailable(WalletLocked()),
+            .unavailable(URLError(.timedOut)), .unavailable(URLError(.notConnectedToInternet)),
+            .unavailable(NSError(domain: "storage", code: 1)), .unavailable(NSError(domain: "storage", code: 2)),
+        ]
+        // Reflexive, for Equatable errors, errors that are not Equatable, and NSErrors alike.
+        for failure in failures {
+            XCTAssertEqual(failure, failure, "\(failure)")
+        }
+        // Symmetric, and distinct failures are not equal.
+        for (i, left) in failures.enumerated() {
+            for (j, right) in failures.enumerated() {
+                XCTAssertEqual(left == right, right == left, "\(left) vs \(right)")
+                if i != j { XCTAssertNotEqual(left, right, "\(left) vs \(right)") }
+            }
+        }
+        // Equal values, not the same instance.
         XCTAssertEqual(Failure.unavailable(WireError.internalFailure("x")), .unavailable(WireError.internalFailure("x")))
-        XCTAssertNotEqual(Failure.unavailable(WireError.internalFailure("x")), .unavailable(WireError.internalFailure("y")))
-        XCTAssertNotEqual(Failure.unavailable(WireError.internalFailure("x")), .unavailable(WireError.notActive("x")))
-        // Errors that are not Equatable never compare equal, even to themselves.
-        XCTAssertNotEqual(Failure.unavailable(WalletLocked()), .unavailable(WalletLocked()))
-        XCTAssertNotEqual(Failure.unavailable(WireError.internalFailure("x")), .refused)
-        XCTAssertNotEqual(Failure.refused, .unreadable)
-        XCTAssertEqual(Failure.refused, .refused)
+        XCTAssertEqual(Failure.unavailable(WalletLocked()), .unavailable(WalletLocked()))
+        XCTAssertEqual(Failure.unavailable(NSError(domain: "storage", code: 1, userInfo: ["a": 1])),
+            .unavailable(NSError(domain: "storage", code: 1)))
     }
 
-    func test_aCancelledWalletCallIsACancellationNotARefusal() async throws {
-        // `URLError(.cancelled)` is what a cancelled `URLSession` request throws.
+    func test_aCancelledRequestIsACancellationOnlyInACancelledTask() async throws {
+        // `URLError(.cancelled)` in a task that was not cancelled is how `URLSession` reports a
+        // rejected authentication challenge or an invalidated session: not a decision, not a
+        // cancellation.
         let log = EventLog()
         let (message, client) = try await listedMessage(
             body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: log)
         do {
             try await client.internalizeEnvelopePayment(of: message,
                 receiver: StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log, outcome: .cancelled))
-            XCTFail("a cancelled wallet call must not be a result")
-        } catch is CancellationError {}
+            XCTFail("a failed wallet call must not be a result")
+        } catch MessageBoxPaymentError.recipientPaymentFailed(let reason) {
+            guard case .unavailable(let error) = reason else { return XCTFail("\(reason)") }
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+        }
         var events = await log.events
         XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction"])
 
-        // Any failure while the task is cancelled is a cancellation, whatever the wallet threw.
+        // The same error from a request in a cancelled task is a cancellation.
         let receiver = StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log, outcome: .failsOnceCancelled)
         let step = Task { try await client.internalizeEnvelopePayment(of: message, receiver: receiver) }
         // Cancel once the wallet is internalizing, so nothing before it sees the cancellation.
@@ -1021,21 +1065,36 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         events = await log.events
         XCTAssertEqual(events, ["listMessages", "identity", "getPublicKey", "internalizeAction",
                                 "identity", "getPublicKey", "internalizeAction"])
+
+        // In a cancelled task any failure is a cancellation; outside one only `CancellationError` is.
         XCTAssertTrue(MessageBoxClient.isCancellation(CancellationError()))
-        XCTAssertTrue(MessageBoxClient.isCancellation(URLError(.cancelled)))
+        XCTAssertFalse(MessageBoxClient.isCancellation(URLError(.cancelled)))
         XCTAssertFalse(MessageBoxClient.isCancellation(URLError(.timedOut)))
+        let inCancelledTask = Task { () -> [Bool] in
+            while !Task.isCancelled { await Task.yield() }
+            return [MessageBoxClient.isCancellation(URLError(.cancelled)), MessageBoxClient.isCancellation(WalletLocked())]
+        }
+        inCancelledTask.cancel()
+        let cancelled = await inCancelledTask.value
+        XCTAssertEqual(cancelled, [true, true])
     }
 
-    func test_acceptReportsACancelledWalletCallAsACancellation() async throws {
+    func test_acceptReportsAFailureInACancelledTaskAsACancellation() async throws {
         // On the envelope payment: the token is in, the message stays, and this is not
         // `envelopePaymentNotTaken`.
         let f = try await fixture(envelope: try recipientPayment())
         let log = EventLog()
         let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
         let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        let receiver = StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log, envelopeOutcome: .failsOnceCancelled)
+        let payment = f.payment
+        let accepting = Task {
+            try await client.accept(payment, receiver: receiver, beforeAcknowledge: { await log.add("beforeAcknowledge") })
+        }
+        while await log.events.count < 6 { await Task.yield() }
+        accepting.cancel()
         do {
-            _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
-                log: log, envelopeOutcome: .cancelled), beforeAcknowledge: { await log.add("beforeAcknowledge") })
+            _ = try await accepting.value
             XCTFail("must not be acknowledged")
         } catch is CancellationError {}
         let events = await log.events
@@ -1050,14 +1109,35 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             (200, try listing([f.row])), (200, try listing([f.row])), (200, #"{"status":"success"}"#),
         ])
         let tokenClient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: tokenTransport)
+        let tokenReceiver = StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: tokenLog, outcome: .failsOnceCancelled)
+        let tokenAccepting = Task { try await tokenClient.accept(payment, receiver: tokenReceiver) }
+        while await tokenLog.events.count < 3 { await Task.yield() }
+        tokenAccepting.cancel()
         do {
-            _ = try await tokenClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
-                log: tokenLog, outcome: .cancelled))
+            _ = try await tokenAccepting.value
             XCTFail("must not be acknowledged")
         } catch is CancellationError {}
         let again = try await tokenClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
             log: tokenLog))
         XCTAssertTrue(again.acknowledged)
+
+        // The same `URLError(.cancelled)` outside a cancelled task leaves the envelope payment
+        // unavailable and the token a settlement failure.
+        let plainLog = EventLog()
+        let plainClient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver),
+            transport: LoggingTransport(log: plainLog, [(200, try listing([f.row])), (200, try listing([f.row]))]))
+        do {
+            _ = try await plainClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+                log: plainLog, envelopeOutcome: .cancelled))
+            XCTFail("must not be acknowledged")
+        } catch MessageBoxPaymentError.envelopePaymentNotTaken(let notTaken) {
+            XCTAssertEqual(FailureKind(notTaken.reason), .unavailable)
+        }
+        do {
+            _ = try await plainClient.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+                log: plainLog, outcome: .cancelled))
+            XCTFail("must not be acknowledged")
+        } catch MessageBoxPaymentError.settlementFailed {}
     }
 
     func test_acceptRefusesTheEnvelopePaymentForAnotherWallet() async throws {
