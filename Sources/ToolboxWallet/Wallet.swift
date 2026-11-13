@@ -30,4 +30,11 @@ public enum WalletError: Error, Equatable, Sendable {
     /// is not the one this wallet's key derives for the given sender, prefix and suffix. Accepting
     /// it would tell storage to track an output this wallet cannot spend.
     case outputIsNotBRC29Payment(outputIndex: UInt32)
+    /// A certificate offered for direct acquisition did not verify: its signature (which covers
+    /// this wallet as subject), its keyring, or one of its fields. Nothing was stored.
+    /// `WERR_INVALID_PARAMETER` on `args` in the reference.
+    case invalidCertificate(String)
+    /// Storage answered a write without confirming it changed exactly one record.
+    /// `WERR_INTERNAL` ("did not affirmatively complete") in the reference.
+    case storageMutationIncomplete(String)
 }
