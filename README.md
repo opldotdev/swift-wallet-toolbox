@@ -110,7 +110,7 @@ let txid = try await outbox.send(
 ```
 
 `MessageBoxOutbox(directory:)` finds advertisements on mainnet trackers. A testnet wallet passes
-its network, as `networkPreset: 'testnet'` does in the reference client:
+its network, as `networkPreset: 'testnet'` does in the reference `MessageBoxClient`:
 
 ```swift
 let outbox = MessageBoxOutbox(directory: outboxDirectory, network: .testnet)

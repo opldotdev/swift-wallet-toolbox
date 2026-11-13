@@ -66,6 +66,15 @@ private struct OutboxAdvertisementResolver: OverlayLookupResolving {
     func resolve(_ question: LookupQuestion) async throws -> LookupAnswer { answer }
 }
 
+/// Records which hosts discovery asks, and answers every lookup with no outputs.
+private actor OutboxRecordingFacilitator: LookupFacilitator {
+    var hosts: [String] = []
+    func lookup(question: LookupQuestion, at host: OverlayHost) async throws -> LookupAnswer {
+        hosts.append(host.rawValue)
+        return try LookupAnswer(outputList: [])
+    }
+}
+
 final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
     private func make(_ directory: URL, _ transport: OutboxTransport) -> MessageBoxOutbox {
         MessageBoxOutbox(directory: directory, resolveHost: { _, fallback in fallback },
@@ -158,6 +167,25 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         } catch MessageBoxOutboxError.pending {}
         let stored = try await outbox.pending(for: wallet.sender)
         XCTAssertEqual(stored?.host.absoluteString, "https://testnet-box.example/mb")
+    }
+
+    func test_networkInitLooksUpOnThatNetworksTrackers() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let facilitator = OutboxRecordingFacilitator()
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        let outbox = MessageBoxOutbox(directory: directory, network: .testnet, facilitator: facilitator,
+            makeClient: { try MessageBoxClient(host: $0, wallet: $1, transport: transport) })
+        do {
+            _ = try await outbox.send(wallet: wallet, to: try recipient(), satoshis: 10,
+                description: "Test PeerPay", fallbackHost: URL(string: "https://fallback.example")!)
+            XCTFail("Delivery must fail")
+        } catch MessageBoxOutboxError.pending {}
+        let hosts = await facilitator.hosts
+        XCTAssertFalse(hosts.isEmpty)
+        XCTAssertEqual(Set(hosts), Set(MessageBoxDiscovery.testnetSLAPTrackers))
+        let stored = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(stored?.host.host, "fallback.example")
     }
 
     func test_paidDeliveryIsRefusedBeforeCreatingAnyPayment() async throws {

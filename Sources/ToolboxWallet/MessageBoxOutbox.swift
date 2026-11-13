@@ -1,6 +1,7 @@
 import Foundation
 import BSVCore
 import BSVKeys
+import BSVOverlay
 import BSVTransaction
 import BSVWallet
 import ToolboxStorage
@@ -23,9 +24,21 @@ public actor MessageBoxOutbox {
     /// Looks up recipients' hosts on `network`'s SLAP trackers, which must match the wallet's
     /// chain. Discovery is built per lookup, so a tracker error surfaces from `send`.
     public init(directory: URL, network: BitcoinNetwork) {
-        self.init(directory: directory,
-            resolveHost: { try await MessageBoxDiscovery(network: network).host(for: $0, fallback: $1) },
+        self.init(directory: directory, network: network, facilitator: nil,
             makeClient: { try MessageBoxClient(host: $0, wallet: $1) })
+    }
+
+    /// Test seam: `facilitator` replaces the HTTPS lookup transport.
+    init(directory: URL, network: BitcoinNetwork, facilitator: (any LookupFacilitator)?,
+        makeClient: @escaping @Sendable (URL, ProtoWallet) throws -> MessageBoxClient) {
+        self.init(directory: directory,
+            resolveHost: { recipient, fallback in
+                let discovery = try facilitator.map {
+                    try MessageBoxDiscovery(network: network, facilitator: $0)
+                } ?? MessageBoxDiscovery(network: network)
+                return try await discovery.host(for: recipient, fallback: fallback)
+            },
+            makeClient: makeClient)
     }
 
     /// Looks up recipients' hosts with `discovery`, whose network must match the wallet's chain.
