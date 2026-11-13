@@ -76,6 +76,7 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(messages.map(\.messageId), ["a", "b"])
         XCTAssertEqual(messages[1].body, #"{"x":1}"#)
         XCTAssertEqual(messages[0].createdAt, "2026-11-13T00:00:00Z")
+        XCTAssertEqual(listing.nextOffset, 2)
         try await client.acknowledge(messageIds: ["a", "b", "a"])
 
         let requests = await transport.requests
@@ -116,6 +117,7 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         let listing = try await client.listMessages(messageBox: "inbox", pageSize: 5)
         XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b", "c"])
         XCTAssertFalse(listing.truncated)
+        XCTAssertEqual(listing.nextOffset, 9)
         // 7 is taken; a repeated 7 does not move forward, so the count is used; a boolean cursor is ignored.
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
@@ -127,7 +129,8 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
             wallet: ProtoWallet(rootKey: key(1)), transport: transport)
         let listing = try await client.listMessages(messageBox: "inbox", pageSize: 4, maxPages: 3)
-        XCTAssertEqual(listing, MessageBoxListing(messages: [], truncated: true))
+        // The next listing goes on from where this one would have asked next.
+        XCTAssertEqual(listing, MessageBoxListing(messages: [], truncated: true, nextOffset: 12))
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
         XCTAssertEqual(offsets, [0, 4, 8])
@@ -144,6 +147,7 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         let listing = try await client.listMessages(messageBox: "inbox", pageSize: 1, maxPages: 2)
         XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b"])
         XCTAssertTrue(listing.truncated)
+        XCTAssertEqual(listing.nextOffset, 2)
         // Exactly the allowed pages are asked for, never a third.
         let count = await transport.requests.count
         XCTAssertEqual(count, 2)
@@ -160,6 +164,33 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         let listing = try await client.listMessages(messageBox: "inbox", pageSize: 1, maxPages: 3)
         XCTAssertEqual(listing.messages.map(\.messageId), ["a", "b"])
         XCTAssertFalse(listing.truncated)
+    }
+
+    func test_aListingStartsAtTheGivenOffsetAndReportsWhereToGoOn() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let transport = ScriptedTransport([
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"f","body":"six","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"g","body":"seven","sender":"\#(sender)"}]}"#,
+        ])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 1, maxPages: 2, offset: 5)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["f", "g"])
+        XCTAssertTrue(listing.truncated)
+        XCTAssertEqual(listing.nextOffset, 7)
+        let requests = await transport.requests
+        let offsets = try requests.map { try json($0.body)["offset"] as? Int }
+        XCTAssertEqual(offsets, [5, 6])
+    }
+
+    func test_aNegativeOffsetIsRefusedBeforeAnyRequest() async throws {
+        let transport = ScriptedTransport([])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        do { _ = try await client.listMessages(messageBox: "inbox", offset: -1); XCTFail("negative offset") }
+        catch MessageBoxError.invalidMessage {}
+        let count = await transport.requests.count
+        XCTAssertEqual(count, 0)
     }
 
     func test_malformedListingsAreRefused() async throws {

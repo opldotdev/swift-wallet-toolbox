@@ -21,27 +21,33 @@ public struct MessageBoxIncomingPayment: Sendable, Equatable {
     }
 }
 
-/// The payments one ``MessageBoxClient/incomingPayments()`` call read. `truncated` is true when
-/// the inbox holds more messages than one listing reads (TS: 1,000 over 10 pages); accept or
-/// acknowledge these and list again for the rest.
+/// The payments one ``MessageBoxClient/incomingPayments(offset:beforeOpening:)`` call read.
+/// `truncated` is true when the inbox holds more messages than one listing reads (TS: 1,000
+/// over 10 pages); accept or acknowledge these and list again for the rest, or list from
+/// `nextOffset` to read past messages that stay in the inbox.
 public struct MessageBoxPaymentListing: Sendable, Equatable {
     public let payments: [MessageBoxIncomingPayment]
     public let truncated: Bool
+    /// The inbox offset just past the last message this listing read, counting messages that
+    /// were not payments or could not be read, since those stay in the inbox. Each message
+    /// acknowledged since moves the rest one place earlier, so subtract those, or list from 0.
+    public let nextOffset: Int
 
-    public init(payments: [MessageBoxIncomingPayment], truncated: Bool) {
-        self.payments = payments; self.truncated = truncated
+    public init(payments: [MessageBoxIncomingPayment], truncated: Bool, nextOffset: Int) {
+        self.payments = payments; self.truncated = truncated; self.nextOffset = nextOffset
     }
 }
 
-/// What ``MessageBoxClient/accept(_:wallet:)`` did.
+/// What ``MessageBoxClient/accept(_:wallet:beforeAcknowledge:)`` did.
 public struct MessageBoxAcceptedPayment: Sendable, Equatable {
     /// The payment as the server listed it at the time of acceptance.
     public let payment: MessageBoxIncomingPayment
     /// True when the message also carried a MessageBox recipient payment with wallet-payment
     /// outputs, and the wallet internalized it.
     public let recipientPaymentInternalized: Bool
-    /// False when the payment was internalized but the server did not confirm the message's
-    /// removal. The funds are in the wallet either way; a later acknowledge removes it.
+    /// False when the payment was internalized but the message was not removed: the server did
+    /// not confirm it, or the caller's `beforeAcknowledge` check threw. The funds are in the
+    /// wallet either way; a later acknowledge removes it.
     public let acknowledged: Bool
 }
 
@@ -87,22 +93,34 @@ extension MessageBoxClient {
     static let incomingPaymentPages = 10
 
     /// Payments waiting in this server's `payment_inbox`, as TS `listIncomingPayments` returns
-    /// them: at most 1,000 messages over at most 10 pages of 100, in the server's order, the first
-    /// of any repeated message ID kept. A message that cannot be read, opened or decoded as a
-    /// payment token is left out, not thrown. When the server still has more after those bounds,
-    /// TS throws; here the payments read so far are returned with `truncated` set, so messages
-    /// that cannot be read, which are never acknowledged, cannot hide every payment behind them.
-    public func incomingPayments() async throws -> MessageBoxPaymentListing {
+    /// them: at most 1,000 messages over at most 10 pages of 100, in the server's order (oldest
+    /// first), the first of any repeated message ID kept. A message that cannot be read, opened or
+    /// decoded as a payment token is left out, not thrown. When the server still has more after
+    /// those bounds, TS throws; here the payments read so far are returned with `truncated` set,
+    /// so messages that cannot be read, which are never acknowledged, cannot hide every payment
+    /// behind them.
+    ///
+    /// The listing starts at `offset` in the inbox. TS `listIncomingPayments` always starts at 0;
+    /// its `listMessages` takes the same `offset`. When a full window holds messages that stay in
+    /// the inbox, pass the listing's `nextOffset` to read the payments after them.
+    ///
+    /// `beforeOpening`, when given, runs before each message is decrypted with the wallet; if it
+    /// throws, the listing stops with that error. Use it to stop when the wallet locks.
+    public func incomingPayments(
+        offset: Int = 0, beforeOpening: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> MessageBoxPaymentListing {
         let listed = try await listRows(messageBox: Self.paymentInbox, pageSize: Self.incomingPaymentPageSize,
-            maxPages: Self.incomingPaymentPages, limit: Self.maximumIncomingPayments, skipMalformed: true)
+            maxPages: Self.incomingPaymentPages, limit: Self.maximumIncomingPayments, offset: offset,
+            skipMalformed: true)
         var seen = Set<String>()
         var payments: [MessageBoxIncomingPayment] = []
         for row in listed.rows {
             guard seen.insert(row.message.messageId).inserted else { continue }
             try Task.checkCancellation()
+            try await beforeOpening?()
             if let payment = await incomingPayment(row) { payments.append(payment) }
         }
-        return MessageBoxPaymentListing(payments: payments, truncated: listed.truncated)
+        return MessageBoxPaymentListing(payments: payments, truncated: listed.truncated, nextOffset: listed.nextOffset)
     }
 
     /// Accepts a listed payment, as TS `acceptPayment` does: the message is looked up again on the
@@ -116,11 +134,22 @@ extension MessageBoxClient {
     /// while listing; here it is internalized first, the same way, and the message is not
     /// acknowledged if that payment cannot be read or the wallet does not accept it, because the
     /// message holds the only copy of it.
-    public func accept(_ payment: MessageBoxIncomingPayment, wallet: RemoteWallet) async throws -> MessageBoxAcceptedPayment {
-        try await accept(payment, receiver: wallet)
+    ///
+    /// `beforeAcknowledge`, when given, runs after everything is internalized and right before
+    /// the acknowledgement. If it throws, the message is not acknowledged and the result reports
+    /// `acknowledged` false, because the funds are already in the wallet. Use it to keep the
+    /// message when the wallet locked while the payment was being accepted. TS has no such hook.
+    public func accept(
+        _ payment: MessageBoxIncomingPayment, wallet: RemoteWallet,
+        beforeAcknowledge: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> MessageBoxAcceptedPayment {
+        try await accept(payment, receiver: wallet, beforeAcknowledge: beforeAcknowledge)
     }
 
-    func accept(_ payment: MessageBoxIncomingPayment, receiver: some MessageBoxReceivingWallet) async throws -> MessageBoxAcceptedPayment {
+    func accept(
+        _ payment: MessageBoxIncomingPayment, receiver: some MessageBoxReceivingWallet,
+        beforeAcknowledge: (@Sendable () async throws -> Void)? = nil
+    ) async throws -> MessageBoxAcceptedPayment {
         let messageId = try MessageBoxIncomingPayment.boundedMessageID(payment.messageId)
         guard await activePayments.begin(messageId) else { throw MessageBoxPaymentError.alreadyProcessing }
         do {
@@ -128,7 +157,12 @@ extension MessageBoxClient {
             let recipientPaymentInternalized = try await Self.internalizeEnvelopePayment(envelopePayment, into: receiver)
             try await Self.internalize(incoming, into: receiver)
             var acknowledged = true
-            do { try await acknowledge(messageIds: [incoming.messageId]) } catch { acknowledged = false }
+            do {
+                try await beforeAcknowledge?()
+                try await acknowledge(messageIds: [incoming.messageId])
+            } catch {
+                acknowledged = false
+            }
             await activePayments.end(messageId)
             return MessageBoxAcceptedPayment(payment: incoming, recipientPaymentInternalized: recipientPaymentInternalized,
                 acknowledged: acknowledged)
@@ -163,8 +197,16 @@ extension MessageBoxClient {
     /// It does not acknowledge the message. A caller accepting such a message does this first,
     /// then whatever else the message carries, and acknowledges last. When this throws
     /// ``MessageBoxPaymentError/recipientPaymentFailed`` the payment could not be read or the
-    /// wallet did not take it: do not acknowledge, because the message holds the only copy of
-    /// that payment. ``accept(_:wallet:)`` does this step itself for PeerPay payments.
+    /// wallet did not take it; when it rethrows `CancellationError` the task was cancelled while
+    /// the wallet was internalizing, and the wallet may or may not have taken it. In either case
+    /// do not acknowledge, because the message holds the only copy of that payment; run the step
+    /// again later. ``accept(_:wallet:beforeAcknowledge:)`` does this step itself for PeerPay
+    /// payments.
+    ///
+    /// Unlike `accept`, this step has no in-flight guard: two calls for the same message both
+    /// ask the wallet to internalize. It relies on wallet storage merging a repeat internalize of
+    /// a transaction it already holds: TS storage takes the merge path, where a wallet payment to
+    /// an output it already manages is idempotent, so the payment is not counted twice.
     @discardableResult
     public func internalizeEnvelopePayment(of message: MessageBoxMessage, wallet: RemoteWallet) async throws -> Bool {
         try await internalizeEnvelopePayment(of: message, receiver: wallet)
