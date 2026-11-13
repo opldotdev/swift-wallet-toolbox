@@ -1,5 +1,6 @@
 import BSVCore
 import BSVTransaction
+import BSVWallet
 import ToolboxStorage
 
 /// A signed transaction, packaged for storage to broadcast.
@@ -101,13 +102,31 @@ public struct SignedAction: Sendable {
     /// What storage needs to finalise and send this: the reference and raw signed transaction.
     /// Without the transaction storage cannot commit or broadcast it, and the inputs
     /// it reserved stay reserved.
-    public func processRequest(sendWith: [String] = []) throws -> StorageProcessActionRequest {
+    ///
+    /// `isNoSend` and `isDelayed` decide what storage does with it. A `noSend` action must say so
+    /// here as well as at createAction: storage reads these flags, not the ones it was funded
+    /// under, so a `false` broadcasts a transaction the caller meant to hold for a later batch.
+    public func processRequest(
+        sendWith: [String] = [], isNoSend: Bool = false, isDelayed: Bool = false
+    ) throws -> StorageProcessActionRequest {
         StorageProcessActionRequest(
             reference: reference,
             isNewTx: true,
             isSendWith: !sendWith.isEmpty,
             rawTX: try transaction.serialized(limits: beefLimits.transactionLimits),
-            sendWith: sendWith
+            sendWith: sendWith,
+            isNoSend: isNoSend,
+            isDelayed: isDelayed
+        )
+    }
+
+    /// The process request for an action funded with these createAction options, with the
+    /// reference client's defaults: `noSend` false, `acceptDelayedBroadcast` true, `sendWith` empty.
+    public func processRequest(options: WalletCreateActionOptions?) throws -> StorageProcessActionRequest {
+        try processRequest(
+            sendWith: (options?.sendWith ?? []).map(\.displayHex),
+            isNoSend: options?.noSend ?? false,
+            isDelayed: options?.acceptDelayedBroadcast ?? true
         )
     }
 }
