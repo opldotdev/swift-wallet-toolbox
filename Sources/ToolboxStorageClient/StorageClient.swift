@@ -58,13 +58,35 @@ public actor StorageClient {
             "params": .array(params),
             "id": .number(Double(id)),
         ])
+        return try await send(method, id: id, body: Array(try JSONEncoder().encode(request)))
+    }
 
+    /// Issues one call whose parameters are written member for member as given.
+    ///
+    /// `call(_:_:)` encodes through a dictionary, which does not keep key order. That is fine for
+    /// every argument a server reads by name, and wrong for one it hashes: the action-batch
+    /// manifest's digest is recomputed by storage from the key order it receives. Parameters
+    /// passed here are written with `JSON.stringify`'s rules and in their own order.
+    public func call(_ method: String, rawParams params: [OrderedJSON]) async throws -> JSONValue {
+        let id = nextID
+        nextID += 1
+
+        let request = OrderedJSON.object([
+            .init("jsonrpc", .string("2.0")),
+            .init("method", .string(method)),
+            .init("params", .array(params)),
+            .init("id", .integer(Int64(id))),
+        ])
+        return try await send(method, id: id, body: request.utf8Bytes())
+    }
+
+    private func send(_ method: String, id: Int, body: [UInt8]) async throws -> JSONValue {
         let response = try await transport.send(
             method: "POST",
             path: endpoint.path.isEmpty ? "/" : endpoint.path,
             query: nil,
             headers: ["Content-Type": "application/json"],
-            body: Array(try JSONEncoder().encode(request))
+            body: body
         )
 
         let envelope: JSONValue
