@@ -3,6 +3,7 @@ import BSVCore
 import BSVKeys
 import BSVWallet
 import ToolboxAuth
+import ToolboxCore
 
 /// HTTP subset of @bsv/message-box-client for any box. The application chooses its server;
 /// messages are encrypted end-to-end and every request is mutually authenticated (BRC-103/104).
@@ -10,6 +11,9 @@ public struct MessageBoxClient: Sendable {
     private let wallet: ProtoWallet
     private let transport: any AuthenticatedTransport
     private let basePath: String
+    /// Payment messages this client is accepting now. Copies of a client share it, as one TS
+    /// `PeerPayClient` instance does.
+    let activePayments = MessageBoxActivePayments()
 
     public init(host: URL, wallet: ProtoWallet, transport: (any AuthenticatedTransport)? = nil) throws {
         let host = try MessageBoxHost.configured(host.absoluteString)
@@ -88,24 +92,55 @@ public struct MessageBoxClient: Sendable {
         guard object["status"] as? String == "success" else { throw MessageBoxError.rejected }
     }
 
-    /// Lists one box on this server, following `hasMore` pages as the TS client does. Bodies are
-    /// returned as stored; ``open(_:)`` decrypts an `encryptedMessage` body.
+    /// Lists one box on this server, following `hasMore` pages as the TS client does. A stored
+    /// `{"message": …, "payment": …}` envelope is unwrapped, as TS `listMessages` does: `body` is
+    /// the wrapped message and `payment` the payment record. ``open(_:)`` decrypts an
+    /// `encryptedMessage` body.
     public func listMessages(messageBox: String, pageSize: Int = 100, maxPages: Int = 100) async throws -> [MessageBoxMessage] {
+        try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages).map(\.message)
+    }
+
+    /// One listed row: the message, and its sender exactly as the server sent it.
+    struct ListedRow: Sendable {
+        let message: MessageBoxMessage
+        let rawSender: String
+    }
+
+    /// The paging loop behind every listing. `limit` caps the rows taken in total, as TS
+    /// `fetchMessagePages` does, and `messageId` asks the server for that one message. A row that
+    /// cannot be read fails the listing, or is left out with `skipMalformed`.
+    func listRows(
+        messageBox: String, pageSize: Int, maxPages: Int, limit: Int? = nil,
+        messageId: String? = nil, skipMalformed: Bool = false
+    ) async throws -> [ListedRow] {
         try Self.requireBoxName(messageBox)
-        guard pageSize > 0, maxPages > 0 else { throw MessageBoxError.invalidMessage }
-        var messages: [MessageBoxMessage] = []
+        guard pageSize > 0, maxPages > 0, limit.map({ $0 > 0 }) ?? true else { throw MessageBoxError.invalidMessage }
+        var rows: [ListedRow] = []
+        var received = 0
         var offset = 0
         for _ in 0..<maxPages {
-            let request = try JSONSerialization.data(withJSONObject: [
-                "messageBox": messageBox, "offset": offset, "limit": pageSize,
-            ] as [String: Any], options: [.sortedKeys])
+            let remaining = limit.map { $0 - received }
+            if let remaining, remaining <= 0 { return rows }
+            var fields: [String: Any] = [
+                "messageBox": messageBox, "offset": offset, "limit": min(pageSize, remaining ?? pageSize),
+            ]
+            if let messageId { fields["messageId"] = messageId }
+            let request = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
             let response = try await transport.send(method: "POST", path: path("listMessages"),
                 query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
             let object = try parse(response)
-            guard let rows = object["messages"] as? [[String: Any]] else { throw MessageBoxError.invalidResponse }
-            let page = try rows.map(MessageBoxMessage.init(row:))
-            messages.append(contentsOf: page)
-            guard object["hasMore"] as? Bool == true else { return messages }
+            guard let page = object["messages"] as? [Any] else { throw MessageBoxError.invalidResponse }
+            let taken = remaining.map { Array(page.prefix($0)) } ?? page
+            received += taken.count
+            for item in taken {
+                if let row = item as? [String: Any], let sender = row["sender"] as? String,
+                   let message = try? MessageBoxMessage(row: row) {
+                    rows.append(ListedRow(message: message, rawSender: sender))
+                } else if !skipMalformed {
+                    throw MessageBoxError.invalidResponse
+                }
+            }
+            guard object["hasMore"] as? Bool == true else { return rows }
             // Prefer the server's cursor when it moves forward; otherwise step by what we saw,
             // or by a full page when the page came back empty, so an empty page never stalls.
             if let next = Self.integer(object["nextOffset"]), next > offset {
@@ -202,8 +237,8 @@ public struct MessageBoxClient: Sendable {
     }
 }
 
-public struct MessageBoxPaymentToken: Codable, Sendable {
-    public struct Instructions: Codable, Sendable {
+public struct MessageBoxPaymentToken: Codable, Sendable, Equatable {
+    public struct Instructions: Codable, Sendable, Equatable {
         public let derivationPrefix: String
         public let derivationSuffix: String
     }
@@ -245,32 +280,63 @@ public struct MessageBoxEnvelope: Codable, Sendable, Equatable {
 }
 
 /// A message as `/listMessages` returns it. `sender` is the compressed identity key, hex.
+///
+/// When the server stored the message in a `{"message": …, "payment": …}` envelope, `body` is
+/// the wrapped message and `payment` the envelope's payment record, as TS `listMessages` returns
+/// them. Nothing here internalizes that payment: it stays on the message until the caller does.
 public struct MessageBoxMessage: Sendable, Equatable {
     public let messageId: String
     public let body: String
     public let sender: String
     public let createdAt: String?
+    public let payment: JSONValue?
 
-    public init(messageId: String, body: String, sender: String, createdAt: String? = nil) {
+    public init(messageId: String, body: String, sender: String, createdAt: String? = nil, payment: JSONValue? = nil) {
         self.messageId = messageId; self.body = body; self.sender = sender; self.createdAt = createdAt
+        self.payment = payment
     }
 
     init(row: [String: Any]) throws {
         guard let id = row["messageId"] as? String, !id.isEmpty,
               let sender = row["sender"] as? String,
               let key = try? Hex.decode(sender, maximumDecodedByteCount: 33), key.count == 33 else { throw MessageBoxError.invalidResponse }
-        let body: String
+        let stored: String
         if let text = row["body"] as? String {
-            body = text
+            stored = text
         } else if let object = row["body"], JSONSerialization.isValidJSONObject(object),
                   let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
             // Some servers return the stored JSON body parsed; keep it as text.
-            body = String(decoding: data, as: UTF8.self)
+            stored = String(decoding: data, as: UTF8.self)
         } else {
             throw MessageBoxError.invalidResponse
         }
+        let (body, payment) = Self.unwrap(stored)
         self.init(messageId: id, body: body, sender: sender.lowercased(),
-            createdAt: row["created_at"] as? String ?? row["createdAt"] as? String)
+            createdAt: row["created_at"] as? String ?? row["createdAt"] as? String, payment: payment)
+    }
+
+    /// TS `listMessages`: a body that parses to an object with its own `message` key is an
+    /// envelope. A string message is the body as it stands; a null message leaves the envelope as
+    /// the body; any other message is kept as JSON text. A payment that is not an object is
+    /// dropped and does not cost the message its body.
+    static func unwrap(_ stored: String) -> (body: String, payment: JSONValue?) {
+        guard let parsed = try? JSONSerialization.jsonObject(with: Data(stored.utf8), options: [.fragmentsAllowed]),
+              let envelope = parsed as? [String: Any], let wrapped = envelope["message"] else {
+            return (stored, nil)
+        }
+        var body = stored
+        if let text = wrapped as? String {
+            body = text
+        } else if !(wrapped is NSNull), let data = try? JSONSerialization.data(
+            withJSONObject: wrapped, options: [.sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes]) {
+            body = String(decoding: data, as: UTF8.self)
+        }
+        var payment: JSONValue?
+        if let record = envelope["payment"] as? [String: Any],
+           let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) {
+            payment = try? JSONDecoder().decode(JSONValue.self, from: data)
+        }
+        return (body, payment)
     }
 }
 
