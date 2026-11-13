@@ -149,6 +149,22 @@ final class CreateActionTests: XCTestCase {
         XCTAssertEqual(arguments["isDelayed"]?.boolValue, true)
     }
 
+    /// `trustSelf: 'known'` reaches storage, which then trims the BEEF it returns. Without it the
+    /// option was silently dropped and storage always sent the full proof chain.
+    func test_trustSelfIsSerializedOnlyWhenSet() throws {
+        let trusted = try WalletCreateActionRequest(
+            description: "trust what I hold",
+            outputs: [try WalletCreateActionOutput(
+                lockingScript: [0x76], satoshis: 1, outputDescription: "x"
+            )],
+            options: try WalletCreateActionOptions(trustSelf: .known)
+        )
+        XCTAssertEqual(try StorageClient.arguments(for: trusted)["options"]?["trustSelf"]?.stringValue, "known")
+
+        let plain = try StorageClient.arguments(for: try payment())
+        XCTAssertNil(plain["options"]?["trustSelf"])
+    }
+
     func test_callerInputsAreSerialized() throws {
         let outpoint = "8ac7230489e80000000000000000000000000000000000000000000000000001.2"
         let request = try WalletCreateActionRequest(
