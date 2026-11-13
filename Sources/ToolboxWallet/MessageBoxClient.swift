@@ -97,12 +97,17 @@ public struct MessageBoxClient: Sendable {
     /// the wrapped message and `payment` the payment record. ``open(_:)`` decrypts an
     /// `encryptedMessage` body.
     ///
-    /// The listing stops after `maxPages` pages. When the server still reports more, the messages
-    /// read so far are returned with `truncated` set; acknowledging them lets the next listing
-    /// reach the rest.
-    public func listMessages(messageBox: String, pageSize: Int = 100, maxPages: Int = 100) async throws -> MessageBoxListing {
-        let listed = try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages)
-        return MessageBoxListing(messages: listed.rows.map(\.message), truncated: listed.truncated)
+    /// The listing starts at `offset` (TS `offset`/`skip`; the server lists oldest first) and
+    /// stops after `maxPages` pages. When the server still reports more, the messages read so far
+    /// are returned with `truncated` set. Acknowledging them lets the next listing reach the rest;
+    /// messages left on the server are passed over by listing again from the listing's
+    /// `nextOffset`.
+    public func listMessages(
+        messageBox: String, pageSize: Int = 100, maxPages: Int = 100, offset: Int = 0
+    ) async throws -> MessageBoxListing {
+        let listed = try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages, offset: offset)
+        return MessageBoxListing(messages: listed.rows.map(\.message), truncated: listed.truncated,
+            nextOffset: listed.nextOffset)
     }
 
     /// One listed row: the message, and its sender exactly as the server sent it.
@@ -120,15 +125,21 @@ public struct MessageBoxClient: Sendable {
     /// are returned with `truncated` set, because rows that cannot be read are never acknowledged
     /// and would otherwise block the listing for good. `truncated` is also set when `limit` cut
     /// rows out of a page or the server has more after the limit.
+    ///
+    /// The first page is asked for at `offset`, as TS `fetchMessagePages` starts at its
+    /// `offset`/`skip`. `nextOffset` is the server offset just past the last row taken (a row that
+    /// could not be read counts, since it is still on the server), so a caller that leaves the
+    /// rows on the server can list on from there.
     func listRows(
-        messageBox: String, pageSize: Int, maxPages: Int, limit: Int? = nil,
+        messageBox: String, pageSize: Int, maxPages: Int, limit: Int? = nil, offset start: Int = 0,
         messageId: String? = nil, skipMalformed: Bool = false
-    ) async throws -> (rows: [ListedRow], truncated: Bool) {
+    ) async throws -> (rows: [ListedRow], truncated: Bool, nextOffset: Int) {
         try Self.requireBoxName(messageBox)
-        guard pageSize > 0, maxPages > 0, limit.map({ $0 > 0 }) ?? true else { throw MessageBoxError.invalidMessage }
+        guard pageSize > 0, maxPages > 0, limit.map({ $0 > 0 }) ?? true,
+              start >= 0, Int64(start) <= Self.maximumListOffset else { throw MessageBoxError.invalidMessage }
         var rows: [ListedRow] = []
         var received = 0
-        var offset = 0
+        var offset = start
         for _ in 0..<maxPages {
             let remaining = limit.map { $0 - received }
             var fields: [String: Any] = [
@@ -153,7 +164,7 @@ public struct MessageBoxClient: Sendable {
             let hasMore = object["hasMore"] as? Bool == true
             let cut = taken.count < page.count
             let full = limit.map { received >= $0 } ?? false
-            if !hasMore || cut || full { return (rows, hasMore || cut) }
+            if !hasMore || cut || full { return (rows, hasMore || cut, offset + taken.count) }
             // Prefer the server's cursor when it moves forward; otherwise step by what we saw,
             // or by a full page when the page came back empty, so an empty page never stalls.
             if let next = Self.integer(object["nextOffset"]), next > offset {
@@ -162,8 +173,11 @@ public struct MessageBoxClient: Sendable {
                 offset += page.isEmpty ? pageSize : page.count
             }
         }
-        return (rows, true)
+        return (rows, true, offset)
     }
+
+    /// `Number.MAX_SAFE_INTEGER`, the largest offset TS sends.
+    static let maximumListOffset: Int64 = 9_007_199_254_740_991
 
     /// Removes delivered messages from this server. Only acknowledge a message once whatever it
     /// carried has been made durable: the server deletes it.
@@ -360,13 +374,17 @@ public struct MessageBoxMessage: Sendable, Equatable {
 
 /// One listing of a box. `truncated` is true when the server has more than was read: the page
 /// cap or the row limit was reached while it still reported more. Acknowledge what was handled
-/// and list again to read the rest.
+/// and list again to read the rest, or list from `nextOffset` to read past messages left there.
 public struct MessageBoxListing: Sendable, Equatable {
     public let messages: [MessageBoxMessage]
     public let truncated: Bool
+    /// The server offset just past the last message this listing read. Listing again from it
+    /// reads on from there while the messages before it stay on the server; each message
+    /// acknowledged since moves the rest one place earlier, so subtract those, or list from 0.
+    public let nextOffset: Int
 
-    public init(messages: [MessageBoxMessage], truncated: Bool) {
-        self.messages = messages; self.truncated = truncated
+    public init(messages: [MessageBoxMessage], truncated: Bool, nextOffset: Int) {
+        self.messages = messages; self.truncated = truncated; self.nextOffset = nextOffset
     }
 }
 

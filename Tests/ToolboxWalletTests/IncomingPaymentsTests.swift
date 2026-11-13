@@ -9,6 +9,7 @@ import ToolboxAuth
 import ToolboxBRC29
 import ToolboxCore
 import ToolboxStorage
+import ToolboxStorageClient
 @testable import ToolboxWallet
 
 /// The order things happen in, across the wallet and the server.
@@ -70,6 +71,15 @@ private struct StubReceiver: MessageBoxReceivingWallet {
         case .fails: throw URLError(.cannotConnectToHost)
         }
     }
+}
+
+/// What a caller's wallet-lock check throws.
+private struct WalletLocked: Error {}
+
+/// Counts calls to a caller's check.
+private actor CallCounter {
+    var count = 0
+    func increment() -> Int { count += 1; return count }
 }
 
 /// A token decode vector produced by the TS `paymentFromMessage` (live ts-stack source), fed the
@@ -173,7 +183,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         let lenient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)),
             transport: LoggingTransport(log: EventLog(), [(200, try listing([["messageId": "a", "sender": sender, "body": body]]))]))
         let payments = try await lenient.incomingPayments()
-        XCTAssertEqual(payments, MessageBoxPaymentListing(payments: [], truncated: false))
+        XCTAssertEqual(payments, MessageBoxPaymentListing(payments: [], truncated: false, nextOffset: 1))
     }
 
     func test_incomingPaymentsReadPlainAndWrappedBodiesAndSkipTheRest() async throws {
@@ -228,8 +238,9 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         let listed = try await client.incomingPayments()
         XCTAssertEqual(listed.payments.count, 1_000)
         XCTAssertEqual(listed.payments.last?.messageId, "m999")
-        // The row the limit cut is still on the server.
+        // The row the limit cut is still on the server, and the next listing can start at it.
         XCTAssertTrue(listed.truncated)
+        XCTAssertEqual(listed.nextOffset, 1_000)
     }
 
     func test_incomingPaymentsStopAtTenPagesAsTruncated() async throws {
@@ -237,7 +248,7 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         let transport = LoggingTransport(log: EventLog(), Array(repeating: (status: 200, body: page), count: 10))
         let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)), transport: transport)
         let listed = try await client.incomingPayments()
-        XCTAssertEqual(listed, MessageBoxPaymentListing(payments: [], truncated: true))
+        XCTAssertEqual(listed, MessageBoxPaymentListing(payments: [], truncated: true, nextOffset: 1_000))
         let count = await transport.requests.count
         XCTAssertEqual(count, 10)
     }
@@ -268,6 +279,103 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(offsets, (0..<10).map { Optional($0 * 100) })
         let limits = try requests.map { try json($0.body)["limit"] as? Int }
         XCTAssertEqual(limits, Array(repeating: Optional(100), count: 10))
+        XCTAssertEqual(listed.nextOffset, 1_000)
+    }
+
+    private func plainToken() throws -> String {
+        String(decoding: try JSONEncoder().encode(MessageBoxPaymentToken(derivationPrefix: prefix,
+            derivationSuffix: suffix, transaction: [1], amount: 5, outputIndex: 0)), as: UTF8.self)
+    }
+
+    func test_exactlyOneThousandMessagesWithNothingMoreAreNotTruncated() async throws {
+        let sender = try key(2)
+        let plain = try plainToken()
+        // Ten full pages of 100; the last says there is nothing more.
+        let pages: [(status: Int, body: String)] = try (0..<10).map { page -> (status: Int, body: String) in
+            let rows: [[String: Any]] = (0..<100).map {
+                ["messageId": "m\(page * 100 + $0)", "sender": hex(sender), "body": plain]
+            }
+            return (200, try listing(rows, hasMore: page < 9))
+        }
+        let transport = LoggingTransport(log: EventLog(), pages)
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let listed = try await client.incomingPayments()
+        XCTAssertFalse(listed.truncated)
+        XCTAssertEqual(listed.payments.count, 1_000)
+        XCTAssertEqual(listed.nextOffset, 1_000)
+        let count = await transport.requests.count
+        XCTAssertEqual(count, 10)
+
+        // The same thousand from a server that ignores the page size.
+        let all: [[String: Any]] = (0..<1_000).map { ["messageId": "m\($0)", "sender": hex(sender), "body": plain] }
+        let whole = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)),
+            transport: LoggingTransport(log: EventLog(), [(200, try listing(all))]))
+        let once = try await whole.incomingPayments()
+        XCTAssertFalse(once.truncated)
+        XCTAssertEqual(once.payments.count, 1_000)
+    }
+
+    func test_aFullWindowOfUnreadableRowsCanBeListedPast() async throws {
+        let sender = try key(2)
+        let plain = try plainToken()
+        // The inbox opens with a thousand rows that are never payments, so never acknowledged;
+        // the payment behind them is only reachable by listing on from where the window ended.
+        var responses: [(status: Int, body: String)] = try (0..<10).map { page -> (status: Int, body: String) in
+            let junk: [Any] = (0..<100).map { "junk \(page * 100 + $0)" }
+            return (200, try listing(junk, hasMore: true))
+        }
+        responses.append((200, try listing([["messageId": "late", "sender": hex(sender), "body": plain]])))
+        let transport = LoggingTransport(log: EventLog(), responses)
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+
+        let first = try await client.incomingPayments()
+        XCTAssertEqual(first, MessageBoxPaymentListing(payments: [], truncated: true, nextOffset: 1_000))
+        let next = try await client.incomingPayments(offset: first.nextOffset)
+        XCTAssertEqual(next.payments.map(\.messageId), ["late"])
+        XCTAssertFalse(next.truncated)
+        XCTAssertEqual(next.nextOffset, 1_001)
+
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 11)
+        let last = try json(requests[10].body)
+        XCTAssertEqual(last["offset"] as? Int, 1_000)
+        XCTAssertEqual(last["limit"] as? Int, 100)
+        XCTAssertEqual(last["messageBox"] as? String, "payment_inbox")
+    }
+
+    func test_aNegativeIncomingPaymentOffsetIsRefusedBeforeAnyRequest() async throws {
+        let transport = LoggingTransport(log: EventLog(), [])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        do { _ = try await client.incomingPayments(offset: -1); XCTFail("negative offset") }
+        catch MessageBoxError.invalidMessage {}
+        let count = await transport.requests.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func test_theBeforeOpeningCheckRunsForEachMessageAndCanStopTheListing() async throws {
+        let sender = try key(2)
+        let plain = try plainToken()
+        let rows: [[String: Any]] = ["a", "a", "b", "c"].map { ["messageId": $0, "sender": hex(sender), "body": plain] }
+        let counter = CallCounter()
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)),
+            transport: LoggingTransport(log: EventLog(), [(200, try listing(rows))]))
+        let listed = try await client.incomingPayments(beforeOpening: { _ = await counter.increment() })
+        XCTAssertEqual(listed.payments.map(\.messageId), ["a", "b", "c"])
+        // Once for each distinct message.
+        let calls = await counter.count
+        XCTAssertEqual(calls, 3)
+
+        let stopping = CallCounter()
+        let locking = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: key(1)),
+            transport: LoggingTransport(log: EventLog(), [(200, try listing(rows))]))
+        do {
+            _ = try await locking.incomingPayments(beforeOpening: {
+                if await stopping.increment() == 2 { throw WalletLocked() }
+            })
+            XCTFail("the check must stop the listing")
+        } catch is WalletLocked {}
+        let stoppedAt = await stopping.count
+        XCTAssertEqual(stoppedAt, 2)
     }
 
     func test_incomingPaymentsUnderTheLimitAreNotTruncated() async throws {
@@ -503,6 +611,52 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(fee.outputs.map(\.outputIndex), [0])
     }
 
+    func test_theEnvelopeStepTwiceAsksTheWalletTwice() async throws {
+        // There is no in-flight guard here; wallet storage merges the repeat.
+        let log = EventLog()
+        let (message, client) = try await listedMessage(
+            body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: log)
+        let receiver = StubReceiver(keys: ProtoWallet(rootKey: try key(1)), log: log)
+        let first = try await client.internalizeEnvelopePayment(of: message, receiver: receiver)
+        let second = try await client.internalizeEnvelopePayment(of: message, receiver: receiver)
+        XCTAssertTrue(first)
+        XCTAssertTrue(second)
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "internalizeAction", "internalizeAction"])
+        let requests = await log.internalized
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.first, requests.last)
+    }
+
+    func test_theEnvelopeStepThenAcceptOnTheSameMessage() async throws {
+        let f = try await fixture(envelope: try recipientPayment())
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [
+            (200, try listing([f.row])), (200, try listing([f.row])), (200, #"{"status":"success"}"#),
+        ])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        let messages = try await client.listMessages(messageBox: MessageBoxClient.paymentInbox).messages
+        let message = try XCTUnwrap(messages.first)
+        let receiver = StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log)
+        let stepped = try await client.internalizeEnvelopePayment(of: message, receiver: receiver)
+        XCTAssertTrue(stepped)
+
+        // Accept looks the message up again and internalizes the envelope payment again before
+        // the token; the repeat is the storage merge the step relies on.
+        let result = try await client.accept(f.payment, receiver: receiver)
+        XCTAssertTrue(result.recipientPaymentInternalized)
+        XCTAssertTrue(result.acknowledged)
+        let events = await log.events
+        XCTAssertEqual(events, [
+            "listMessages", "internalizeAction",
+            "listMessages", "internalizeAction", "getPublicKey", "internalizeAction", "acknowledgeMessage",
+        ])
+        let internalized = await log.internalized
+        XCTAssertEqual(internalized.count, 3)
+        XCTAssertEqual(internalized[0], internalized[1])
+        XCTAssertEqual(internalized[2].labels, ["peerpay"])
+    }
+
     func test_aFailedEnvelopePaymentLeavesTheMessageUnacknowledged() async throws {
         let cases: [(envelope: [String: Any], outcome: StubReceiver.Outcome, events: [String])] = [
             (try recipientPayment(), .refused, ["listMessages", "internalizeAction"]),
@@ -554,6 +708,128 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         } catch MessageBoxPaymentError.notInInbox {}
         let events = await log.events
         XCTAssertEqual(events, ["listMessages"])
+    }
+
+    func test_aLookupThatReturnsMoreThanTwoRowsIsNotAccepted() async throws {
+        // A server that ignores the lookup's limit of two: the third row is cut, so the lookup
+        // cannot show the message is there exactly once, even though it matches only once.
+        let f = try await fixture()
+        var second = f.row, third = f.row
+        second["messageId"] = "p2"; third["messageId"] = "p3"
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row, second, third]))])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        do {
+            _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log))
+            XCTFail("a cut lookup cannot show the message is there once")
+        } catch MessageBoxPaymentError.notInInbox {}
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages"])
+    }
+
+    func test_theBeforeAcknowledgeCheckRunsRightBeforeTheAcknowledgement() async throws {
+        let f = try await fixture()
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row])), (200, #"{"status":"success"}"#)])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        let result = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log),
+            beforeAcknowledge: { await log.add("beforeAcknowledge") })
+        XCTAssertTrue(result.acknowledged)
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction", "beforeAcknowledge", "acknowledgeMessage"])
+    }
+
+    func test_aBeforeAcknowledgeCheckThatThrowsKeepsTheMessage() async throws {
+        let f = try await fixture(envelope: try recipientPayment())
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [
+            (200, try listing([f.row])), (200, try listing([f.row])), (200, #"{"status":"success"}"#),
+        ])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        let result = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log),
+            beforeAcknowledge: { await log.add("beforeAcknowledge"); throw WalletLocked() })
+        // The funds are in the wallet, so this is a result, not an error; the message stays.
+        XCTAssertFalse(result.acknowledged)
+        XCTAssertTrue(result.recipientPaymentInternalized)
+        XCTAssertEqual(result.payment, f.payment)
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "internalizeAction", "getPublicKey", "internalizeAction", "beforeAcknowledge"])
+        let paths = await transport.requests.map(\.path)
+        XCTAssertEqual(paths, ["/listMessages"])
+
+        // The message is no longer in flight, so accepting it again once the wallet is unlocked
+        // runs to the acknowledgement.
+        let again = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log))
+        XCTAssertTrue(again.acknowledged)
+        let retried = await transport.requests.map(\.path)
+        XCTAssertEqual(retried, ["/listMessages", "/listMessages", "/acknowledgeMessage"])
+    }
+
+    func test_theBeforeAcknowledgeCheckDoesNotRunWhenTheSettlementFails() async throws {
+        let f = try await fixture(satoshis: 1_000, claimed: 999)
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row]))])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        do {
+            _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver), log: log),
+                beforeAcknowledge: { await log.add("beforeAcknowledge") })
+            XCTFail("must be refused")
+        } catch MessageBoxPaymentError.settlementFailed {}
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "getPublicKey"])
+    }
+
+    // MARK: - The RemoteWallet overloads
+
+    /// A RemoteWallet whose storage is never reached: every case here is refused by the wallet's
+    /// own BRC-29 ownership check, or by the settlement check, before storage is called.
+    private func remoteWallet(root: PrivateKey) throws -> RemoteWallet {
+        let storage = try RemoteStorage.client(at: XCTUnwrap(URL(string: "https://storage.invalid")),
+            wallet: ProtoWallet(rootKey: root))
+        return RemoteWallet(storage: storage, identityKey: root, auth: AuthID(identityKey: hex(root)))
+    }
+
+    func test_acceptWithARemoteWalletChecksTheSettlementAndAcknowledgesNothing() async throws {
+        let stranger = try key(9)
+        let f = try await fixture(payTo: stranger.publicKey)
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row]))])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        do {
+            _ = try await client.accept(f.payment, wallet: remoteWallet(root: f.receiver))
+            XCTFail("a payment to another key must be refused")
+        } catch MessageBoxPaymentError.settlementFailed {}
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages"])
+    }
+
+    func test_anEnvelopePaymentARemoteWalletDoesNotOwnIsRefused() async throws {
+        // The envelope pays key 1; this wallet is key 5, so its own ownership check refuses it.
+        let other = try key(5)
+        let log = EventLog()
+        let (message, client) = try await listedMessage(
+            body: ["message": "paymail", "payment": try recipientPayment()] as [String: Any], log: log)
+        do {
+            try await client.internalizeEnvelopePayment(of: message, wallet: remoteWallet(root: other))
+            XCTFail("an output this wallet does not own must be refused")
+        } catch MessageBoxPaymentError.recipientPaymentFailed {}
+
+        // Accepting through the RemoteWallet overload stops at the same step.
+        let f = try await fixture(envelope: try recipientPayment())
+        let acceptLog = EventLog()
+        let acceptClient = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver),
+            transport: LoggingTransport(log: acceptLog, [(200, try listing([f.row]))]))
+        do {
+            _ = try await acceptClient.accept(f.payment, wallet: remoteWallet(root: other))
+            XCTFail("must not be acknowledged")
+        } catch MessageBoxPaymentError.recipientPaymentFailed {}
+        let events = await acceptLog.events
+        XCTAssertEqual(events, ["listMessages"])
+
+        // A message with no envelope payment asks nothing of the wallet.
+        let (plain, plainClient) = try await listedMessage(body: "plain", log: EventLog())
+        let internalized = try await plainClient.internalizeEnvelopePayment(of: plain, wallet: remoteWallet(root: other))
+        XCTAssertFalse(internalized)
     }
 
     func test_aFailedAcknowledgementIsNotAnError() async throws {
