@@ -21,6 +21,18 @@ public struct MessageBoxIncomingPayment: Sendable, Equatable {
     }
 }
 
+/// The payments one ``MessageBoxClient/incomingPayments()`` call read. `truncated` is true when
+/// the inbox holds more messages than one listing reads (TS: 1,000 over 10 pages); accept or
+/// acknowledge these and list again for the rest.
+public struct MessageBoxPaymentListing: Sendable, Equatable {
+    public let payments: [MessageBoxIncomingPayment]
+    public let truncated: Bool
+
+    public init(payments: [MessageBoxIncomingPayment], truncated: Bool) {
+        self.payments = payments; self.truncated = truncated
+    }
+}
+
 /// What ``MessageBoxClient/accept(_:wallet:)`` did.
 public struct MessageBoxAcceptedPayment: Sendable, Equatable {
     /// The payment as the server listed it at the time of acceptance.
@@ -77,18 +89,20 @@ extension MessageBoxClient {
     /// Payments waiting in this server's `payment_inbox`, as TS `listIncomingPayments` returns
     /// them: at most 1,000 messages over at most 10 pages of 100, in the server's order, the first
     /// of any repeated message ID kept. A message that cannot be read, opened or decoded as a
-    /// payment token is left out, not thrown.
-    public func incomingPayments() async throws -> [MessageBoxIncomingPayment] {
-        let rows = try await listRows(messageBox: Self.paymentInbox, pageSize: Self.incomingPaymentPageSize,
+    /// payment token is left out, not thrown. When the server still has more after those bounds,
+    /// TS throws; here the payments read so far are returned with `truncated` set, so messages
+    /// that cannot be read, which are never acknowledged, cannot hide every payment behind them.
+    public func incomingPayments() async throws -> MessageBoxPaymentListing {
+        let listed = try await listRows(messageBox: Self.paymentInbox, pageSize: Self.incomingPaymentPageSize,
             maxPages: Self.incomingPaymentPages, limit: Self.maximumIncomingPayments, skipMalformed: true)
         var seen = Set<String>()
         var payments: [MessageBoxIncomingPayment] = []
-        for row in rows {
+        for row in listed.rows {
             guard seen.insert(row.message.messageId).inserted else { continue }
             try Task.checkCancellation()
             if let payment = await incomingPayment(row) { payments.append(payment) }
         }
-        return payments
+        return MessageBoxPaymentListing(payments: payments, truncated: listed.truncated)
     }
 
     /// Accepts a listed payment, as TS `acceptPayment` does: the message is looked up again on the
@@ -111,11 +125,7 @@ extension MessageBoxClient {
         guard await activePayments.begin(messageId) else { throw MessageBoxPaymentError.alreadyProcessing }
         do {
             let (incoming, envelopePayment) = try await freshIncomingPayment(messageId)
-            var recipientPaymentInternalized = false
-            if let request = try Self.recipientPaymentRequest(envelopePayment) {
-                try await Self.internalizeRecipientPayment(request, into: receiver)
-                recipientPaymentInternalized = true
-            }
+            let recipientPaymentInternalized = try await Self.internalizeEnvelopePayment(envelopePayment, into: receiver)
             try await Self.internalize(incoming, into: receiver)
             var acknowledged = true
             do { try await acknowledge(messageIds: [incoming.messageId]) } catch { acknowledged = false }
@@ -129,16 +139,49 @@ extension MessageBoxClient {
     }
 
     /// TS `findIncomingPaymentsByMessageId`: one page of at most two, asked for by message ID.
-    /// Returns the payment and the envelope payment the message carries, if any.
+    /// Returns the payment and the envelope payment the message carries, if any. A lookup the
+    /// server reports as having more cannot show the message is there exactly once, so it is
+    /// refused, as TS refuses it when its one page still has more.
     private func freshIncomingPayment(_ messageId: String) async throws -> (MessageBoxIncomingPayment, JSONValue?) {
-        let rows = try await listRows(messageBox: Self.paymentInbox, pageSize: 2, maxPages: 1, limit: 2,
+        let listed = try await listRows(messageBox: Self.paymentInbox, pageSize: 2, maxPages: 1, limit: 2,
             messageId: messageId, skipMalformed: true)
+        guard !listed.truncated else { throw MessageBoxPaymentError.notInInbox }
         var matches: [(MessageBoxIncomingPayment, JSONValue?)] = []
-        for row in rows where row.message.messageId == messageId {
+        for row in listed.rows where row.message.messageId == messageId {
             if let payment = await incomingPayment(row) { matches.append((payment, row.message.payment)) }
         }
         guard matches.count == 1 else { throw MessageBoxPaymentError.notInInbox }
         return matches[0]
+    }
+
+    /// Internalizes the payment a listed message's `{"message", "payment"}` envelope carried, as
+    /// TS `listMessages` does through `internalizeRecipientPayment`: its wallet-payment outputs
+    /// go into `wallet`. Returns true when it did; false when the message carried no payment, or
+    /// one with no wallet-payment outputs (TS `no-wallet-outputs`), and nothing was asked of the
+    /// wallet.
+    ///
+    /// It does not acknowledge the message. A caller accepting such a message does this first,
+    /// then whatever else the message carries, and acknowledges last. When this throws
+    /// ``MessageBoxPaymentError/recipientPaymentFailed`` the payment could not be read or the
+    /// wallet did not take it: do not acknowledge, because the message holds the only copy of
+    /// that payment. ``accept(_:wallet:)`` does this step itself for PeerPay payments.
+    @discardableResult
+    public func internalizeEnvelopePayment(of message: MessageBoxMessage, wallet: RemoteWallet) async throws -> Bool {
+        try await internalizeEnvelopePayment(of: message, receiver: wallet)
+    }
+
+    @discardableResult
+    func internalizeEnvelopePayment(of message: MessageBoxMessage, receiver: some MessageBoxReceivingWallet) async throws -> Bool {
+        try await Self.internalizeEnvelopePayment(message.payment, into: receiver)
+    }
+
+    /// The envelope step behind ``internalizeEnvelopePayment(of:wallet:)`` and `accept`.
+    static func internalizeEnvelopePayment(
+        _ payment: JSONValue?, into wallet: some MessageBoxReceivingWallet
+    ) async throws -> Bool {
+        guard let request = try recipientPaymentRequest(payment) else { return false }
+        try await internalizeRecipientPayment(request, into: wallet)
+        return true
     }
 
     /// TS `snapshotIncomingPayment`: the envelope payment as an internalize request for its

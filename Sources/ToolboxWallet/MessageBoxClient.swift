@@ -96,8 +96,13 @@ public struct MessageBoxClient: Sendable {
     /// `{"message": …, "payment": …}` envelope is unwrapped, as TS `listMessages` does: `body` is
     /// the wrapped message and `payment` the payment record. ``open(_:)`` decrypts an
     /// `encryptedMessage` body.
-    public func listMessages(messageBox: String, pageSize: Int = 100, maxPages: Int = 100) async throws -> [MessageBoxMessage] {
-        try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages).map(\.message)
+    ///
+    /// The listing stops after `maxPages` pages. When the server still reports more, the messages
+    /// read so far are returned with `truncated` set; acknowledging them lets the next listing
+    /// reach the rest.
+    public func listMessages(messageBox: String, pageSize: Int = 100, maxPages: Int = 100) async throws -> MessageBoxListing {
+        let listed = try await listRows(messageBox: messageBox, pageSize: pageSize, maxPages: maxPages)
+        return MessageBoxListing(messages: listed.rows.map(\.message), truncated: listed.truncated)
     }
 
     /// One listed row: the message, and its sender exactly as the server sent it.
@@ -109,10 +114,16 @@ public struct MessageBoxClient: Sendable {
     /// The paging loop behind every listing. `limit` caps the rows taken in total, as TS
     /// `fetchMessagePages` does, and `messageId` asks the server for that one message. A row that
     /// cannot be read fails the listing, or is left out with `skipMalformed`.
+    ///
+    /// It stops at the first of: a page without `hasMore`, `limit` rows taken, or `maxPages`
+    /// pages read. TS throws when the last allowed page still has more; here the rows read so far
+    /// are returned with `truncated` set, because rows that cannot be read are never acknowledged
+    /// and would otherwise block the listing for good. `truncated` is also set when `limit` cut
+    /// rows out of a page or the server has more after the limit.
     func listRows(
         messageBox: String, pageSize: Int, maxPages: Int, limit: Int? = nil,
         messageId: String? = nil, skipMalformed: Bool = false
-    ) async throws -> [ListedRow] {
+    ) async throws -> (rows: [ListedRow], truncated: Bool) {
         try Self.requireBoxName(messageBox)
         guard pageSize > 0, maxPages > 0, limit.map({ $0 > 0 }) ?? true else { throw MessageBoxError.invalidMessage }
         var rows: [ListedRow] = []
@@ -120,7 +131,6 @@ public struct MessageBoxClient: Sendable {
         var offset = 0
         for _ in 0..<maxPages {
             let remaining = limit.map { $0 - received }
-            if let remaining, remaining <= 0 { return rows }
             var fields: [String: Any] = [
                 "messageBox": messageBox, "offset": offset, "limit": min(pageSize, remaining ?? pageSize),
             ]
@@ -140,7 +150,10 @@ public struct MessageBoxClient: Sendable {
                     throw MessageBoxError.invalidResponse
                 }
             }
-            guard object["hasMore"] as? Bool == true else { return rows }
+            let hasMore = object["hasMore"] as? Bool == true
+            let cut = taken.count < page.count
+            let full = limit.map { received >= $0 } ?? false
+            if !hasMore || cut || full { return (rows, hasMore || cut) }
             // Prefer the server's cursor when it moves forward; otherwise step by what we saw,
             // or by a full page when the page came back empty, so an empty page never stalls.
             if let next = Self.integer(object["nextOffset"]), next > offset {
@@ -149,7 +162,7 @@ public struct MessageBoxClient: Sendable {
                 offset += page.isEmpty ? pageSize : page.count
             }
         }
-        throw MessageBoxError.tooManyPages
+        return (rows, true)
     }
 
     /// Removes delivered messages from this server. Only acknowledge a message once whatever it
@@ -284,8 +297,9 @@ public struct MessageBoxEnvelope: Codable, Sendable, Equatable {
 /// When the server stored the message in a `{"message": …, "payment": …}` envelope, `body` is
 /// the wrapped message and `payment` the envelope's payment record, as TS `listMessages` returns
 /// them. Listing does not internalize that payment; ``MessageBoxClient/accept(_:wallet:)`` does,
-/// before it acknowledges the message. A row whose envelope payment is not an object cannot be
-/// read, as in TS `listMessages`.
+/// before it acknowledges the message, and ``MessageBoxClient/internalizeEnvelopePayment(of:wallet:)``
+/// does it for any other message. A row whose envelope payment is not an object cannot be read,
+/// as in TS `listMessages`.
 public struct MessageBoxMessage: Sendable, Equatable {
     public let messageId: String
     public let body: String
@@ -344,8 +358,20 @@ public struct MessageBoxMessage: Sendable, Equatable {
     }
 }
 
+/// One listing of a box. `truncated` is true when the server has more than was read: the page
+/// cap or the row limit was reached while it still reported more. Acknowledge what was handled
+/// and list again to read the rest.
+public struct MessageBoxListing: Sendable, Equatable {
+    public let messages: [MessageBoxMessage]
+    public let truncated: Bool
+
+    public init(messages: [MessageBoxMessage], truncated: Bool) {
+        self.messages = messages; self.truncated = truncated
+    }
+}
+
 public enum MessageBoxError: Error, LocalizedError, Sendable {
-    case invalidHost, invalidResponse, blocked, deliveryFeeRequired, rejected, invalidMessage, tooManyPages
+    case invalidHost, invalidResponse, blocked, deliveryFeeRequired, rejected, invalidMessage
     case httpStatus(Int)
     public var errorDescription: String? {
         switch self {
@@ -355,7 +381,6 @@ public enum MessageBoxError: Error, LocalizedError, Sendable {
         case .deliveryFeeRequired: "This MessageBox requires a delivery fee. No payment was created."
         case .rejected: "The MessageBox server did not accept the delivery."
         case .invalidMessage: "The message, box name or message ID is not valid for MessageBox."
-        case .tooManyPages: "The MessageBox listing has more pages than allowed; acknowledge messages first."
         case .httpStatus(let status): "The MessageBox server returned HTTP \(status)."
         }
     }
