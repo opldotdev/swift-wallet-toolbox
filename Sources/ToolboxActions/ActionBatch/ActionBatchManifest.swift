@@ -104,11 +104,13 @@ struct StagedAction: Sendable {
     let txid: String
     let rawTx: [UInt8]
     let inputSourceTxids: [String]
+    /// Decided when the action was planned; see `ActionBatchController.process`.
+    let isNoSend: Bool
     /// The format-2 action object without `rawTx`, in the reference's member order.
     let json: OrderedJSON
 
     /// `ActionBatchWorkspace.stage` for a format-2 workspace.
-    init(planned: PlannedAction, transaction: Transaction, isNoSend: Bool, isDelayed: Bool) throws {
+    init(planned: PlannedAction, transaction: Transaction, isDelayed: Bool) throws {
         let limits = WalletTransactionLimits.standard
         let txid = try transaction.transactionID(limits: limits).displayHex
         // Storage checks these at commit; checking here keeps a mismatched signature from being
@@ -138,7 +140,7 @@ struct StagedAction: Sendable {
         let metadata = OrderedJSON.record([
             "description": .string(request.description),
             "labels": .strings(request.labels ?? []),
-            "isNoSend": .bool(isNoSend),
+            "isNoSend": .bool(planned.isNoSend),
             "isDelayed": .bool(isDelayed),
             "inputs": .array((request.inputs ?? []).map { ActionBatchWire.input($0) }),
             "outputs": .array((request.outputs ?? []).map { ActionBatchWire.output($0, lockingScript: "") }),
@@ -147,6 +149,7 @@ struct StagedAction: Sendable {
         self.txid = txid
         self.rawTx = rawTx
         self.inputSourceTxids = planned.inputs.map(\.sourceTxid)
+        self.isNoSend = planned.isNoSend
         self.json = .record([
             "reference": .string(planned.reference),
             "txid": .string(txid),

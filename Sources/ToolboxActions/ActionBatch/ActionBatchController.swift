@@ -23,7 +23,7 @@ import ToolboxStorage
 ///
 ///     let funded = try await batch.plan(auth, request) ?? storage.createAction(auth, request)
 ///     ...
-///     let result = try await batch.process(auth, signed, sendWith: ..., isNoSend: ..., isDelayed: ...)
+///     let result = try await batch.process(auth, signed, options: request.options)
 ///         ?? storage.processAction(auth, signed.processRequest(...))
 ///
 /// and on any failure after a batch-owned plan, `abort(_:)` releases the reservations.
@@ -39,7 +39,8 @@ import ToolboxStorage
 ///   it does for version-1 providers in the reference.
 /// - `abort` releases the whole batch; there is no per-action `abortAction` rebuild.
 /// - `listActions` and `listOutputs` do not see staged actions.
-/// - BRC-177 expiry-labelled requests and "max satoshis" outputs are not batched.
+/// - BRC-177 expiry-labelled requests and "max satoshis" outputs are not batched. One that spends
+///   or sends a staged action throws instead, since the ordinary call cannot see that action.
 /// - `fundFrom` stands in for `noSendChange` on a member that is not `noSend`, because the SDK's
 ///   createAction options refuse that combination while the reference planner accepts it.
 public actor ActionBatchController {
@@ -103,18 +104,29 @@ public actor ActionBatchController {
         let inputs = request.inputs ?? []
         let outputs = request.outputs ?? []
         guard !inputs.isEmpty || !outputs.isEmpty else { return nil }
-        // A BRC-177 protected action is a different client protocol with its own storage calls.
-        guard !(request.labels ?? []).contains(where: { $0.hasPrefix(NoSendExpiry.labelPrefix) }) else {
-            return nil
-        }
-        guard !outputs.contains(where: { $0.satoshis == ActionBatchPlanner.maxPossibleSatoshis }) else {
-            return nil
+        // A BRC-177 protected action is a different client protocol with its own storage calls,
+        // and a "max satoshis" output is not planned here.
+        let unbatchable: String?
+        if (request.labels ?? []).contains(where: { $0.hasPrefix(NoSendExpiry.labelPrefix) }) {
+            unbatchable = "a BRC-177 expiry-labelled action"
+        } else if outputs.contains(where: { $0.satoshis == ActionBatchPlanner.maxPossibleSatoshis }) {
+            unbatchable = "an action with a max-satoshis output"
+        } else {
+            unbatchable = nil
         }
 
         if let workspace {
+            // Membership comes first: a request that spends a staged output can only be funded
+            // here, because ordinary createAction cannot see the staged transaction.
             guard workspace.references(inputs.map(\.outpoint) + fundFrom, sendWith: request.options?.sendWith ?? []) else {
                 return nil
             }
+            if let unbatchable {
+                throw ActionBatchError.invalidInput(
+                    "\(unbatchable) spends or sends a staged action but cannot join the action batch"
+                )
+            }
+            try ActionBatchPlanner.validateMetadata(request)
             do {
                 return try await planInWorkspace(workspace, auth, request, fundFrom: fundFrom)
             } catch {
@@ -122,9 +134,13 @@ public actor ActionBatchController {
             }
         }
 
-        guard request.options?.noSend == true, inputs.count <= Self.maximumFirstActionInputs else {
+        guard unbatchable == nil, request.options?.noSend == true,
+              inputs.count <= Self.maximumFirstActionInputs else {
             return nil
         }
+        // Storage re-validates every member's metadata at commit, after the whole chain is
+        // staged; refuse now what it would refuse then.
+        try ActionBatchPlanner.validateMetadata(request)
         let begun: ActionBatchWorkspace
         do {
             guard let started = try await begin(auth, request) else { return nil }
@@ -136,8 +152,10 @@ public actor ActionBatchController {
             throw error
         }
         // Storage commission would have to be paid by every member and validated at commit.
-        // That is not ported, so such storage keeps the ordinary path.
+        // That is not ported, so such storage keeps the ordinary path, and is remembered as not
+        // batchable so later noSend actions do not pay a begin and an abort each.
         guard begun.state.begin.commissionSatoshis == 0 else {
+            negotiated = .some(nil)
             await retire(begun)
             return nil
         }
@@ -150,14 +168,33 @@ public actor ActionBatchController {
         }
     }
 
+    /// Begins a batch. The batch id is chosen here, so a failure after storage may have begun it
+    /// (a reply that cannot be read, or a begin whose proof data the planner refuses) releases it
+    /// by that id, best effort, rather than leaving the wallet's outputs locked for the lease. A
+    /// `WireError` is storage refusing the begin, so there is nothing to release.
     private func begin(_ auth: AuthID, _ request: WalletCreateActionRequest) async throws -> ActionBatchWorkspace? {
         guard let capabilities = await negotiate() else { return nil }
-        let begin = try await storage.beginActionBatch(auth, ActionBatchBeginRequest(
-            batchId: ActionBatchPlanner.randomBase64(24),
-            firstAction: request,
-            compact: capabilities.compactBegin
-        ))
-        let state = try PlannerState(begin: begin, firstActionBEEF: request.inputBEEF)
+        let batchId = ActionBatchPlanner.randomBase64(24)
+        let begin: ActionBatchBegin
+        let state: PlannerState
+        do {
+            begin = try await storage.beginActionBatch(auth, ActionBatchBeginRequest(
+                batchId: batchId,
+                firstAction: request,
+                compact: capabilities.compactBegin
+            ))
+        } catch let error as WireError {
+            throw error
+        } catch {
+            _ = try? await storage.abortActionBatch(auth, batchId: batchId)
+            throw error
+        }
+        do {
+            state = try PlannerState(begin: begin, firstActionBEEF: request.inputBEEF)
+        } catch {
+            _ = try? await storage.abortActionBatch(auth, batchId: begin.batchId)
+            throw error
+        }
         let workspace = ActionBatchWorkspace(auth: auth, capabilities: capabilities, state: state)
         self.workspace = workspace
         return workspace
@@ -218,9 +255,15 @@ public actor ActionBatchController {
     /// staged transaction in `sendWith` is staged only, with no storage call, and returns an empty
     /// result. Any other member commits every staged action in one manifest, with `sendWith`
     /// extended by this member's own txid when it is not `noSend`; the batch is then finished.
+    ///
+    /// Whether a member is `noSend` is decided when it is planned, from its createAction
+    /// options, as the reference's signAction takes `noSend` from the prior createAction: the
+    /// plan's `noSendChangeOutputVouts` and the manifest's `isNoSend` must agree, or storage
+    /// refuses the commit. Leave `isNoSend` `nil` to use the planned value; a value that differs
+    /// from it throws `ActionBatchError.invalidOperation` before anything is staged.
     public func process(
         _ auth: AuthID, _ signed: SignedAction, sendWith: [String] = [],
-        isNoSend: Bool = false, isDelayed: Bool = false
+        isNoSend: Bool? = nil, isDelayed: Bool = false
     ) async throws -> StorageProcessActionResult? {
         try await exclusive {
             try await self.processExclusive(auth, signed, sendWith: sendWith, isNoSend: isNoSend, isDelayed: isDelayed)
@@ -228,14 +271,15 @@ public actor ActionBatchController {
     }
 
     /// `process` with the flags read from createAction options, with the reference client's
-    /// defaults (`noSend` false, `acceptDelayedBroadcast` true), as `SignedAction.processRequest`.
+    /// default `acceptDelayedBroadcast` true, as `SignedAction.processRequest`. An absent `noSend`
+    /// follows the plan.
     public func process(
         _ auth: AuthID, _ signed: SignedAction, options: WalletCreateActionOptions?
     ) async throws -> StorageProcessActionResult? {
         try await process(
             auth, signed,
             sendWith: (options?.sendWith ?? []).map(\.displayHex),
-            isNoSend: options?.noSend ?? false,
+            isNoSend: options?.noSend,
             isDelayed: options?.acceptDelayedBroadcast ?? true
         )
     }
@@ -254,7 +298,7 @@ public actor ActionBatchController {
 
     /// `ActionBatchController.process`; `signed` is the reference's `prior`.
     private func processExclusive(
-        _ auth: AuthID, _ signed: SignedAction?, sendWith: [String], isNoSend: Bool, isDelayed: Bool
+        _ auth: AuthID, _ signed: SignedAction?, sendWith: [String], isNoSend requested: Bool?, isDelayed: Bool
     ) async throws -> StorageProcessActionResult? {
         guard let workspace else { return nil }
         if let signed {
@@ -262,9 +306,9 @@ public actor ActionBatchController {
         } else {
             guard sendWith.contains(where: { workspace.ownsTransaction($0) }) else { return nil }
         }
-        if let signed {
-            try workspace.stage(signed, isNoSend: isNoSend, isDelayed: isDelayed)
-        }
+        let isNoSend = try signed.map {
+            try workspace.stage($0, isNoSend: requested, isDelayed: isDelayed)
+        } ?? false
 
         let referencesWorkspace = sendWith.contains { workspace.ownsTransaction($0) }
         if signed != nil, isNoSend, !sendWith.isEmpty, !referencesWorkspace {
@@ -315,23 +359,29 @@ public actor ActionBatchController {
 
     // MARK: - Abort
 
-    /// Releases the batch's reservations in storage and forgets it. Does nothing when no batch is
-    /// active or it has already committed. Best effort: storage also releases an abandoned batch
-    /// when its lease runs out.
+    /// Releases the batch's reservations in storage and forgets it.
+    ///
+    /// Returns `true` only when storage confirmed the release. `false` means no batch was active,
+    /// it had already committed, the abort call failed, or storage answered `aborted: false`. The
+    /// batch is forgotten in every case: storage also releases an abandoned batch when its lease
+    /// runs out, so a `false` after a failed call means the outputs stay locked until then.
     @discardableResult
     public func abort(_ auth: AuthID) async -> Bool {
         await exclusive {
             guard let workspace = self.workspace else { return false }
-            await self.retire(workspace, auth)
-            return true
+            return await self.retire(workspace, auth)
         }
     }
 
-    private func retire(_ workspace: ActionBatchWorkspace, _ auth: AuthID? = nil) async {
+    /// Aborts in storage, best effort, and forgets the batch. `true` when storage released it.
+    @discardableResult
+    private func retire(_ workspace: ActionBatchWorkspace, _ auth: AuthID? = nil) async -> Bool {
+        var released = false
         if !workspace.committed {
-            _ = try? await storage.abortActionBatch(auth ?? workspace.auth, batchId: workspace.batchId)
+            released = (try? await storage.abortActionBatch(auth ?? workspace.auth, batchId: workspace.batchId)) ?? false
         }
         if self.workspace === workspace { self.workspace = nil }
+        return released
     }
 
     // MARK: - Lease
@@ -447,16 +497,28 @@ final class ActionBatchWorkspace {
             || sendWith.contains { ownsTransaction($0.displayHex) }
     }
 
-    func stage(_ signed: SignedAction, isNoSend: Bool, isDelayed: Bool) throws {
-        if actions.contains(where: { $0.reference == signed.reference }) { return }
+    /// Stages a signed member and returns whether it is `noSend`, which its plan decided.
+    /// `requested`, when given, must agree with the plan.
+    func stage(_ signed: SignedAction, isNoSend requested: Bool?, isDelayed: Bool) throws -> Bool {
+        if let staged = actions.first(where: { $0.reference == signed.reference }) {
+            try Self.check(requested, planned: staged.isNoSend)
+            return staged.isNoSend
+        }
         guard let planned = planned[signed.reference] else {
             throw ActionBatchError.invalidOperation("signed action does not belong to the action batch")
         }
-        let action = try StagedAction(
-            planned: planned, transaction: signed.transaction, isNoSend: isNoSend, isDelayed: isDelayed
-        )
+        try Self.check(requested, planned: planned.isNoSend)
+        let action = try StagedAction(planned: planned, transaction: signed.transaction, isDelayed: isDelayed)
         try state.stage(planned, txid: action.txid, transaction: signed.transaction)
         actions.append(action)
         self.planned[signed.reference] = nil
+        return planned.isNoSend
+    }
+
+    private static func check(_ requested: Bool?, planned: Bool) throws {
+        guard let requested, requested != planned else { return }
+        throw ActionBatchError.invalidOperation(
+            "isNoSend \(requested) does not match the action's createAction noSend \(planned)"
+        )
     }
 }

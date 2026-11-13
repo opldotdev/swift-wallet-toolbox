@@ -35,14 +35,16 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
     }
 
     /// The wallet's single unspent output: BRC-29 change it paid itself.
-    private func utxo(satoshis: UInt64 = 1_000, tag: UInt8 = 0) throws -> Transaction {
+    private func utxo(satoshis: UInt64 = 1_000, tag: UInt8 = 0, spending parent: Outpoint? = nil) throws -> Transaction {
         let identity = try identity()
         let key = try BRC29.receivingPrivateKey(
             recipient: identity, sender: identity.publicKey, prefix: prefix, suffix: suffix
         )
         return Transaction(
             version: 1,
-            inputs: [],
+            inputs: try parent.map {
+                [TransactionInput(previousOutput: $0, unlockingScript: try Script(bytes: [], maximumByteCount: 0))]
+            } ?? [],
             outputs: [
                 TransactionOutput(satoshis: satoshis, lockingScript: try BRC29.lockingScript(for: key.publicKey)),
                 // Distinct transactions for distinct tags.
@@ -82,7 +84,8 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
     }
 
     private func begin(
-        _ request: ActionBatchBeginRequest, funding: [Transaction], commission: UInt64 = 0
+        _ request: ActionBatchBeginRequest, funding: [Transaction], commission: UInt64 = 0,
+        inputBeef: [UInt8]? = nil
     ) throws -> ActionBatchBegin {
         ActionBatchBegin(
             batchId: request.batchId,
@@ -97,7 +100,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
             availableChangeCount: funding.count,
             reservedOutputs: try funding.enumerated().map { try row($1, outputId: 41 + $0) },
             explicitOutputs: [],
-            inputBeef: try beef(funding)
+            inputBeef: try inputBeef ?? beef(funding)
         )
     }
 
@@ -293,7 +296,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let batch = controller(storage)
         let request = try WalletCreateActionRequest(
             description: "send now",
-            outputs: [try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 5, outputDescription: "o")],
+            outputs: [try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 5, outputDescription: "output")],
             options: try WalletCreateActionOptions(noSend: true)
         )
         let funded = try await XCTUnwrapAsync(await batch.plan(auth, request))
@@ -387,7 +390,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let signed = try sign(try await XCTUnwrapAsync(await batch.plan(auth, request)), request)
 
         do {
-            _ = try await batch.process(auth, signed, isNoSend: false)
+            _ = try await batch.process(auth, signed, sendWith: [signed.transactionID.displayHex])
             XCTFail("the commit failed")
         } catch WireError.actionBatchState(let state, _, _) {
             XCTAssertEqual(state, "hard-expired")
@@ -410,7 +413,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let request = try anchorRequest()
         let signed = try sign(try await XCTUnwrapAsync(await batch.plan(auth, request)), request)
 
-        await XCTAssertThrowsAsync(try await batch.process(auth, signed, isNoSend: false))
+        await XCTAssertThrowsAsync(try await batch.process(auth, signed, sendWith: [signed.transactionID.displayHex]))
         let isActive = await batch.isActive
         XCTAssertTrue(isActive)
         let calls = await storage.calls
@@ -440,15 +443,15 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let auth = try auth
         let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
         let batch = controller(storage)
-        let output = try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 2, outputDescription: "o")
+        let output = try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 2, outputDescription: "output")
 
-        let sendNow = try WalletCreateActionRequest(description: "now", outputs: [output])
+        let sendNow = try WalletCreateActionRequest(description: "send now", outputs: [output])
         let tooManyInputs = try WalletCreateActionRequest(
-            description: "many",
+            description: "many inputs",
             inputs: try (0..<9).map {
                 try WalletCreateActionInput(
                     outpoint: Outpoint(transactionID: try TransactionID(displayHex: String(repeating: "ab", count: 32)), outputIndex: UInt32($0)),
-                    inputDescription: "i", unlockingScriptLength: 1
+                    inputDescription: "input", unlockingScriptLength: 1
                 )
             },
             outputs: [output],
@@ -461,11 +464,11 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let sweep = try WalletCreateActionRequest(
             description: "sweep",
             outputs: [try WalletCreateActionOutput(
-                lockingScript: anchorScript, satoshis: ActionBatchPlanner.maxPossibleSatoshis, outputDescription: "all"
+                lockingScript: anchorScript, satoshis: ActionBatchPlanner.maxPossibleSatoshis, outputDescription: "everything"
             )],
             options: try WalletCreateActionOptions(noSend: true)
         )
-        let empty = try WalletCreateActionRequest(description: "empty", options: try WalletCreateActionOptions(noSend: true))
+        let empty = try WalletCreateActionRequest(description: "empty action", options: try WalletCreateActionOptions(noSend: true))
         for request in [sendNow, tooManyInputs, protected, sweep, empty] {
             let planned = try await batch.plan(auth, request)
             XCTAssertNil(planned, request.description)
@@ -501,10 +504,16 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let batch = controller(storage)
         let planned = try await batch.plan(auth, try anchorRequest())
         XCTAssertNil(planned)
-        let calls = await storage.calls
+        var calls = await storage.calls
         XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "abortActionBatch"])
         let isActive = await batch.isActive
         XCTAssertFalse(isActive)
+
+        // Remembered: the next noSend action pays no second begin and abort.
+        let again = try await batch.plan(auth, try anchorRequest())
+        XCTAssertNil(again)
+        calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "abortActionBatch"])
     }
 
     /// With a batch open, work that does not spend or send a staged transaction stays out of it.
@@ -621,7 +630,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let request = try anchorRequest()
         let signed = try sign(try await XCTUnwrapAsync(await batch.plan(auth, request)), request)
         clock.now = start.addingTimeInterval(61)
-        _ = try await batch.process(auth, signed, isNoSend: false)
+        _ = try await batch.process(auth, signed, sendWith: [signed.transactionID.displayHex])
         let calls = await storage.calls
         XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "commitActionBatch"])
     }
@@ -667,7 +676,7 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
                 outpoint: Outpoint(transactionID: anchor.transactionID, outputIndex: vout),
                 inputDescription: "spend anchor", unlockingScript: [0x51]
             )],
-            outputs: [try WalletCreateActionOutput(lockingScript: publishScript, satoshis: 0, outputDescription: "o")],
+            outputs: [try WalletCreateActionOutput(lockingScript: publishScript, satoshis: 0, outputDescription: "inscription")],
             options: try WalletCreateActionOptions(
                 noSend: true, noSendChange: [try changeOutpoint(anchorFunded, anchor)]
             )
@@ -714,6 +723,296 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let owns = await batch.owns(reference: anchor.reference)
         XCTAssertTrue(owns)
     }
+
+    // MARK: - Review fixes
+
+    /// Storage re-runs `validateCreateActionArgs` over each member's metadata at commit, so a
+    /// description outside 5...2000 UTF-8 bytes is refused before anything is reserved.
+    func test_descriptionsOutsideTheValidatorBoundsAreRefusedUpFront() async throws {
+        let auth = try auth
+        let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
+        let batch = controller(storage)
+        let noSend = try WalletCreateActionOptions(noSend: true)
+        func output(_ description: String) throws -> WalletCreateActionOutput {
+            try WalletCreateActionOutput(lockingScript: anchorScript, satoshis: 2, outputDescription: description)
+        }
+        let input = try WalletCreateActionInput(
+            outpoint: Outpoint(transactionID: try TransactionID(displayHex: String(repeating: "ab", count: 32)), outputIndex: 0),
+            inputDescription: "in", unlockingScriptLength: 1
+        )
+        let cases: [(WalletCreateActionRequest, String, String)] = [
+            (try WalletCreateActionRequest(description: "pub", outputs: [try output("anchor")], options: noSend),
+             "description", "at least 5 length."),
+            // Bytes, not characters: two two-byte characters are four bytes.
+            (try WalletCreateActionRequest(description: "éé", outputs: [try output("anchor")], options: noSend),
+             "description", "at least 5 length."),
+            // Wider ABI limits than the standard ones let a request carry what storage refuses.
+            (try WalletCreateActionRequest(
+                description: String(repeating: "d", count: 2_001), outputs: [try output("anchor")], options: noSend,
+                limits: try WalletABILimits(maximumTextUTF8ByteCount: 4_000)
+             ), "description", "no more than 2000 length."),
+            (try WalletCreateActionRequest(description: "sigma anchor", outputs: [try output("o")], options: noSend),
+             "outputDescription", "at least 5 length."),
+            (try WalletCreateActionRequest(
+                description: "sigma anchor", inputs: [input], outputs: [try output("anchor")], options: noSend
+             ), "inputDescription", "at least 5 length."),
+        ]
+        for (request, name, message) in cases {
+            do {
+                _ = try await batch.plan(auth, request)
+                XCTFail("\(name) is out of bounds")
+            } catch {
+                XCTAssertEqual(error as? WireError, .invalidParameter(name: name, message: message))
+            }
+        }
+        // At the bounds: accepted.
+        let edge = try WalletCreateActionRequest(description: "éée", outputs: [try output("12345")], options: noSend)
+        let planned = try await batch.plan(auth, edge)
+        XCTAssertNotNil(planned)
+        var calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch"], "only the valid request reserved anything")
+
+        // A member of an open batch is held to the same rule.
+        let anchor = try sign(try XCTUnwrap(planned), edge)
+        _ = try await batch.process(auth, anchor)
+        let vout = try XCTUnwrap(planned?.outputs.first { !$0.isChange }?.vout)
+        let short = try WalletCreateActionRequest(
+            description: "pub",
+            inputs: [try WalletCreateActionInput(
+                outpoint: Outpoint(transactionID: anchor.transactionID, outputIndex: vout),
+                inputDescription: "spend anchor", unlockingScript: [0x51]
+            )],
+            outputs: [try output("inscription")]
+        )
+        do {
+            _ = try await batch.plan(auth, short)
+            XCTFail("the publish description is too short")
+        } catch {
+            XCTAssertEqual(error as? WireError, .invalidParameter(name: "description", message: "at least 5 length."))
+        }
+        calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch"])
+    }
+
+    /// `noSend` is decided by the createAction options when the action is planned. A process
+    /// call that contradicts it is refused before staging, since storage would refuse the commit.
+    func test_processTakesNoSendFromThePlan() async throws {
+        let auth = try auth
+        let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
+        let batch = controller(storage)
+        let request = try anchorRequest()
+        let anchor = try sign(try await XCTUnwrapAsync(await batch.plan(auth, request)), request)
+
+        do {
+            _ = try await batch.process(auth, anchor, isNoSend: false)
+            XCTFail("the anchor was planned noSend")
+        } catch ActionBatchError.invalidOperation(let message) {
+            XCTAssertTrue(message.contains("noSend"), message)
+        }
+        var calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch"])
+        let stillPlanned = await batch.owns(reference: anchor.reference)
+        XCTAssertTrue(stillPlanned)
+
+        // Left out, or read from the same options, it follows the plan: staged, not committed.
+        let staged = try await batch.process(auth, anchor, options: request.options)
+        XCTAssertEqual(staged?.sendWithResults, [])
+        let again = try await batch.process(auth, anchor)
+        XCTAssertEqual(again?.sendWithResults, [])
+        calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch"])
+
+        let txid = anchor.transactionID.displayHex
+        _ = try await batch.send(auth, sendWith: [txid])
+        let commits = await storage.commits
+        let action = try XCTUnwrap(commits.first?.body["actions"]?.arrayValue?.first)
+        XCTAssertEqual(action["metadata"]?["isNoSend"], .bool(true))
+        XCTAssertNotNil(action["plan"]?["noSendChangeOutputVouts"])
+    }
+
+    /// A request that spends a staged output belongs to the batch even when it carries something
+    /// the batch does not plan: ordinary createAction cannot see the staged anchor, so it throws.
+    func test_aMemberTheBatchCannotPlanThrowsInsteadOfFallingBack() async throws {
+        let auth = try auth
+        let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
+        let batch = controller(storage)
+        let request = try anchorRequest()
+        let anchorFunded = try await XCTUnwrapAsync(await batch.plan(auth, request))
+        let anchor = try sign(anchorFunded, request)
+        _ = try await batch.process(auth, anchor)
+        let vout = try XCTUnwrap(anchorFunded.outputs.first { !$0.isChange }?.vout)
+        let spend = try WalletCreateActionInput(
+            outpoint: Outpoint(transactionID: anchor.transactionID, outputIndex: vout),
+            inputDescription: "spend anchor", unlockingScript: [0x51]
+        )
+        let protected = try WalletCreateActionRequest(
+            description: "protected publish", inputs: [spend],
+            outputs: [try WalletCreateActionOutput(lockingScript: publishScript, satoshis: 0, outputDescription: "inscription")],
+            labels: [NoSendExpiry.labelPrefix + "1800000000"],
+            options: try WalletCreateActionOptions(noSend: true)
+        )
+        let sweep = try WalletCreateActionRequest(
+            description: "sweep publish", inputs: [spend],
+            outputs: [try WalletCreateActionOutput(
+                lockingScript: publishScript, satoshis: ActionBatchPlanner.maxPossibleSatoshis, outputDescription: "everything"
+            )]
+        )
+        for member in [protected, sweep] {
+            do {
+                _ = try await batch.plan(auth, member)
+                XCTFail("\(member.description) cannot be batched")
+            } catch ActionBatchError.invalidInput(let message) {
+                XCTAssertTrue(message.contains("cannot join the action batch"), message)
+            }
+        }
+        let isActive = await batch.isActive
+        XCTAssertTrue(isActive, "the caller decides whether to abort")
+        let calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch"])
+    }
+
+    /// Storage began the batch, but its reply cannot be used: the batch is aborted by the id the
+    /// client chose, so a single-output wallet is not locked for the lease.
+    func test_aBeginThatCannotBeUsedIsAborted() async throws {
+        let auth = try auth
+        struct Unreadable: Error {}
+        let unusableProof = FakeBatchStorage(capabilities: capabilities()) {
+            try self.begin($0, funding: [try self.utxo()], inputBeef: [0xde, 0xad, 0xbe, 0xef])
+        }
+        let unreadableReply = FakeBatchStorage(capabilities: capabilities()) { _ in throw Unreadable() }
+        for storage in [unusableProof, unreadableReply] {
+            let batch = controller(storage)
+            await XCTAssertThrowsAsync(try await batch.plan(auth, try anchorRequest()))
+            let calls = await storage.calls
+            XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "abortActionBatch"])
+            let isActive = await batch.isActive
+            XCTAssertFalse(isActive)
+        }
+    }
+
+    /// `abort` reports whether storage released the batch; the batch is forgotten either way.
+    func test_abortReportsWhetherStorageReleasedTheBatch() async throws {
+        let auth = try auth
+        for (result, expected) in [
+            (Result<Bool, Error>.success(true), true),
+            (.success(false), false),
+            (.failure(WireError.internalFailure("unreachable")), false),
+        ] {
+            let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
+            await storage.abortWith(result)
+            let batch = controller(storage)
+            _ = try await XCTUnwrapAsync(await batch.plan(auth, try anchorRequest()))
+            let aborted = await batch.abort(auth)
+            XCTAssertEqual(aborted, expected)
+            let isActive = await batch.isActive
+            XCTAssertFalse(isActive)
+            let calls = await storage.calls
+            XCTAssertEqual(calls.filter { $0 == "abortActionBatch" }.count, 1)
+        }
+    }
+
+    /// The publish cannot be funded after the anchor is staged. Planning throws, the batch stays
+    /// for the caller, and the caller's abort releases it once.
+    func test_aFailedPublishPlanAfterTheAnchorIsStagedAbortsOnce() async throws {
+        let auth = try auth
+        let storage = FakeBatchStorage(capabilities: capabilities()) { try self.begin($0, funding: [try self.utxo()]) }
+        let batch = controller(storage)
+        let request = try anchorRequest()
+        let anchorFunded = try await XCTUnwrapAsync(await batch.plan(auth, request))
+        let anchor = try sign(anchorFunded, request)
+        _ = try await batch.process(auth, anchor)
+        let vout = try XCTUnwrap(anchorFunded.outputs.first { !$0.isChange }?.vout)
+
+        let tooDear = try WalletCreateActionRequest(
+            description: "publish",
+            inputs: [try WalletCreateActionInput(
+                outpoint: Outpoint(transactionID: anchor.transactionID, outputIndex: vout),
+                inputDescription: "spend anchor", unlockingScript: [0x51]
+            )],
+            outputs: [try WalletCreateActionOutput(lockingScript: publishScript, satoshis: 100_000, outputDescription: "inscription")]
+        )
+        do {
+            _ = try await batch.plan(auth, tooDear, fundFrom: [try changeOutpoint(anchorFunded, anchor)])
+            XCTFail("the reservation cannot pay for the publish")
+        } catch ActionBatchError.insufficientFunds(let more) {
+            XCTAssertGreaterThan(more, 0)
+        }
+        let isActive = await batch.isActive
+        XCTAssertTrue(isActive)
+
+        let aborted = await batch.abort(auth)
+        let again = await batch.abort(auth)
+        XCTAssertTrue(aborted)
+        XCTAssertFalse(again)
+        let calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "extendActionBatch", "abortActionBatch"])
+    }
+
+    /// The reserved output's source transaction spends a proven parent. The proof graph handed to
+    /// the signer and the commit's dependency graph walk to that parent, stop there, and carry
+    /// only its merkle path, renumbered.
+    func test_aProvenAncestorAndItsMerklePathTravelWithTheReservation() async throws {
+        let auth = try auth
+        let limits = WalletTransactionLimits.standard
+        func proven(_ tag: UInt8, height: UInt32) throws -> (Transaction, MerklePath) {
+            let transaction = Transaction(
+                version: 1, inputs: [],
+                outputs: [TransactionOutput(satoshis: 5_000, lockingScript: try Script(bytes: [0x51, tag], maximumByteCount: 2))],
+                lockTime: 0
+            )
+            let id = try transaction.transactionID(limits: limits)
+            let path = try MerklePath(
+                blockHeight: height, levels: [[.hash(offset: 0, hash: try Hash256(id.wireBytes), isTransactionID: true)]]
+            )
+            return (transaction, path)
+        }
+        // An unrelated proven transaction holds path 0, so the parent's path is renumbered.
+        let (unrelated, unrelatedPath) = try proven(1, height: 99)
+        let (parent, parentPath) = try proven(2, height: 100)
+        let parentID = try parent.transactionID(limits: limits)
+        let funding = try utxo(spending: Outpoint(transactionID: parentID, outputIndex: 0))
+        let source = try BEEF(
+            version: .v2, merklePaths: [unrelatedPath, parentPath],
+            transactions: [
+                .rawWithMerklePath(transaction: unrelated, merklePathIndex: 0),
+                .rawWithMerklePath(transaction: parent, merklePathIndex: 1),
+                .raw(funding),
+            ],
+            limits: WalletBEEFLimits.standard
+        ).serialized(limits: WalletBEEFLimits.standard)
+        let storage = FakeBatchStorage(capabilities: capabilities()) {
+            try self.begin($0, funding: [funding], inputBeef: source)
+        }
+        let batch = controller(storage)
+
+        func check(_ bytes: [UInt8]?, file: StaticString = #filePath, line: UInt = #line) throws {
+            let graph = try BEEF(bytes: try XCTUnwrap(bytes, file: file, line: line), limits: WalletBEEFLimits.standard)
+            XCTAssertEqual(graph.merklePaths, [parentPath], file: file, line: line)
+            let entries = try graph.transactions.map {
+                (try $0.transactionID(limits: limits).displayHex, $0.merklePathIndex)
+            }
+            XCTAssertEqual(entries.map(\.0), [parentID.displayHex, try txid(funding)], file: file, line: line)
+            XCTAssertEqual(entries.map(\.1), [0, nil], file: file, line: line)
+        }
+
+        let request = try anchorRequest()
+        let funded = try await XCTUnwrapAsync(await batch.plan(auth, request))
+        XCTAssertEqual(funded.inputs.map(\.sourceTXID), [try txid(funding)])
+        try check(funded.inputBEEF)
+        let anchor = try sign(funded, request)
+        try verifyScripts(anchor.transaction)
+        let envelope = try AtomicBEEF(bytes: try anchor.atomicBEEF(), limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(envelope.subjectTransactionID, anchor.transactionID)
+
+        _ = try await batch.process(auth, anchor, sendWith: [anchor.transactionID.displayHex])
+        let commits = await storage.commits
+        let manifest = try XCTUnwrap(commits.first)
+        XCTAssertTrue(try ActionBatchDigest.verify(manifest.body))
+        let blobs = try XCTUnwrap(manifest.body["inlineBlobs"]?.members)
+        let digest = manifest.body["dependencyBeefDigest"]?.stringValue
+        let dependency = try XCTUnwrap(blobs.first { $0.key == digest }?.value.arrayValue)
+        try check(dependency.compactMap { $0.int64Value.flatMap(UInt8.init(exactly:)) })
+    }
 }
 
 // MARK: - Doubles
@@ -737,6 +1036,7 @@ actor FakeBatchStorage: ActionBatchStorage {
     private var commitError: Error?
     private var renewal: Result<Date, Error>?
     private var extension_: (rows: [ActionBatchFundingOutput], beef: [UInt8]?) = ([], nil)
+    private var abortResult: Result<Bool, Error> = .success(true)
     private var batchId: String?
 
     private(set) var calls: [String] = []
@@ -756,6 +1056,7 @@ actor FakeBatchStorage: ActionBatchStorage {
     func failCommit(with error: Error) { commitError = error }
     func renewWith(_ result: Result<Date, Error>) { renewal = result }
     func extendWith(_ rows: [ActionBatchFundingOutput], beef: [UInt8]?) { extension_ = (rows, beef) }
+    func abortWith(_ result: Result<Bool, Error>) { abortResult = result }
 
     func actionBatchCapabilities() async throws -> ActionBatchCapabilities? {
         calls.append("getCapabilities")
@@ -766,9 +1067,9 @@ actor FakeBatchStorage: ActionBatchStorage {
     func beginActionBatch(_ auth: AuthID, _ request: ActionBatchBeginRequest) async throws -> ActionBatchBegin {
         calls.append("beginActionBatch")
         XCTAssertEqual(Data(base64Encoded: request.batchId)?.count, 24)
-        let begin = try beginHandler(request)
-        batchId = begin.batchId
-        return begin
+        // The id is the client's, so storage knows it even when the reply goes astray.
+        batchId = request.batchId
+        return try beginHandler(request)
     }
 
     func extendActionBatch(_ auth: AuthID, _ request: ActionBatchExtendRequest) async throws -> ActionBatchExtension {
@@ -806,7 +1107,7 @@ actor FakeBatchStorage: ActionBatchStorage {
     func abortActionBatch(_ auth: AuthID, batchId: String) async throws -> Bool {
         calls.append("abortActionBatch")
         XCTAssertEqual(batchId, self.batchId)
-        return true
+        return try abortResult.get()
     }
 
     func processAction(_ auth: AuthID, _ request: StorageProcessActionRequest) async throws -> StorageProcessActionResult {

@@ -176,6 +176,9 @@ struct PlannedAction: Sendable {
     let inputs: [PlannedInput]
     let outputs: [PlannedOutput]
     let derivationPrefix: String
+    /// The request's `noSend`, the one source for both the plan's change vouts below and the
+    /// manifest metadata's `isNoSend`, which storage requires to agree.
+    let isNoSend: Bool
     /// The change vouts, present exactly when the action is `noSend`, as storage checks.
     let noSendChangeOutputVouts: [UInt32]?
     let request: WalletCreateActionRequest
@@ -397,11 +400,40 @@ enum ActionBatchPlanner {
             inputs: inputs,
             outputs: outputs,
             derivationPrefix: derivationPrefix,
+            isNoSend: isNoSend,
             noSendChangeOutputVouts: isNoSend ? outputs.filter(\.isChange).map(\.vout) : nil,
             request: request,
             consumedOutpoints: consumed,
             result: result
         )
+    }
+
+    /// The description bounds of `validateCreateActionArgs` (`@bsv/sdk` `validateStringLength`
+    /// with 5 and 2000 UTF-8 bytes) for the action, each input and each output.
+    ///
+    /// Storage runs that validator again over every member's metadata when the batch commits
+    /// (`validateActionMetadata`), which is after the whole chain is staged. Checking here refuses
+    /// such a request before anything is reserved. The errors are the validator's own.
+    static func validateMetadata(_ request: WalletCreateActionRequest) throws {
+        try validateDescription(request.description, name: "description")
+        for input in request.inputs ?? [] {
+            try validateDescription(input.inputDescription, name: "inputDescription")
+        }
+        for output in request.outputs ?? [] {
+            try validateDescription(output.outputDescription, name: "outputDescription")
+        }
+    }
+
+    static let descriptionBytes = 5...2000
+
+    private static func validateDescription(_ text: String, name: String) throws {
+        let bytes = text.utf8.count
+        if bytes < descriptionBytes.lowerBound {
+            throw WireError.invalidParameter(name: name, message: "at least \(descriptionBytes.lowerBound) length.")
+        }
+        if bytes > descriptionBytes.upperBound {
+            throw WireError.invalidParameter(name: name, message: "no more than \(descriptionBytes.upperBound) length.")
+        }
     }
 
     /// `validateActionOutpoints`: no outpoint twice, none already spent within the batch.
@@ -429,6 +461,12 @@ enum ActionBatchPlanner {
     /// `noSendChange` list, then unconsumed reservations by the canonical exact / least-over /
     /// largest-under rule. Inputs are added until the action can pay its fee and a change output
     /// worth at least the dust floor; failing that, until it can pay its fee with no change.
+    ///
+    /// The no-change fallback is tried only once every `fundFrom` output and every unconsumed
+    /// reservation has been allocated, so an action that ends there spends the batch's whole
+    /// reserved pool, and its surplus (less than the dust floor plus a change output's fee) goes
+    /// to the fee. A later member then has to extend the batch for its own funding. This is
+    /// kept deliberately: it is reached only when the pool barely covers the action.
     static func fund(
         _ state: PlannerState, explicit: [PlannerOutput], requestedInputs: [WalletCreateActionInput],
         requestedOutputs: [WalletCreateActionOutput], fundFrom: [PlannerOutput]
