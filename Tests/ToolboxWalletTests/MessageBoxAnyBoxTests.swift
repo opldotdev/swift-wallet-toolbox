@@ -84,6 +84,51 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(try json(requests[2].body)["messageIds"] as? [String], ["a", "b"])
     }
 
+    func test_anEmptyPageWithMoreToComeDoesNotStopTheListing() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let transport = ScriptedTransport([
+            #"{"status":"success","hasMore":true,"messages":[{"messageId":"a","body":"one","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":true,"messages":[]}"#,
+            #"{"status":"success","hasMore":false,"messages":[{"messageId":"c","body":"three","sender":"\#(sender)"}]}"#,
+        ])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let messages = try await client.listMessages(messageBox: "inbox", pageSize: 2)
+        XCTAssertEqual(messages.map(\.messageId), ["a", "c"])
+        let requests = await transport.requests
+        let offsets = try requests.map { try json($0.body)["offset"] as? Int }
+        XCTAssertEqual(offsets, [0, 1, 3])
+    }
+
+    func test_anAdvancingServerCursorIsFollowed() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let transport = ScriptedTransport([
+            #"{"status":"success","hasMore":true,"nextOffset":7,"messages":[{"messageId":"a","body":"one","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":true,"nextOffset":7,"messages":[{"messageId":"b","body":"two","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","hasMore":true,"nextOffset":true,"messages":[{"messageId":"c","body":"three","sender":"\#(sender)"}]}"#,
+            #"{"status":"success","messages":[]}"#,
+        ])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let messages = try await client.listMessages(messageBox: "inbox", pageSize: 5)
+        XCTAssertEqual(messages.map(\.messageId), ["a", "b", "c"])
+        // 7 is taken; a repeated 7 does not move forward, so the count is used; a boolean cursor is ignored.
+        let requests = await transport.requests
+        let offsets = try requests.map { try json($0.body)["offset"] as? Int }
+        XCTAssertEqual(offsets, [0, 7, 8, 9])
+    }
+
+    func test_emptyPagesThatNeverEndHitTheCap() async throws {
+        let transport = ScriptedTransport(Array(repeating: #"{"status":"success","hasMore":true,"messages":[]}"#, count: 3))
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        do { _ = try await client.listMessages(messageBox: "inbox", pageSize: 4, maxPages: 3); XCTFail("should hit the cap") }
+        catch MessageBoxError.tooManyPages {}
+        let requests = await transport.requests
+        let offsets = try requests.map { try json($0.body)["offset"] as? Int }
+        XCTAssertEqual(offsets, [0, 4, 8])
+    }
+
     func test_malformedListingsAreRefused() async throws {
         for body in [
             #"{"status":"success"}"#,

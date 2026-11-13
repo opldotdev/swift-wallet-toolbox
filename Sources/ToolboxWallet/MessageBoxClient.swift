@@ -105,8 +105,14 @@ public struct MessageBoxClient: Sendable {
             guard let rows = object["messages"] as? [[String: Any]] else { throw MessageBoxError.invalidResponse }
             let page = try rows.map(MessageBoxMessage.init(row:))
             messages.append(contentsOf: page)
-            guard object["hasMore"] as? Bool == true, !page.isEmpty else { return messages }
-            offset += page.count
+            guard object["hasMore"] as? Bool == true else { return messages }
+            // Prefer the server's cursor when it moves forward; otherwise step by what we saw,
+            // or by a full page when the page came back empty, so an empty page never stalls.
+            if let next = Self.integer(object["nextOffset"]), next > offset {
+                offset = next
+            } else {
+                offset += page.isEmpty ? pageSize : page.count
+            }
         }
         throw MessageBoxError.tooManyPages
     }
@@ -173,6 +179,15 @@ public struct MessageBoxClient: Sendable {
 
     private func path(_ suffix: String) -> String {
         basePath.isEmpty ? "/\(suffix)" : "/\(basePath)/\(suffix)"
+    }
+
+    /// A non-negative whole number from a JSON value, refusing booleans and fractions.
+    static func integer(_ value: Any?) -> Int? {
+        // JSON booleans arrive as NSNumber with the char type; `is Bool` also matches 0 and 1 on Darwin.
+        guard let number = value as? NSNumber, String(cString: number.objCType) != "c" else { return nil }
+        let double = number.doubleValue
+        guard double >= 0, double.rounded() == double, double <= Double(Int.max / 2) else { return nil }
+        return Int(double)
     }
 
     private func parse(_ response: AuthenticatedResponse) throws -> [String: Any] {
