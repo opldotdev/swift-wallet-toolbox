@@ -25,6 +25,11 @@ public enum WireError: Error, Equatable, Sendable, LocalizedError {
     case notImplemented(String)
     case reviewActions(String)
     case unauthorized(String)
+    /// An action-batch lifecycle call reached a batch that cannot continue: `state` is one of the
+    /// reference's states (`missing`, `expired`, `hard-expired`, `aborted`, `committed`,
+    /// `inactive`, `conflicted`). Only `expired` is recoverable, by committing, which reacquires
+    /// the batch's inputs; every other state is terminal for that batch.
+    case actionBatchState(state: String, batchId: String?, message: String)
     /// A name this version does not know. Kept rather than flattened, so a server that gains a
     /// code before we do produces a report somebody can act on.
     case unrecognized(name: String, message: String)
@@ -45,6 +50,7 @@ public enum WireError: Error, Equatable, Sendable, LocalizedError {
         case .notImplemented: "WERR_NOT_IMPLEMENTED"
         case .reviewActions: "WERR_REVIEW_ACTIONS"
         case .unauthorized: "WERR_UNAUTHORIZED"
+        case .actionBatchState: "WERR_ACTION_BATCH_STATE"
         case .unrecognized(let name, _): name
         }
     }
@@ -63,7 +69,7 @@ public enum WireError: Error, Equatable, Sendable, LocalizedError {
              .unauthorized(let message):
             message
         case .invalidParameter(_, let message), .missingParameter(_, let message),
-             .unrecognized(_, let message):
+             .unrecognized(_, let message), .actionBatchState(_, _, let message):
             message
         }
     }
@@ -95,6 +101,16 @@ public enum WireError: Error, Equatable, Sendable, LocalizedError {
         case "WERR_NOT_IMPLEMENTED": return .notImplemented(message)
         case "WERR_REVIEW_ACTIONS": return .reviewActions(message)
         case "WERR_UNAUTHORIZED": return .unauthorized(message)
+        case "WERR_ACTION_BATCH_STATE":
+            // The reference sends `state` and `batchId` beside the message. Without a state the
+            // error cannot be classified, so it is kept as an unrecognized one rather than
+            // guessed at.
+            guard let state = payload["state"]?.stringValue else {
+                return .unrecognized(name: name, message: message)
+            }
+            return .actionBatchState(
+                state: state, batchId: payload["batchId"]?.stringValue, message: message
+            )
         default: return .unrecognized(name: name, message: message)
         }
     }
