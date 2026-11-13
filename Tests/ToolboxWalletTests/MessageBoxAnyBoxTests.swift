@@ -131,6 +131,7 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
         let listing = try await client.listMessages(messageBox: "inbox", pageSize: 4, maxPages: 3)
         // The next listing goes on from where this one would have asked next.
         XCTAssertEqual(listing, MessageBoxListing(messages: [], truncated: true, nextOffset: 12))
+        XCTAssertFalse(listing.isComplete)
         let requests = await transport.requests
         let offsets = try requests.map { try json($0.body)["offset"] as? Int }
         XCTAssertEqual(offsets, [0, 4, 8])
@@ -205,6 +206,42 @@ final class MessageBoxAnyBoxTests: XCTestCase, @unchecked Sendable {
             do { _ = try await client.listMessages(messageBox: "inbox"); XCTFail("should refuse \(body)") }
             catch is MessageBoxError {}
         }
+    }
+
+    func test_aListingCanSkipRowsItCannotReadAndSaysItIsIncomplete() async throws {
+        let sender = Hex.encode(try key(3).publicKey.compressedBytes)
+        let first = #"{"status":"success","hasMore":true,"messages":[{"messageId":"a","body":"one","sender":"\#(sender)"},{"messageId":"b","body":"x","sender":"zz"},"junk"]}"#
+        let second = #"{"status":"success","messages":[{"body":"x","sender":"\#(sender)"},{"messageId":"c","body":"three","sender":"\#(sender)"}]}"#
+
+        // By default one such row fails the whole listing.
+        let strict = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: ScriptedTransport([first]))
+        do { _ = try await strict.listMessages(messageBox: "inbox", pageSize: 3); XCTFail("must refuse") }
+        catch MessageBoxError.invalidResponse {}
+
+        let transport = ScriptedTransport([first, second])
+        let client = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: transport)
+        let listing = try await client.listMessages(messageBox: "inbox", pageSize: 3, skipMalformed: true)
+        XCTAssertEqual(listing.messages.map(\.messageId), ["a", "c"])
+        XCTAssertEqual(listing.skipped, 3)
+        // Every page was read, but rows were left out: not truncated, and not complete either.
+        XCTAssertFalse(listing.truncated)
+        XCTAssertFalse(listing.isComplete)
+        // Skipped rows are still on the server, so they count toward where to list on from.
+        XCTAssertEqual(listing.nextOffset, 5)
+        let requests = await transport.requests
+        let offsets = try requests.map { try json($0.body)["offset"] as? Int }
+        XCTAssertEqual(offsets, [0, 3])
+
+        // A clean listing with skipping on is complete.
+        let clean = try MessageBoxClient(host: URL(string: "https://mb.example")!,
+            wallet: ProtoWallet(rootKey: key(1)), transport: ScriptedTransport([second.replacingOccurrences(
+                of: #"{"body":"x","sender":"\#(sender)"},"#, with: "")]))
+        let whole = try await clean.listMessages(messageBox: "inbox", skipMalformed: true)
+        XCTAssertEqual(whole, MessageBoxListing(messages: whole.messages, truncated: false, nextOffset: 1, skipped: 0))
+        XCTAssertEqual(whole.messages.map(\.messageId), ["c"])
+        XCTAssertTrue(whole.isComplete)
     }
 
     func test_boxNamesAndAcknowledgementsAreChecked() async throws {
