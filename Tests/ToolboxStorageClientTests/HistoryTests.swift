@@ -20,6 +20,7 @@ final class HistoryTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            if let reply = ActiveStorageFixture.reply(to: body) { return reply }
             self.body = body
             let request = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
             let response = JSONValue.object([
@@ -42,6 +43,7 @@ final class HistoryTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            if let reply = ActiveStorageFixture.reply(to: body) { return reply }
             throw CancellationError()
         }
     }
