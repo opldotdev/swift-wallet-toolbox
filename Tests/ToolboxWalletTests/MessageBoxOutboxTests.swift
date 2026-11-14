@@ -682,10 +682,10 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         let directory = directory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let payee = try recipient()
-        let script = try PushDrop.lockingScript(
-            fields: [payee.compressedBytes, Array("https://testnet-box.example/mb".utf8)],
-            publicKey: PrivateKey(Array(repeating: 0, count: 31) + [1]).publicKey,
-            lockPosition: .beforeCompatibility)
+        // The payee's own signed advertisement, as TS `anointHost` makes it.
+        let script = try await MessageBoxAdvertiser.lockingScript(
+            host: URL(string: "https://testnet-box.example/mb")!,
+            wallet: ProtoWallet(rootKey: PrivateKey(Array(repeating: 0, count: 31) + [2])))
         let transaction = Transaction(version: 1, inputs: [],
             outputs: [TransactionOutput(satoshis: 1, lockingScript: script)], lockTime: 0)
         let beef = try BEEF(version: .v2, merklePaths: [], transactions: [.raw(transaction)],

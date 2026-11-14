@@ -4,6 +4,7 @@ import BSVKeys
 import BSVOverlay
 import BSVScript
 import BSVTransaction
+import BSVWallet
 import ToolboxStorage
 @testable import ToolboxWallet
 
@@ -30,17 +31,25 @@ final class MessageBoxDiscoveryTests: XCTestCase, @unchecked Sendable {
     private func key(_ value: UInt8) throws -> PublicKey {
         try PrivateKey(Array(repeating: 0, count: 31) + [value]).publicKey
     }
-    private func advertisement(host: String, identity: PublicKey) throws -> OutputListItem {
-        let script = try PushDrop.lockingScript(fields: [identity.compressedBytes, Array(host.utf8)],
-            publicKey: key(1), lockPosition: .beforeCompatibility)
+    private func item(_ script: Script) throws -> OutputListItem {
         let transaction = Transaction(version: 1, inputs: [],
             outputs: [TransactionOutput(satoshis: 1, lockingScript: script)], lockTime: 0)
         let beef = try BEEF(version: .v2, merklePaths: [], transactions: [.raw(transaction)], limits: StorageLimits.beef)
         return try OutputListItem(beef: beef.serialized(limits: StorageLimits.beef), outputIndex: 0)
     }
+    /// The advertisement TS `anointHost` makes, signed by the key `signer` names.
+    private func advertisement(host: String, signer: UInt8) async throws -> OutputListItem {
+        let wallet = ProtoWallet(rootKey: try PrivateKey(Array(repeating: 0, count: 31) + [signer]))
+        return try item(try await MessageBoxAdvertiser.lockingScript(host: URL(string: host)!, wallet: wallet))
+    }
+    /// The two-field form with no signature, for a host `anointHost` would refuse.
+    private func unsigned(host: String, identity: PublicKey) throws -> OutputListItem {
+        try item(PushDrop.lockingScript(fields: [identity.compressedBytes, Array(host.utf8)],
+            publicKey: key(1), lockPosition: .beforeCompatibility))
+    }
     func test_typescriptPushDropAdvertisementOverridesConfiguredFallback() async throws {
         let recipient = try key(2)
-        let item = try advertisement(host: "https://recipient.example/mb", identity: recipient)
+        let item = try await advertisement(host: "https://recipient.example/mb", signer: 2)
         let resolver = AdvertisementResolver(answer: try LookupAnswer(outputList: [item]))
         let host = try await MessageBoxDiscovery(resolver: resolver).host(for: recipient,
             fallback: URL(string: "https://default.example")!)
@@ -48,13 +57,36 @@ final class MessageBoxDiscoveryTests: XCTestCase, @unchecked Sendable {
     }
     func test_unsafeOrWrongIdentityAdvertisementFallsBack() async throws {
         let recipient = try key(2)
-        for item in [try advertisement(host: "http://unsafe.example", identity: recipient),
-            try advertisement(host: "https://wrong.example", identity: key(3))] {
+        for item in [try unsigned(host: "http://unsafe.example", identity: recipient),
+            try await advertisement(host: "https://wrong.example", signer: 3)] {
             let resolver = AdvertisementResolver(answer: try LookupAnswer(outputList: [item]))
             let host = try await MessageBoxDiscovery(resolver: resolver).host(for: recipient,
                 fallback: URL(string: "https://default.example")!)
             XCTAssertEqual(host.host, "default.example")
         }
+    }
+
+    /// As TS 2.7.0: an advertisement the recipient did not sign is skipped, whether it carries no
+    /// signature or the recipient's signature over another host.
+    func test_anAdvertisementTheRecipientDidNotSignIsSkipped() async throws {
+        let recipient = try key(2)
+        let signed = try await MessageBoxAdvertiser.lockingScript(host: URL(string: "https://recipient.example")!,
+            wallet: ProtoWallet(rootKey: PrivateKey(Array(repeating: 0, count: 31) + [2])))
+        let decoded = try PushDrop.decode(signed, lockPosition: .beforeCompatibility)
+        let tampered = try item(PushDrop.lockingScript(
+            fields: [recipient.compressedBytes, Array("https://attacker.example".utf8), decoded.fields[2]],
+            publicKey: decoded.publicKey, lockPosition: .beforeCompatibility))
+        let noSignature = try unsigned(host: "https://attacker.example", identity: recipient)
+        let genuine = try item(signed)
+        let resolver = AdvertisementResolver(answer: try LookupAnswer(outputList: [tampered, noSignature, genuine]))
+        let host = try await MessageBoxDiscovery(resolver: resolver).host(for: recipient,
+            fallback: URL(string: "https://default.example")!)
+        XCTAssertEqual(host.absoluteString, "https://recipient.example")
+
+        let forgedOnly = AdvertisementResolver(answer: try LookupAnswer(outputList: [tampered, noSignature]))
+        let fallback = try await MessageBoxDiscovery(resolver: forgedOnly).host(for: recipient,
+            fallback: URL(string: "https://default.example")!)
+        XCTAssertEqual(fallback.host, "default.example")
     }
 
     func test_trackersMatchTypeScriptNetworkPresets() {

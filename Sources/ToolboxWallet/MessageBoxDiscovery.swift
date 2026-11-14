@@ -7,8 +7,8 @@ import BSVScript
 import BSVTransaction
 import ToolboxStorage
 
-/// Matches MessageBoxClient.queryAdvertisements: resolve ls_messagebox, decode
-/// the advertised PushDrop host, and use the configured fallback when absent.
+/// Matches MessageBoxClient.queryAdvertisements: resolve ls_messagebox, keep the first
+/// advertisement the recipient signed, and use the configured fallback when there is none.
 public struct MessageBoxDiscovery: Sendable {
     /// `DEFAULT_SLAP_TRACKERS` in @bsv/sdk `src/overlay-tools/LookupResolver.ts`.
     public static let mainnetSLAPTrackers = ["https://overlay-us-1.bsvb.tech",
@@ -48,32 +48,19 @@ public struct MessageBoxDiscovery: Sendable {
             let answer = try await resolver.resolve(LookupQuestion(
                 service: OverlayService(rawValue: "ls_messagebox"), query: Array(query)))
             if case .outputList(let outputs) = answer {
+                // As TS 2.7.0 `queryAdvertisements`: only an advertisement the recipient signed
+                // counts, so nobody else can route the recipient's payments to their own host.
                 for output in outputs {
-                    guard let transaction = try? Self.transaction(output.beef),
-                          Int(output.outputIndex) < transaction.outputs.count,
-                          // TS MessageBox advertisements use PushDrop's default
-                          // key-before-fields layout, not the Swift default.
-                          let token = try? PushDrop.decode(transaction.outputs[Int(output.outputIndex)].lockingScript,
-                              lockPosition: .beforeCompatibility),
-                          token.fields.count >= 2,
-                          token.fields[0] == recipient.compressedBytes,
-                          let text = String(bytes: token.fields[1], encoding: .utf8),
-                          let host = MessageBoxHost.advertised(text) else { continue }
-                    return host
+                    try Task.checkCancellation()
+                    guard let advertisement = await MessageBoxAdvertiser.advertisement(output, identity: recipient)
+                    else { continue }
+                    return advertisement.host
                 }
             }
         } catch is CancellationError { throw CancellationError() }
         catch { /* The reference client falls back on an unavailable overlay. */ }
         try Task.checkCancellation()
         return fallback
-    }
-
-    private static func transaction(_ bytes: [UInt8]) throws -> Transaction? {
-        if bytes.starts(with: [1, 1, 1, 1]) {
-            let atomic = try AtomicBEEF(bytes: bytes, limits: StorageLimits.beef)
-            return try atomic.beef.transaction(for: atomic.subjectTransactionID, limits: StorageLimits.transaction)
-        }
-        return try BEEF(bytes: bytes, limits: StorageLimits.beef).transactions.last?.transaction
     }
 
 }

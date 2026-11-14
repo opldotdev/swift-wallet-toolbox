@@ -143,8 +143,34 @@ The recipient must understand standard PeerPay payment tokens. Server acceptance
 that the recipient has internalized the payment.
 
 This slice supports zero-fee delivery. Blocked recipients or quotes requiring an additional
-delivery payment are refused before transaction creation. It does not register receiving hosts,
-poll inboxes, or silently pay delivery fees. Configured endpoints must use HTTPS.
+delivery payment are refused before transaction creation. It does not poll inboxes or silently
+pay delivery fees. Configured endpoints must use HTTPS.
+
+### Advertising the receiving host
+
+A sender looks the recipient up in `ls_messagebox` and, finding nothing, delivers to its own
+default host. `MessageBoxAdvertiser` publishes the host a wallet reads, as the reference
+`MessageBoxClient.anointHost`, `revokeHostAdvertisement` and `queryAdvertisements` do:
+
+```swift
+let advertiser = try MessageBoxAdvertiser(network: .mainnet)
+let mine = try await advertiser.advertisements(of: identityKey)
+if !mine.contains(where: { $0.names(host) }) {
+    _ = try await advertiser.anoint(host, wallet: wallet)   // creates and broadcasts a transaction
+}
+```
+
+The advertisement is a 1-satoshi PushDrop in the `overlay advertisements` basket, submitted to
+`tm_messagebox`. `anoint` spends every earlier advertisement the overlay lists and the wallet holds
+as spendable; `revoke` spends one without replacing it. Each creates a transaction, so call them
+only on an explicit user action. As TS `TopicBroadcaster` does, the submission succeeds once one
+interested SHIP host admits the transaction; the result lists the hosts that took it and those
+that failed. A signing failure or a cancellation before the wallet signed aborts the action.
+Unlike TS, a failed lookup throws rather than reading as "not advertised", and `anoint` refuses
+to go on without it.
+
+`MessageBoxDiscovery` takes a recipient's host only from an advertisement the recipient signed,
+as TS 2.7.0 `queryAdvertisements` checks it.
 
 ### MessageBox incoming payments
 
