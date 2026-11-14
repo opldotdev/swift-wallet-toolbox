@@ -96,7 +96,7 @@ public struct MessageBoxAdvertiser: Sendable {
     /// As TS `networkPreset`: a testnet identity advertises on, and looks up from, testnet
     /// trackers only.
     public init(network: BitcoinNetwork = .mainnet) throws {
-        let configuration = OverlayHTTPConfiguration(beefLimits: StorageLimits.beef)
+        let configuration = try OverlayHTTPConfiguration(beefLimits: StorageLimits.beef)
         let resolver = try LookupResolver(facilitator: HTTPSOverlayLookupFacilitator(configuration: configuration),
             slapTrackers: MessageBoxDiscovery.slapTrackers(for: network).map { try OverlayHost(rawValue: $0) },
             beefLimits: StorageLimits.beef)
