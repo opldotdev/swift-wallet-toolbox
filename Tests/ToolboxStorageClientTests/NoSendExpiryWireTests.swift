@@ -85,7 +85,7 @@ final class NoSendExpiryWireTests: XCTestCase {
         let bodies = await transport.bodies
         XCTAssertEqual(bodies[0]["method"]?.stringValue, "prepareNoSendExpiry")
         let args = try XCTUnwrap(bodies[0]["params"]?.arrayValue?[1])
-        XCTAssertEqual(args, .object(try StorageClient.arguments(for: try target())))
+        XCTAssertEqual(args, try StorageClient.noSendExpiryTarget(try target()).jsonValue)
         XCTAssertEqual(args["labels"], .array([.string("p nosend expiry seconds 60")]))
         XCTAssertEqual(args["options"]?["noSend"], .bool(true))
         XCTAssertEqual(args["isNoSend"], .bool(true))
@@ -104,7 +104,7 @@ final class NoSendExpiryWireTests: XCTestCase {
 
         let recorded = await transport.bodies
         let args = try XCTUnwrap(recorded[0]["params"]?.arrayValue?[1])
-        XCTAssertEqual(args["target"], .object(try StorageClient.arguments(for: try target())))
+        XCTAssertEqual(args["target"], try StorageClient.noSendExpiryTarget(try target()).jsonValue)
         XCTAssertEqual(args["fundingReference"], .string("Zg=="))
         XCTAssertEqual(args["fundingTxid"], .string(txid))
         XCTAssertEqual(args["anchorVout"], .number(0))

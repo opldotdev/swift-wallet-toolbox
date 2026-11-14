@@ -10,9 +10,9 @@ extension StorageClient {
         _ auth: AuthID, _ request: WalletListCertificatesRequest
     ) async throws -> WalletListCertificatesResult {
         let codec = try WalletBRC100JSONCodec(beefLimits: StorageLimits.beef)
-        let bytes = try codec.encodeRequest(.certificate(.listCertificates(request)))
-        let arguments = try JSONDecoder().decode(JSONValue.self, from: Data(bytes))
-        let result = try await call("listCertificates", [.object(auth.jsonObject), arguments])
+        let result = try await call(
+            "listCertificates", [.object(auth.jsonObject), try Self.listCertificatesArguments(request)]
+        )
         do {
             let encoded = try JSONEncoder().encode(result)
             guard case .certificate(.listCertificates(let certificates)) = try codec.decodeResult(
@@ -24,6 +24,25 @@ extension StorageClient {
         } catch {
             throw StorageClientError.unreadableResponse(method: "listCertificates")
         }
+    }
+
+    /// `ValidListCertificatesArgs` as `validateListCertificatesArgs` builds it.
+    ///
+    /// The BRC-100 request leaves `limit`, `offset` and `privileged` out when unset; storage reads
+    /// the validated defaults (10, 0, false) without filling them in, so they are filled in here.
+    /// Certifiers and types keep the BRC-100 JSON codec's encoding, which is the reference's.
+    static func listCertificatesArguments(
+        _ request: WalletListCertificatesRequest
+    ) throws -> JSONValue {
+        let codec = try WalletBRC100JSONCodec(beefLimits: StorageLimits.beef)
+        let bytes = try codec.encodeRequest(.certificate(.listCertificates(request)))
+        guard var arguments = try JSONDecoder().decode(JSONValue.self, from: Data(bytes)).objectValue else {
+            throw StorageClientError.unreadableResponse(method: "listCertificates")
+        }
+        arguments["limit"] = .number(Double(request.pagination.effectiveLimit))
+        arguments["offset"] = .number(Double(request.pagination.effectiveOffset))
+        arguments["privileged"] = .bool(request.privilege.privileged ?? false)
+        return .object(arguments)
     }
 
     /// Stores a certificate with its fields and master keyring, returning storage's record id.

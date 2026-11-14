@@ -21,7 +21,7 @@ extension StorageClient: NoSendExpiryStorage {
     ) async throws -> NoSendExpiryPrepared {
         let result = try await call(
             "prepareNoSendExpiry",
-            [.object(auth.jsonObject), .object(try Self.noSendExpiryTarget(target))]
+            rawParams: [Self.authJSON(auth), try Self.noSendExpiryTarget(target)]
         )
         return try Self.decodePrepared(result)
     }
@@ -30,13 +30,14 @@ extension StorageClient: NoSendExpiryStorage {
         _ auth: AuthID, target: WalletCreateActionRequest, fundingReference: String,
         fundingTxid: String, anchorVout: UInt32
     ) async throws -> NoSendExpiryActivated {
-        let result = try await call("activateNoSendExpiry", [
-            .object(auth.jsonObject),
-            .object([
-                "target": .object(try Self.noSendExpiryTarget(target)),
+        // `{ ...args, target }` of `StorageActivateNoSendExpiryArgs`, in the reference's order.
+        let result = try await call("activateNoSendExpiry", rawParams: [
+            Self.authJSON(auth),
+            .record([
+                "target": try Self.noSendExpiryTarget(target),
                 "fundingReference": .string(fundingReference),
                 "fundingTxid": .string(fundingTxid),
-                "anchorVout": .number(Double(anchorVout)),
+                "anchorVout": .int(anchorVout),
             ]),
         ])
         return try Self.decodeActivated(result)
@@ -58,9 +59,13 @@ extension StorageClient: NoSendExpiryStorage {
 
     /// The protected action's arguments, checked the way storage checks them before any call, so
     /// a request storage would refuse is refused here without reserving anything.
+    ///
+    /// This is the reference signer's `targetForStorage`: the validated arguments without unlocking
+    /// scripts, `inputBEEF` kept even with no inputs, and `includeAllSourceTransactions` as the
+    /// reference `Wallet` sets it by default (true).
     static func noSendExpiryTarget(
         _ target: WalletCreateActionRequest
-    ) throws -> [String: JSONValue] {
+    ) throws -> OrderedJSON {
         guard try NoSendExpiry.parse(labels: target.labels ?? []) != nil else {
             throw NoSendExpiryError.invalidRequest("no BRC-177 expiry label")
         }
@@ -80,7 +85,7 @@ extension StorageClient: NoSendExpiryStorage {
         guard options?.returnTransactionIDOnly != true else {
             throw NoSendExpiryError.invalidRequest("options.returnTXIDOnly must be false")
         }
-        return try arguments(for: target)
+        return try validatedArguments(for: target, includeAllSourceTransactions: true)
     }
 
     static func decodePrepared(_ result: JSONValue) throws -> NoSendExpiryPrepared {

@@ -180,7 +180,12 @@ final class CreateActionTests: XCTestCase {
         let arguments = try StorageClient.arguments(for: request)
         let input = try XCTUnwrap(arguments["inputs"]?.arrayValue?.first)
 
-        XCTAssertEqual(input["outpoint"]?.stringValue, outpoint)
+        // Validated `{txid, vout}`, as `parseWalletOutpoint` produces it. Storage reads
+        // `outpoint.txid`; the BRC-100 string made that undefined and storage failed internally.
+        XCTAssertEqual(input["outpoint"], .object([
+            "txid": .string("8ac7230489e80000000000000000000000000000000000000000000000000001"),
+            "vout": .number(2),
+        ]))
         XCTAssertEqual(input["unlockingScriptLength"]?.intValue, 107)
         XCTAssertEqual(input["sequenceNumber"]?.intValue, 42)
     }

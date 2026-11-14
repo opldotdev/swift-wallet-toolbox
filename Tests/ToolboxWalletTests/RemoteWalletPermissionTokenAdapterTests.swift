@@ -775,7 +775,10 @@ private actor MutationTransport: AuthenticatedTransport {
         let arguments = try XCTUnwrap(request["params"]?.arrayValue?[1])
         let inputRows = try XCTUnwrap(arguments["inputs"]?.arrayValue)
         var fundedInputs = try inputRows.map { row -> JSONValue in
-            let outpointText = try XCTUnwrap(row["outpoint"]?.stringValue)
+            // Storage receives the validated `{txid, vout}` outpoint, never the BRC-100 string.
+            let outpointTXID = try XCTUnwrap(row["outpoint"]?["txid"]?.stringValue)
+            let outpointVout = try XCTUnwrap(row["outpoint"]?["vout"]?.intValue)
+            let outpointText = "\(outpointTXID).\(outpointVout)"
             let fixture = try XCTUnwrap(sources[outpointText])
             let output = fixture.transaction.outputs[Int(fixture.outpoint.outputIndex)]
             var sourceTXID = fixture.outpoint.transactionID.displayHex

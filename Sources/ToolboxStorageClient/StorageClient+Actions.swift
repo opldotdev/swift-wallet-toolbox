@@ -20,11 +20,26 @@ extension StorageClient {
         includeAllSourceTransactions: Bool = false
     ) async throws -> StorageCreateActionResult {
         let result = try await call(
-            "createAction", [.object(auth.jsonObject), .object(try Self.arguments(
+            "createAction", rawParams: [Self.authJSON(auth), try Self.createActionWireArguments(
                 for: request, includeAllSourceTransactions: includeAllSourceTransactions
-            ))]
+            )]
         )
         return try Self.decodeCreateAction(result)
+    }
+
+    /// The second positional parameter of `createAction`, as the reference `StorageClient` sends it.
+    ///
+    /// The validated arguments, less `inputBEEF` when there are no caller inputs: the reference
+    /// client drops it there (`StorageClientBase.createAction`), since storage has nothing to
+    /// read it for.
+    static func createActionWireArguments(
+        for request: WalletCreateActionRequest, includeAllSourceTransactions: Bool = false
+    ) throws -> OrderedJSON {
+        let validated = try validatedArguments(
+            for: request, includeAllSourceTransactions: includeAllSourceTransactions
+        )
+        guard (request.inputs ?? []).isEmpty else { return validated }
+        return validated.setting("inputBEEF", nil)
     }
 
     /// Hands a signed transaction back for finalisation and broadcast.
@@ -68,105 +83,30 @@ extension StorageClient {
         return StorageProcessActionResult(sendWithResults: sendWith)
     }
 
-    /// The validated argument shape the storage protocol expects.
+    /// The validated argument shape the storage protocol expects: `@bsv/sdk`
+    /// `validateCreateActionArgs`, then the reference signer's `removeUnlockScripts`.
     ///
-    /// Fields the reference client always sends are always sent, including empty collections. The
-    /// server reads several of them without checking they exist, so an omitted empty array is a
-    /// fault there rather than a default here — `tags` on `listOutputs` proved that the hard way.
+    /// Storage does not validate these again. It reads `outpoint.txid` and `outpoint.vout` from
+    /// each input and from each `noSendChange` entry, and the derived flags as given, so the raw
+    /// BRC-100 shape (outpoints as `"txid.vout"` strings) fails inside storage as `WERR_INTERNAL`.
+    /// Fields the reference always sends are always sent, including empty collections.
+    static func validatedArguments(
+        for request: WalletCreateActionRequest, includeAllSourceTransactions: Bool = false
+    ) throws -> OrderedJSON {
+        try ActionBatchWire.createActionArguments(
+            request, compact: false, beefLimits: StorageLimits.beef,
+            stripUnlockingScripts: true,
+            includeAllSourceTransactions: includeAllSourceTransactions
+        )
+    }
+
+    /// `validatedArguments` read back by key, for callers and tests that inspect members.
     static func arguments(
         for request: WalletCreateActionRequest, includeAllSourceTransactions: Bool = false
     ) throws -> [String: JSONValue] {
-        let requestedOutputs = request.outputs ?? []
-        let requestedInputs = request.inputs ?? []
-        let options = request.options
-
-        let outputs = requestedOutputs.map { output -> JSONValue in
-            var encoded: [String: JSONValue] = [
-                "lockingScript": .string(hexText(output.lockingScript)),
-                "satoshis": .number(Double(output.satoshis)),
-                "outputDescription": .string(output.outputDescription),
-                "tags": .array(output.tags.map { .string($0) }),
-            ]
-            if let basket = output.basket { encoded["basket"] = .string(basket) }
-            if let instructions = output.customInstructions {
-                encoded["customInstructions"] = .string(instructions)
-            }
-            return .object(encoded)
-        }
-
-        // Caller inputs travel with their outpoint, sequence and the length of the unlocking
-        // script they will carry once signed. The script bytes themselves are not sent — storage
-        // does not sign — but the length is, so the fee it funds matches the final weight.
-        let inputs = requestedInputs.map { input -> JSONValue in
-            var encoded: [String: JSONValue] = [
-                "outpoint": .string(input.outpoint.description),
-                "inputDescription": .string(input.inputDescription),
-                "unlockingScriptLength": .number(Double(unlockingLength(of: input.unlocking))),
-            ]
-            if let sequence = input.sequenceNumber {
-                encoded["sequenceNumber"] = .number(Double(sequence))
-            }
-            return .object(encoded)
-        }
-
-        let isNewTx = !requestedOutputs.isEmpty || !requestedInputs.isEmpty
-        let noSend = options?.noSend ?? false
-        // Unset means true in the reference client, so storage hears the same flags it would there.
-        let delayed = options?.acceptDelayedBroadcast ?? true
-        let sendWith = (options?.sendWith ?? []).map { JSONValue.string($0.displayHex) }
-
-        var encoded: [String: JSONValue] = [
-            "description": .string(request.description),
-            "inputs": .array(inputs),
-            "outputs": .array(outputs),
-            "lockTime": .number(Double(request.lockTime ?? 0)),
-            "version": .number(Double(request.version ?? 1)),
-            "labels": .array((request.labels ?? []).map { .string($0) }),
-            "options": .object([
-                "acceptDelayedBroadcast": .bool(delayed),
-                "returnTXIDOnly": .bool(options?.returnTransactionIDOnly ?? false),
-                "noSend": .bool(noSend),
-                "sendWith": .array(sendWith),
-                // Overridden, and only this one: the wallet holds the keys, so storage must stop
-                // and hand the action back rather than completing it.
-                "signAndProcess": .bool(false),
-                "knownTxids": .array(
-                    (options?.knownTransactionIDs ?? []).map { .string($0.displayHex) }
-                ),
-                "noSendChange": .array(
-                    (options?.noSendChange ?? []).map { .string($0.description) }
-                ),
-                "randomizeOutputs": .bool(options?.randomizeOutputs ?? true),
-            ].merging(trustSelf(options?.trustSelf)) { $1 }),
-            "isSignAction": .bool(true),
-            "isSendWith": .bool(!sendWith.isEmpty),
-            "isNewTx": .bool(isNewTx),
-            "isRemixChange": .bool(false),
-            "isNoSend": .bool(noSend),
-            "isDelayed": .bool(delayed),
-            "isTestWerrReviewActions": .bool(false),
-            "includeAllSourceTransactions": .bool(includeAllSourceTransactions),
-        ]
-        if let inputBEEF = request.inputBEEF {
-            encoded["inputBEEF"] = .array(
-                try inputBEEF.serialized(limits: StorageLimits.beef).map { .number(Double($0)) }
-            )
-        }
-        return encoded
-    }
-
-    /// `trustSelf: 'known'` lets storage leave out of the returned BEEF the proofs the wallet
-    /// already holds. The reference client sends it only when set; absent means "verify all".
-    private static func trustSelf(_ value: WalletTrustSelf?) -> [String: JSONValue] {
-        guard let value else { return [:] }
-        return ["trustSelf": .string(value.rawValue)]
-    }
-
-    private static func unlockingLength(of unlocking: WalletInputUnlocking) -> UInt32 {
-        switch unlocking {
-        case .script(let bytes): UInt32(bytes.count)
-        case .scriptLength(let length): length
-        }
+        try validatedArguments(
+            for: request, includeAllSourceTransactions: includeAllSourceTransactions
+        ).jsonValue.objectValue ?? [:]
     }
 
     /// Reads the funded action.

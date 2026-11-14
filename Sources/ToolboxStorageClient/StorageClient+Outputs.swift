@@ -19,32 +19,33 @@ extension StorageClient {
     public func listOutputs(
         _ auth: AuthID, _ request: WalletListOutputsRequest
     ) async throws -> WalletListOutputsResult {
-        // `tags` is always sent, even empty. The server reads its length without checking it
-        // exists, so omitting it is a crash there rather than a default here.
-        var arguments: [String: JSONValue] = [
-            "basket": .string(request.basket),
-            "tags": .array(request.tags.map { .string($0) }),
-        ]
-        if let limit = request.pagination.limit {
-            arguments["limit"] = .number(Double(limit))
-        }
-        if let offset = request.pagination.offset {
-            arguments["offset"] = .number(Double(offset))
-        }
-        if request.includeTags == true { arguments["includeTags"] = .bool(true) }
-        if request.includeLabels == true { arguments["includeLabels"] = .bool(true) }
-        if request.includeCustomInstructions == true {
-            arguments["includeCustomInstructions"] = .bool(true)
-        }
-        // Storage consumes validated arguments, not the public BRC-100 include selector.
-        arguments["includeLockingScripts"] = .bool(request.include == .lockingScripts)
-        arguments["includeTransactions"] = .bool(request.include == .entireTransactions)
-        if let tagQueryMode = request.tagQueryMode {
-            arguments["tagQueryMode"] = .string(tagQueryMode.rawValue)
-        }
-
-        let result = try await call("listOutputs", [.object(auth.jsonObject), .object(arguments)])
+        let result = try await call(
+            "listOutputs", rawParams: [Self.authJSON(auth), Self.listOutputsArguments(request)]
+        )
         return try Self.decodeOutputs(result)
+    }
+
+    /// `ValidListOutputsArgs`, member for member as `validateListOutputsArgs` builds it.
+    ///
+    /// Storage reads these without validating them again, so every default the reference fills in
+    /// is filled in here: an omitted `limit` reached storage as "no limit" rather than ten, and an
+    /// omitted `tags` is a crash there. Basket and tags are trimmed and lowercased as the
+    /// reference does.
+    static func listOutputsArguments(_ request: WalletListOutputsRequest) -> OrderedJSON {
+        .record([
+            "basket": .string(ActionBatchWire.identifier(request.basket)),
+            "tags": .strings(ActionBatchWire.identifiers(request.tags)),
+            "tagQueryMode": .string((request.tagQueryMode ?? .any).rawValue),
+            "includeLockingScripts": .bool(request.include == .lockingScripts),
+            "includeTransactions": .bool(request.include == .entireTransactions),
+            "includeCustomInstructions": .bool(request.includeCustomInstructions ?? false),
+            "includeTags": .bool(request.includeTags ?? false),
+            "includeLabels": .bool(request.includeLabels ?? false),
+            "limit": .int(request.pagination.effectiveLimit),
+            "offset": .int(request.pagination.effectiveOffset),
+            "seekPermission": .bool(request.seekPermission ?? true),
+            "knownTxids": .array([]),
+        ])
     }
 
     /// Turns the store's answer into wallet records.

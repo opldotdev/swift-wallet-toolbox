@@ -139,7 +139,7 @@ struct StagedAction: Sendable {
         ])
         let metadata = OrderedJSON.record([
             "description": .string(request.description),
-            "labels": .strings(request.labels ?? []),
+            "labels": .strings(ActionBatchWire.identifiers(request.labels ?? [])),
             "isNoSend": .bool(planned.isNoSend),
             "isDelayed": .bool(isDelayed),
             "inputs": .array((request.inputs ?? []).map { ActionBatchWire.input($0) }),

@@ -15,38 +15,31 @@ extension StorageClient {
     public func listActions(
         _ auth: AuthID, _ request: WalletListActionsRequest
     ) async throws -> WalletListActionsResult {
-        var arguments: [String: JSONValue] = [
-            "labels": .array(request.labels.map { .string($0) })
-        ]
-        if let limit = request.pagination.limit { arguments["limit"] = .number(Double(limit)) }
-        if let offset = request.pagination.offset { arguments["offset"] = .number(Double(offset)) }
-        if let mode = request.labelQueryMode {
-            arguments["labelQueryMode"] = .string(mode.rawValue)
-        }
-        if let include = request.includeLabels {
-            arguments["includeLabels"] = .bool(include)
-        }
-        if let include = request.includeInputs {
-            arguments["includeInputs"] = .bool(include)
-        }
-        if let include = request.includeInputSourceLockingScripts {
-            arguments["includeInputSourceLockingScripts"] = .bool(include)
-        }
-        if let include = request.includeInputUnlockingScripts {
-            arguments["includeInputUnlockingScripts"] = .bool(include)
-        }
-        if let include = request.includeOutputs {
-            arguments["includeOutputs"] = .bool(include)
-        }
-        if let include = request.includeOutputLockingScripts {
-            arguments["includeOutputLockingScripts"] = .bool(include)
-        }
-        if let seek = request.seekPermission {
-            arguments["seekPermission"] = .bool(seek)
-        }
-
-        let result = try await call("listActions", [.object(auth.jsonObject), .object(arguments)])
+        let result = try await call(
+            "listActions", rawParams: [Self.authJSON(auth), Self.listActionsArguments(request)]
+        )
         return try Self.decodeActions(result)
+    }
+
+    /// `ValidListActionsArgs`, member for member as `validateListActionsArgs` builds it.
+    ///
+    /// Storage reads these without validating them again: an omitted `limit` or `offset` reached
+    /// storage as "no limit" rather than ten, and the include flags it tests must be booleans.
+    /// Labels are trimmed and lowercased as the reference does.
+    static func listActionsArguments(_ request: WalletListActionsRequest) -> OrderedJSON {
+        .record([
+            "labels": .strings(ActionBatchWire.identifiers(request.labels)),
+            "labelQueryMode": .string((request.labelQueryMode ?? .any).rawValue),
+            "includeLabels": .bool(request.includeLabels ?? false),
+            "includeInputs": .bool(request.includeInputs ?? false),
+            "includeInputSourceLockingScripts": .bool(request.includeInputSourceLockingScripts ?? false),
+            "includeInputUnlockingScripts": .bool(request.includeInputUnlockingScripts ?? false),
+            "includeOutputs": .bool(request.includeOutputs ?? false),
+            "includeOutputLockingScripts": .bool(request.includeOutputLockingScripts ?? false),
+            "limit": .int(request.pagination.effectiveLimit),
+            "offset": .int(request.pagination.effectiveOffset),
+            "seekPermission": .bool(request.seekPermission ?? true),
+        ])
     }
 
     /// TypeScript `listActionsKnex` returns unsigned leftovers as `txid: tx.txid || ''`.
