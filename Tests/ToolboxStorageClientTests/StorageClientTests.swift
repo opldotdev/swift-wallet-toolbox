@@ -144,6 +144,37 @@ final class StorageClientTests: XCTestCase {
         XCTAssertEqual(envelope["id"]?.intValue, 1)
     }
 
+    /// The bytes on the wire are `JSON.stringify`'s. The storage server verifies the BRC-104
+    /// signature over `JSON.stringify(req.body)`, not over what arrived, so a client that wrote
+    /// `\/` for `/` (as `JSONEncoder` does) or `1500000.0` for an integer signed text the server
+    /// never rebuilds: an unsigned 401 on every inscribe (`type:text/plain`) and on any
+    /// `processAction`/`abortAction` whose base64 reference holds a `/`.
+    func test_aCallWritesTheBodyAsJSONStringifyWould() async throws {
+        let transport = FakeTransport(json: #"{"result": null}"#)
+        let client = StorageClient(endpoint: endpoint, transport: transport)
+
+        _ = try await client.call("abortAction", [
+            .object(auth.jsonObject),
+            .object([
+                "reference": .string("dGVz/A=="),
+                "tags": .array([.string("type:text/plain")]),
+                "satoshis": .number(1_500_000),
+            ]),
+        ])
+
+        let body = await transport.bodiesSent[0]
+        let text = String(decoding: body, as: UTF8.self)
+        XCTAssertEqual(
+            text,
+            #"{"jsonrpc":"2.0","method":"abortAction","params":[{"identityKey":"02aa","userId":7},"#
+                + #"{"reference":"dGVz/A==","satoshis":1500000,"tags":["type:text/plain"]}],"id":1}"#
+        )
+        XCTAssertEqual(
+            try OrderedJSON.parse(text).serialized(), text,
+            "the server's JSON.parse then JSON.stringify must give back the signed bytes"
+        )
+    }
+
     /// The first parameter is always the caller's identity. Storage decides which records to hand
     /// back from it, so a call that dropped it would read somebody else's wallet or nobody's.
     func test_theFirstParameterIsTheCallerIdentity() async throws {
