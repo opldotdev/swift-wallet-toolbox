@@ -72,4 +72,32 @@ final class OrderedJSONTests: XCTestCase {
             XCTAssertNoThrow(try OrderedJSON.parse(text), text)
         }
     }
+
+    /// A dictionary value converted for the wire must be a fixed point of Node's
+    /// `JSON.stringify(JSON.parse(text))`, because the storage server verifies our signature over
+    /// that re-serialisation rather than the bytes we sent. Node.js 22 returns the expected text
+    /// unchanged: index keys first, `/` unescaped, integral numbers without a fraction.
+    func test_convertedValuesMatchJSONStringifyAfterJSONParse() {
+        let value = JSONValue.object([
+            "tags": .array([.string("type:text/plain"), .string("origin")]),
+            "reference": .string("dGVz/A=="),
+            "satoshis": .number(1_500_000),
+            "rate": .number(0.5),
+            "b": .bool(true),
+            "10": .null,
+            "2": .null,
+            "01": .null,
+        ])
+        XCTAssertEqual(
+            OrderedJSON(value).serialized(),
+            #"{"2":null,"10":null,"01":null,"b":true,"rate":0.5,"reference":"dGVz/A==","satoshis":1500000,"tags":["type:text/plain","origin"]}"#
+        )
+    }
+
+    func test_javaScriptKeyOrderPutsOnlyCanonicalArrayIndexesFirst() {
+        XCTAssertEqual(
+            OrderedJSON.javaScriptKeyOrder(["b", "4294967295", "4294967294", "+1", "1", "a", "0"]),
+            ["0", "1", "4294967294", "+1", "4294967295", "a", "b"]
+        )
+    }
 }

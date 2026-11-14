@@ -111,7 +111,13 @@ public extension OrderedJSON {
         return .object(members)
     }
 
-    /// Converts an unordered value. Object members are sorted by key so the result is stable.
+    /// Converts an unordered value, with members in the order `JSON.stringify(JSON.parse(text))`
+    /// writes them back.
+    ///
+    /// A JavaScript object lists array-index keys (`"0"`, `"7"`, `"10"`) first, ascending by value,
+    /// whatever order they were parsed in; the other keys keep their parse order. So the index
+    /// keys come first here too, and the rest are sorted so the result is stable. A server that
+    /// re-serialises what it parsed then writes exactly these bytes.
     init(_ value: JSONValue) {
         switch value {
         case .null: self = .null
@@ -125,8 +131,25 @@ public extension OrderedJSON {
         case .string(let text): self = .string(text)
         case .array(let values): self = .array(values.map(OrderedJSON.init))
         case .object(let members):
-            self = .object(members.keys.sorted().map { Member($0, OrderedJSON(members[$0]!)) })
+            self = .object(Self.javaScriptKeyOrder(members.keys).map {
+                Member($0, OrderedJSON(members[$0]!))
+            })
         }
+    }
+
+    /// ECMAScript `OrdinaryOwnPropertyKeys`: array indexes (canonical decimal below 2³² − 1)
+    /// ascending by value, then every other key. With no parse order to keep, those are sorted.
+    static func javaScriptKeyOrder(_ keys: some Collection<String>) -> [String] {
+        var indexes: [(UInt32, String)] = []
+        var names: [String] = []
+        for key in keys {
+            if let index = UInt32(key), index != .max, String(index) == key {
+                indexes.append((index, key))
+            } else {
+                names.append(key)
+            }
+        }
+        return indexes.sorted { $0.0 < $1.0 }.map { $0.1 } + names.sorted()
     }
 
     /// The unordered form, for code that reads values by key.
