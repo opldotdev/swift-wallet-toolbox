@@ -133,17 +133,17 @@ struct StagedAction: Sendable {
             "version": .int(planned.version),
             "lockTime": .int(planned.lockTime),
             "inputs": .array(planned.inputs.map(\.compactJSON)),
-            "outputs": .array(planned.outputs.map(\.compactJSON)),
+            "outputs": .array(try planned.outputs.map { try $0.compactJSON() }),
             "derivationPrefix": .string(planned.derivationPrefix),
             "noSendChangeOutputVouts": planned.noSendChangeOutputVouts.map { .array($0.map { .int($0) }) },
         ])
         let metadata = OrderedJSON.record([
             "description": .string(request.description),
-            "labels": .strings(ActionBatchWire.identifiers(request.labels ?? [])),
+            "labels": .strings(try ActionBatchWire.identifiers(request.labels ?? [], name: "label")),
             "isNoSend": .bool(planned.isNoSend),
             "isDelayed": .bool(isDelayed),
             "inputs": .array((request.inputs ?? []).map { ActionBatchWire.input($0) }),
-            "outputs": .array((request.outputs ?? []).map { ActionBatchWire.output($0, lockingScript: "") }),
+            "outputs": .array(try (request.outputs ?? []).map { try ActionBatchWire.output($0, lockingScript: "") }),
         ])
         self.reference = planned.reference
         self.txid = txid

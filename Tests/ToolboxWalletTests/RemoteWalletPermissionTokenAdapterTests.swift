@@ -228,11 +228,16 @@ final class RemoteWalletPermissionTokenAdapterTests: XCTestCase {
             consumed: [source.match],
             created: []
         )
+        // The task waits until it has been cancelled, so the mutation always starts cancelled.
+        // Without the wait, the task could pass its own check before `cancel()` ran.
+        let (started, release) = AsyncStream<Void>.makeStream()
         let beforeTask = Task {
+            for await _ in started {}
             try Task.checkCancellation()
             return try await beforeAdapter.commitPermissionTokenMutation(beforeRequest)
         }
         beforeTask.cancel()
+        release.finish()
         do {
             _ = try await beforeTask.value
             XCTFail("pre-cancelled mutation must stop")

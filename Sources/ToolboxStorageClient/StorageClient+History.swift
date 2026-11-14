@@ -16,7 +16,7 @@ extension StorageClient {
         _ auth: AuthID, _ request: WalletListActionsRequest
     ) async throws -> WalletListActionsResult {
         let result = try await call(
-            "listActions", rawParams: [Self.authJSON(auth), Self.listActionsArguments(request)]
+            "listActions", rawParams: [Self.authJSON(auth), try Self.listActionsArguments(request)]
         )
         return try Self.decodeActions(result)
     }
@@ -26,9 +26,9 @@ extension StorageClient {
     /// Storage reads these without validating them again: an omitted `limit` or `offset` reached
     /// storage as "no limit" rather than ten, and the include flags it tests must be booleans.
     /// Labels are trimmed and lowercased as the reference does.
-    static func listActionsArguments(_ request: WalletListActionsRequest) -> OrderedJSON {
+    static func listActionsArguments(_ request: WalletListActionsRequest) throws -> OrderedJSON {
         .record([
-            "labels": .strings(ActionBatchWire.identifiers(request.labels)),
+            "labels": .strings(try ActionBatchWire.identifiers(request.labels, name: "label")),
             "labelQueryMode": .string((request.labelQueryMode ?? .any).rawValue),
             "includeLabels": .bool(request.includeLabels ?? false),
             "includeInputs": .bool(request.includeInputs ?? false),

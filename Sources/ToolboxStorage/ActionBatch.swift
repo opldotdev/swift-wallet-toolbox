@@ -300,16 +300,40 @@ public enum ActionBatchWire {
     public static let throwReviewActionsLabel =
         "a496e747fc3ad5fabdd4ae8f91184e71f87539bd3d962aa2548942faaaf0047a"
 
-    /// A basket, label or tag as the SDK's `validateIdentifier` returns it: trimmed, lowercased.
-    /// Storage stores and matches what it receives, so an unnormalised name would be a different
-    /// basket, label or tag there than the same name sent by the reference wallet.
-    public static func identifier(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    /// A basket, label or tag as the SDK's `validateIdentifier` returns it: trimmed, lowercased,
+    /// and 1 to 300 UTF-8 bytes once trimmed. Storage stores and matches what it receives, so an
+    /// unnormalised name would be a different basket, label or tag there than the same name sent
+    /// by the reference wallet, and a whitespace-only name would reach it as `""`.
+    ///
+    /// `name` is the parameter the error names, as the SDK's `validateBasket`, `validateLabel` and
+    /// `validateTag` name theirs: `basket`, `label` or `tag`.
+    public static func identifier(_ value: String, name: String) throws -> String {
+        let normalized = value.trimmingCharacters(in: javaScriptWhitespace).lowercased()
+        let bytes = normalized.utf8.count
+        if bytes < identifierBytes.lowerBound {
+            throw WireError.invalidParameter(name: name, message: "at least \(identifierBytes.lowerBound) length.")
+        }
+        if bytes > identifierBytes.upperBound {
+            throw WireError.invalidParameter(name: name, message: "no more than \(identifierBytes.upperBound) length.")
+        }
+        return normalized
     }
 
-    public static func identifiers(_ values: [String]) -> [String] {
-        values.map(identifier)
+    public static func identifiers(_ values: [String], name: String) throws -> [String] {
+        try values.map { try identifier($0, name: name) }
     }
+
+    /// `validateIdentifier`'s byte bounds.
+    public static let identifierBytes = 1...300
+
+    /// What `String.prototype.trim` removes: Unicode white space and line terminators, which is
+    /// Foundation's set less NEXT LINE (U+0085) and plus ZERO WIDTH NO-BREAK SPACE (U+FEFF).
+    static let javaScriptWhitespace: CharacterSet = {
+        var set = CharacterSet.whitespacesAndNewlines
+        set.remove(Unicode.Scalar(0x85)!)
+        set.insert(Unicode.Scalar(0xFEFF)!)
+        return set
+    }()
 
     /// `{txid, vout}`, as `parseWalletOutpoint` produces it.
     public static func outpoint(_ outpoint: Outpoint) -> OrderedJSON {
@@ -343,14 +367,14 @@ public enum ActionBatchWire {
 
     /// `ValidCreateActionOutput`. An absent basket or custom instructions is left out, as
     /// `JSON.stringify` leaves out the SDK's `undefined`.
-    public static func output(_ output: WalletCreateActionOutput, lockingScript: String? = nil) -> OrderedJSON {
+    public static func output(_ output: WalletCreateActionOutput, lockingScript: String? = nil) throws -> OrderedJSON {
         .record([
             "lockingScript": .string(lockingScript ?? hex(output.lockingScript)),
             "satoshis": .int(output.satoshis),
             "outputDescription": .string(output.outputDescription),
-            "basket": output.basket.map { .string(identifier($0)) },
+            "basket": try output.basket.map { .string(try identifier($0, name: "basket")) },
             "customInstructions": output.customInstructions.map { .string($0) },
-            "tags": .strings(identifiers(output.tags)),
+            "tags": .strings(try identifiers(output.tags, name: "tag")),
         ])
     }
 
@@ -400,10 +424,10 @@ public enum ActionBatchWire {
         let inputsJSON: [OrderedJSON] = inputs.map {
             input($0, includeUnlockingScript: !compact && !stripUnlockingScripts)
         }
-        let outputsJSON: [OrderedJSON] = outputs.map { output($0, lockingScript: compact ? "" : nil) }
+        let outputsJSON: [OrderedJSON] = try outputs.map { try output($0, lockingScript: compact ? "" : nil) }
         let lockTime: UInt32 = request.lockTime ?? 0
         let version: UInt32 = request.version ?? 1
-        let labels = identifiers(request.labels ?? [])
+        let labels = try identifiers(request.labels ?? [], name: "label")
         let isSendWith = !sendWith.isEmpty
         let isRemixChange = !isSendWith && inputs.isEmpty && outputs.isEmpty
         let isNewTx = isRemixChange || !inputs.isEmpty || !outputs.isEmpty

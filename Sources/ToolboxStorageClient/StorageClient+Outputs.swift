@@ -20,7 +20,7 @@ extension StorageClient {
         _ auth: AuthID, _ request: WalletListOutputsRequest
     ) async throws -> WalletListOutputsResult {
         let result = try await call(
-            "listOutputs", rawParams: [Self.authJSON(auth), Self.listOutputsArguments(request)]
+            "listOutputs", rawParams: [Self.authJSON(auth), try Self.listOutputsArguments(request)]
         )
         return try Self.decodeOutputs(result)
     }
@@ -31,10 +31,10 @@ extension StorageClient {
     /// is filled in here: an omitted `limit` reached storage as "no limit" rather than ten, and an
     /// omitted `tags` is a crash there. Basket and tags are trimmed and lowercased as the
     /// reference does.
-    static func listOutputsArguments(_ request: WalletListOutputsRequest) -> OrderedJSON {
+    static func listOutputsArguments(_ request: WalletListOutputsRequest) throws -> OrderedJSON {
         .record([
-            "basket": .string(ActionBatchWire.identifier(request.basket)),
-            "tags": .strings(ActionBatchWire.identifiers(request.tags)),
+            "basket": .string(try ActionBatchWire.identifier(request.basket, name: "basket")),
+            "tags": .strings(try ActionBatchWire.identifiers(request.tags, name: "tag")),
             "tagQueryMode": .string((request.tagQueryMode ?? .any).rawValue),
             "includeLockingScripts": .bool(request.include == .lockingScripts),
             "includeTransactions": .bool(request.include == .entireTransactions),
