@@ -306,6 +306,11 @@ public struct RemoteWallet: Sendable {
     /// The output index is confirmed against the signed transaction **before** the broadcast. A
     /// derivation that does not appear exactly once throws and nothing is sent, because telling the
     /// recipient a wrong index points it at an output it cannot spend.
+    ///
+    /// `beforeBroadcast` runs with the signed payment before storage sees it. If it throws, nothing
+    /// is broadcast and the funded action is aborted: its error is rethrown once storage confirms
+    /// the abort, and ``BRC29PaymentError/notReleased(reference:)`` is thrown instead when storage
+    /// does not, since the hook was handed the reference and may hold a record of it.
     public func payToCounterparty(
         recipient recipientIdentityKey: PublicKey,
         satoshis: UInt64,
@@ -344,7 +349,13 @@ public struct RemoteWallet: Sendable {
             $0.element.lockingScript.bytes == scriptBytes
         }
         guard matches.count == 1, let index = matches.first?.offset else {
-            _ = try? await abort(reference: funded.reference)
+            do {
+                try await release(funded.reference)
+            } catch {
+                // The derivation is what failed, and nothing outside this call holds the
+                // reference, so the caller gets that error even when the abort is not confirmed.
+                // Storage fails the abandoned unsigned action on its own (TS `TaskFailAbandoned`).
+            }
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
 
@@ -354,7 +365,7 @@ public struct RemoteWallet: Sendable {
                     transactionID: signed.transactionID, outputIndex: index,
                     atomicBEEF: try signed.atomicBEEF(), reference: funded.reference, results: []))
             } catch {
-                _ = try? await abort(reference: funded.reference)
+                try await release(funded.reference)
                 throw error
             }
         }
@@ -367,6 +378,20 @@ public struct RemoteWallet: Sendable {
             reference: funded.reference,
             results: processed.sendWithResults
         )
+    }
+
+    /// Aborts a funded action that will not be broadcast, and throws
+    /// ``BRC29PaymentError/notReleased(reference:)`` unless storage confirms the abort, so a caller
+    /// never takes coins that are still reserved for released ones. The abort runs in its own task:
+    /// a cancelled caller still releases what it reserved.
+    private func release(_ reference: String) async throws {
+        let released: Bool
+        do {
+            released = try await Task { try await self.abort(reference: reference) }.value
+        } catch {
+            throw BRC29PaymentError.notReleased(reference: reference)
+        }
+        guard released else { throw BRC29PaymentError.notReleased(reference: reference) }
     }
 
     /// Funds, signs and broadcasts the outputs, returning both the signed action (for a paymail
@@ -742,6 +767,9 @@ public enum BRC29PaymentError: Error, Equatable, Sendable {
     /// The derived output did not appear exactly once in the signed transaction. The payment was
     /// not broadcast. `matches` is how many outputs carried the derived locking script.
     case outputNotUniquelyIdentified(matches: Int)
+    /// The payment was not broadcast, but storage did not confirm the abort of its funded action,
+    /// so its inputs may still be reserved. Abort `reference` again to release them.
+    case notReleased(reference: String)
 }
 
 /// The outcome of a payment that reached storage.

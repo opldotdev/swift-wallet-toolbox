@@ -33,7 +33,7 @@ public struct MessageBoxClient: Sendable {
             URLQueryItem(name: "recipient", value: Hex.encode(recipient.compressedBytes)),
             URLQueryItem(name: "messageBox", value: messageBox)
         ]
-        let response = try await transport.send(method: "GET", path: path("permissions/quote"),
+        let response = try await exchange(method: "GET", path: path("permissions/quote"),
             query: query.percentEncodedQuery.map { "?" + $0 }, headers: [:], body: nil)
         let object = try parse(response)
         struct QuoteResponse: Decodable {
@@ -86,7 +86,7 @@ public struct MessageBoxClient: Sendable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let request = try encoder.encode(["message": envelope])
-        let response = try await transport.send(method: "POST", path: path("sendMessage"),
+        let response = try await exchange(method: "POST", path: path("sendMessage"),
             query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
         let object = try parse(response)
         guard object["status"] as? String == "success" else { throw MessageBoxError.rejected }
@@ -157,7 +157,7 @@ public struct MessageBoxClient: Sendable {
             ]
             if let messageId { fields["messageId"] = messageId }
             let request = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
-            let response = try await transport.send(method: "POST", path: path("listMessages"),
+            let response = try await exchange(method: "POST", path: path("listMessages"),
                 query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
             let object = try parse(response)
             guard let page = object["messages"] as? [Any] else { throw MessageBoxError.invalidResponse }
@@ -203,7 +203,7 @@ public struct MessageBoxClient: Sendable {
         let unique = messageIds.filter { seen.insert($0).inserted }
         guard !unique.isEmpty, unique.allSatisfy({ !$0.isEmpty }) else { throw MessageBoxError.invalidMessage }
         let request = try JSONSerialization.data(withJSONObject: ["messageIds": unique], options: [.sortedKeys])
-        let response = try await transport.send(method: "POST", path: path("acknowledgeMessage"),
+        let response = try await exchange(method: "POST", path: path("acknowledgeMessage"),
             query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
         _ = try parse(response)
     }
@@ -232,13 +232,54 @@ public struct MessageBoxClient: Sendable {
         guard !trimmed.isEmpty, !trimmed.contains("?"), !trimmed.contains("#"), !trimmed.contains("..") else {
             throw MessageBoxError.invalidMessage
         }
-        let response = try await transport.send(method: "POST", path: path(trimmed),
-            query: nil, headers: ["Content-Type": contentType], body: body)
+        let response: AuthenticatedResponse
+        do {
+            response = try await transport.send(method: "POST", path: path(trimmed),
+                query: nil, headers: ["Content-Type": contentType], body: body)
+        } catch AuthTransportError.unauthenticatedReply(let status, _) {
+            // A refusal from in front of the server's auth is still that status to these callers.
+            throw MessageBoxError.httpStatus(status)
+        }
         guard (200..<300).contains(response.statusCode) else {
             throw MessageBoxError.httpStatus(response.statusCode)
         }
         return response.body
     }
+
+    /// One JSON request. A refusal the server's gate sends before its auth runs (the 1Sat host
+    /// refuses `/sendMessage` with 403 `ERR_ACCOUNT_REQUIRED` there) comes back unsigned; it is
+    /// reported by its status and error code, as TS reports the status and body of such a reply,
+    /// rather than as a server that could not be verified.
+    private func exchange(
+        method: String, path: String, query: String?, headers: [String: String], body: [UInt8]?
+    ) async throws -> AuthenticatedResponse {
+        do {
+            return try await transport.send(method: method, path: path, query: query, headers: headers, body: body)
+        } catch AuthTransportError.unauthenticatedReply(let status, let body) {
+            throw Self.refusal(status: status, body: body)
+        }
+    }
+
+    /// The error for a non-2xx reply: the account gate's code by name, any other code with its
+    /// status, and the bare status when the body names none. The code is read from
+    /// `{"code": …}` (message-box-server and the 1Sat host) and kept only when it is a short
+    /// identifier, since an unsigned body is shown, never trusted.
+    static func refusal(status: Int, body: [UInt8]) -> MessageBoxError {
+        let object = try? JSONSerialization.jsonObject(with: Data(body)) as? [String: Any]
+        guard let code = object?["code"] as? String, !code.isEmpty, code.utf8.count <= 64,
+              code.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-" || $0 == "."
+              }) else {
+            return .httpStatus(status)
+        }
+        if code == accountRequiredCode { return .recipientAccountRequired }
+        return .refused(status: status, code: code)
+    }
+
+    /// The 1Sat host's account gate: the recipient holds no account there.
+    static let accountRequiredCode = "ERR_ACCOUNT_REQUIRED"
+    /// message-box-server's answer to a message ID it already stores.
+    static let duplicateMessageCode = "ERR_DUPLICATE_MESSAGE"
 
     public static let paymentInbox = "payment_inbox"
     /// The TS client caps box names at 64 UTF-8 bytes and forbids control characters.
@@ -271,7 +312,7 @@ public struct MessageBoxClient: Sendable {
 
     private func parse(_ response: AuthenticatedResponse) throws -> [String: Any] {
         guard (200..<300).contains(response.statusCode) else {
-            throw MessageBoxError.httpStatus(response.statusCode)
+            throw Self.refusal(status: response.statusCode, body: response.body)
         }
         guard let object = try JSONSerialization.jsonObject(with: Data(response.body)) as? [String: Any] else {
             throw MessageBoxError.invalidResponse
@@ -419,11 +460,48 @@ public struct MessageBoxListing: Sendable, Equatable {
     }
 }
 
-public enum MessageBoxError: Error, LocalizedError, Sendable {
+public enum MessageBoxError: Error, LocalizedError, Sendable, Equatable {
     case invalidHost, invalidResponse, blocked, deliveryFeeRequired, rejected, invalidMessage
     case httpStatus(Int)
+    /// The server holds no account for the recipient, so it will not store messages for them
+    /// (the 1Sat host's 403 `ERR_ACCOUNT_REQUIRED`). The recipient registers an account there;
+    /// the sender cannot.
+    case recipientAccountRequired
+    /// The server refused with an error code other than the account gate's.
+    case refused(status: Int, code: String)
+
+    /// The server answered and turned the request down, so nothing it was asked to store was
+    /// stored: an account, block, fee or rejection decision, or a 4xx other than 408 and 429.
+    /// False for a failure that decided nothing (a 5xx, a timeout, an unreadable reply), and for
+    /// ``isDuplicate``, where the server already holds the message.
+    public var isRefusal: Bool {
+        switch self {
+        case .recipientAccountRequired, .blocked, .deliveryFeeRequired, .rejected:
+            true
+        case .refused(_, MessageBoxClient.duplicateMessageCode):
+            false
+        case .httpStatus(let status), .refused(let status, _):
+            (400..<500).contains(status) && status != 408 && status != 429
+        case .invalidHost, .invalidResponse, .invalidMessage:
+            false
+        }
+    }
+
+    /// The server already stores a message with this message ID (message-box-server's 400
+    /// `ERR_DUPLICATE_MESSAGE`). A PeerPay message ID is the HMAC of its own body, so for a resent
+    /// envelope this means the server holds that envelope.
+    public var isDuplicate: Bool {
+        if case .refused(_, MessageBoxClient.duplicateMessageCode) = self { return true }
+        return false
+    }
+
     public var errorDescription: String? {
         switch self {
+        case .recipientAccountRequired:
+            "The recipient has no account on this MessageBox server, so it can't take the delivery. The recipient has to register there first."
+        case .refused(let status, let code) where status >= 500:
+            "The MessageBox server failed to handle the request (HTTP \(status), \(code))."
+        case .refused(let status, let code): "The MessageBox server refused the request (HTTP \(status), \(code))."
         case .invalidHost: "The MessageBox server must have a valid HTTPS URL."
         case .invalidResponse: "The MessageBox server returned an unreadable response."
         case .blocked: "This recipient does not accept payments from this identity."

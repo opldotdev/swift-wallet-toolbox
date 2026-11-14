@@ -38,6 +38,9 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// each recovery attempt. That is three recoveries after the first failure.
     static let sessionRecoveryRetries = 3
 
+    /// TS `getBodyPreview` keeps the first 1024 bytes of an unauthenticated reply.
+    static let unauthenticatedBodyPreviewBytes = 1024
+
     public init(
         baseURL: URL,
         wallet: any AuthenticationWallet,
@@ -231,6 +234,16 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         // is an unsigned application reply and is not retried.
         if response.statusCode == 401, response.header(BRC104HTTPHeaderName.version) == nil {
             throw AuthTransportError.sessionExpired
+        }
+        // Any other error status with no auth frame is a refusal from in front of the peer's auth
+        // (a gate, a proxy). TS reports its status and body preview; returning neither would
+        // leave the caller naming the wrong cause.
+        if !(200..<300).contains(response.statusCode),
+           response.header(BRC104HTTPHeaderName.version) == nil {
+            throw AuthTransportError.unauthenticatedReply(
+                status: response.statusCode,
+                body: Array(response.body.prefix(Self.unauthenticatedBodyPreviewBytes))
+            )
         }
 
         let frame = try BRC104HTTPResponseFrame(
