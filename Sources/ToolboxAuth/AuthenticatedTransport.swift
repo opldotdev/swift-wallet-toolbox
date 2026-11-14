@@ -64,6 +64,8 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
             "Couldn't reconnect to storage. Try again."
         case .responseNotAuthenticated:
             "The storage server could not be verified."
+        case .unauthenticatedReply(let status, _) where status >= 500:
+            "The server could not handle the request (HTTP \(status))."
         case .unauthenticatedReply(let status, _):
             "The server refused the request (HTTP \(status))."
         case .handshakeFailed:

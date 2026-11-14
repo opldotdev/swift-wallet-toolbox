@@ -93,6 +93,19 @@ final class MessageBoxRefusalTests: XCTestCase {
         XCTAssertFalse(MessageBoxError.httpStatus(408).isRefusal)
     }
 
+    /// A gateway's 502 or 503 decided nothing, so it is not worded as a refusal.
+    func test_aServerErrorIsNotWordedAsARefusal() {
+        for status in [500, 502, 503] {
+            let gate = AuthTransportError.unauthenticatedReply(status: status, body: [])
+            XCTAssertFalse(gate.localizedDescription.contains("refused"), gate.localizedDescription)
+            XCTAssertTrue(gate.localizedDescription.contains("\(status)"))
+            let signed = MessageBoxError.refused(status: status, code: "ERR_INTERNAL")
+            XCTAssertFalse(signed.localizedDescription.contains("refused"), signed.localizedDescription)
+        }
+        XCTAssertTrue(AuthTransportError.unauthenticatedReply(status: 403, body: []).localizedDescription.contains("refused"))
+        XCTAssertTrue(MessageBoxError.refused(status: 400, code: "ERR_INVALID_BODY").localizedDescription.contains("refused"))
+    }
+
     func test_aBinaryPostStillReportsTheBareStatus() async throws {
         let client = try MessageBoxClient(host: host, wallet: wallet(),
             transport: gate(403, #"{"code":"ERR_ACCOUNT_REQUIRED"}"#))

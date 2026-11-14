@@ -278,6 +278,8 @@ public struct MessageBoxClient: Sendable {
 
     /// The 1Sat host's account gate: the recipient holds no account there.
     static let accountRequiredCode = "ERR_ACCOUNT_REQUIRED"
+    /// message-box-server's answer to a message ID it already stores.
+    static let duplicateMessageCode = "ERR_DUPLICATE_MESSAGE"
 
     public static let paymentInbox = "payment_inbox"
     /// The TS client caps box names at 64 UTF-8 bytes and forbids control characters.
@@ -470,11 +472,14 @@ public enum MessageBoxError: Error, LocalizedError, Sendable, Equatable {
 
     /// The server answered and turned the request down, so nothing it was asked to store was
     /// stored: an account, block, fee or rejection decision, or a 4xx other than 408 and 429.
-    /// False for a failure that decided nothing (a 5xx, a timeout, an unreadable reply).
+    /// False for a failure that decided nothing (a 5xx, a timeout, an unreadable reply), and for
+    /// ``isDuplicate``, where the server already holds the message.
     public var isRefusal: Bool {
         switch self {
         case .recipientAccountRequired, .blocked, .deliveryFeeRequired, .rejected:
             true
+        case .refused(_, MessageBoxClient.duplicateMessageCode):
+            false
         case .httpStatus(let status), .refused(let status, _):
             (400..<500).contains(status) && status != 408 && status != 429
         case .invalidHost, .invalidResponse, .invalidMessage:
@@ -482,10 +487,20 @@ public enum MessageBoxError: Error, LocalizedError, Sendable, Equatable {
         }
     }
 
+    /// The server already stores a message with this message ID (message-box-server's 400
+    /// `ERR_DUPLICATE_MESSAGE`). A PeerPay message ID is the HMAC of its own body, so for a resent
+    /// envelope this means the server holds that envelope.
+    public var isDuplicate: Bool {
+        if case .refused(_, MessageBoxClient.duplicateMessageCode) = self { return true }
+        return false
+    }
+
     public var errorDescription: String? {
         switch self {
         case .recipientAccountRequired:
             "The recipient has no account on this MessageBox server, so it can't take the delivery. The recipient has to register there first."
+        case .refused(let status, let code) where status >= 500:
+            "The MessageBox server failed to handle the request (HTTP \(status), \(code))."
         case .refused(let status, let code): "The MessageBox server refused the request (HTTP \(status), \(code))."
         case .invalidHost: "The MessageBox server must have a valid HTTPS URL."
         case .invalidResponse: "The MessageBox server returned an unreadable response."

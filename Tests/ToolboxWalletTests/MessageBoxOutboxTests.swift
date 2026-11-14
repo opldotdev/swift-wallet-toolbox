@@ -7,16 +7,21 @@ import BSVScript
 import BSVTransaction
 import BSVWallet
 import ToolboxAuth
+import ToolboxCore
 import ToolboxStorage
 @testable import ToolboxWallet
 
 private actor OutboxTransport: AuthenticatedTransport {
-    enum Delivery { case lost, refused, accepted }
+    enum Delivery { case lost, refused, accepted, duplicate }
     var delivery = Delivery.lost
+    /// Answers for the next deliveries, in order, before `delivery` applies again.
+    var script: [Delivery] = []
     var bodies: [[UInt8]] = []
     var recipientFee = 0
     func allowDelivery() { delivery = .accepted }
     func refuseDelivery() { delivery = .refused }
+    func answer(_ delivery: Delivery) { self.delivery = delivery }
+    func answerNext(_ deliveries: [Delivery]) { script = deliveries }
     func requireFee() { recipientFee = 5 }
     func send(method: String, path: String, query: String?, headers: [String: String], body: [UInt8]?) async throws -> AuthenticatedResponse {
         if method == "GET" {
@@ -24,7 +29,8 @@ private actor OutboxTransport: AuthenticatedTransport {
                 body: Array("{\"status\":\"success\",\"quote\":{\"recipientFee\":\(recipientFee),\"deliveryFee\":0}}".utf8))
         }
         bodies.append(body ?? [])
-        switch delivery {
+        let answer = script.isEmpty ? delivery : script.removeFirst()
+        switch answer {
         case .lost:
             throw URLError(.networkConnectionLost)
         case .refused:
@@ -33,11 +39,16 @@ private actor OutboxTransport: AuthenticatedTransport {
                 #"{"status":"error","code":"ERR_ACCOUNT_REQUIRED","description":"Recipient has no account on this host"}"#.utf8))
         case .accepted:
             return AuthenticatedResponse(statusCode: 200, headers: [:], body: Array(#"{"status":"success"}"#.utf8))
+        case .duplicate:
+            // Stock message-box-server, signed, for a message ID it already stores.
+            return AuthenticatedResponse(statusCode: 400, headers: [:], body: Array(
+                #"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#.utf8))
         }
     }
 }
 
 private actor OutboxWallet: MessageBoxPayingWallet {
+    enum Abort { case releases, answersFalse, storageRefuses }
     nonisolated let messageBoxIdentity: String
     nonisolated let protoWallet: ProtoWallet
     nonisolated let sender: PublicKey
@@ -45,8 +56,11 @@ private actor OutboxWallet: MessageBoxPayingWallet {
     var resumes = 0
     var broadcasts = 0
     var aborts = 0
+    var probes = 0
     let loseBroadcastResponse: Bool
-    var storageAborts = true
+    var abort = Abort.releases
+    /// What storage says when asked whether it sent the transaction.
+    var storageSent = false
     init(loseBroadcastResponse: Bool = false) throws {
         let key = try PrivateKey(Array(repeating: 0, count: 31) + [1])
         sender = key.publicKey
@@ -54,9 +68,12 @@ private actor OutboxWallet: MessageBoxPayingWallet {
         protoWallet = ProtoWallet(rootKey: key)
         self.loseBroadcastResponse = loseBroadcastResponse
     }
-    func refuseAborts() { storageAborts = false }
+    func refuseAborts() { abort = .answersFalse }
+    func abortsAre(_ abort: Abort) { self.abort = abort }
+    func storageHasSent() { storageSent = true }
     /// As `RemoteWallet.payToCounterparty`: the hook runs before the broadcast, and a hook that
-    /// throws aborts the funded action and broadcasts nothing.
+    /// throws aborts the funded action and broadcasts nothing. The hook's error is rethrown once
+    /// the abort is confirmed, and `notReleased` otherwise.
     func createMessageBoxPayment(recipient: PublicKey, satoshis: UInt64,
         derivationPrefix: String, derivationSuffix: String, description: String,
         beforeBroadcast: @escaping @Sendable (CounterpartyPayment) async throws -> Void) async throws -> CounterpartyPayment {
@@ -68,6 +85,7 @@ private actor OutboxWallet: MessageBoxPayingWallet {
         do {
             try await beforeBroadcast(payment)
         } catch {
+            guard abort == .releases else { throw BRC29PaymentError.notReleased(reference: payment.reference) }
             aborts += 1
             throw error
         }
@@ -82,9 +100,20 @@ private actor OutboxWallet: MessageBoxPayingWallet {
     }
     func abandonMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws -> Bool {
         XCTAssertEqual(pending.reference, "original-reference")
-        guard storageAborts else { return false }
-        aborts += 1
-        return true
+        switch abort {
+        case .releases:
+            aborts += 1
+            return true
+        case .answersFalse:
+            return false
+        case .storageRefuses:
+            throw WireError.invalidParameter(name: "reference",
+                message: "an inprocess, outgoing action that has not been signed and shared to the network.")
+        }
+    }
+    func messageBoxPaymentWasSent(_ pending: MessageBoxPendingPayment) async throws -> Bool {
+        probes += 1
+        return storageSent
     }
 }
 
@@ -239,7 +268,10 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(pending.isEmpty)
     }
 
-    func test_discardingAnUnbroadcastPaymentAbortsItFirst() async throws {
+    /// The delivery went out with no answer and the broadcast's answer was lost. The server may
+    /// hold the signed transaction and the recipient may broadcast it, so Discard must not abort
+    /// it: Retry broadcasts it first, then delivers.
+    func test_anOfferedPaymentIsNeverAbortedAndRetryBroadcastsIt() async throws {
         let directory = directory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let transport = OutboxTransport(), wallet = try OutboxWallet(loseBroadcastResponse: true)
@@ -250,23 +282,269 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
                 description: "Stuck", fallbackHost: host)
             XCTFail("Lost response must be pending")
         } catch MessageBoxOutboxError.notDelivered {}
+        let saved = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(saved.first?.delivery, .offered)
+        XCTAssertEqual(saved.first?.broadcastAccepted, false)
 
+        do {
+            _ = try await outbox.discard(wallet: wallet, recipient: payee)
+            XCTFail("An offered payment must not be aborted")
+        } catch MessageBoxOutboxError.offered(let txid) {
+            XCTAssertEqual(txid, saved.first?.txid)
+        }
+        let aborts = await wallet.aborts
+        XCTAssertEqual(aborts, 0)
+        let listed1 = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(listed1.count, 1)
+
+        // The server stays silent: Retry still puts the payment on chain, and keeps it for delivery.
+        do {
+            _ = try await outbox.retry(wallet: wallet, recipient: payee)
+            XCTFail("Delivery must fail")
+        } catch MessageBoxOutboxError.notDelivered {}
+        var resumes = await wallet.resumes
+        XCTAssertEqual(resumes, 1)
+        let broadcast = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(broadcast.first?.broadcastAccepted, true)
+        XCTAssertEqual(broadcast.first?.delivery, .offered)
+
+        await transport.allowDelivery()
+        _ = try await outbox.retry(wallet: wallet, recipient: payee)
+        resumes = await wallet.resumes
+        XCTAssertEqual(resumes, 1, "a payment storage accepted is not broadcast again")
+        let listed2 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed2.isEmpty)
+    }
+
+    /// The server took the payment, then the broadcast's answer was lost. Retry broadcasts and
+    /// resends the same envelope; stock message-box-server answers ERR_DUPLICATE_MESSAGE for it,
+    /// which is delivery, not a refusal.
+    func test_retryReadsADuplicateMessageAsDelivered() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet(loseBroadcastResponse: true)
+        await transport.allowDelivery()
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Delivered", fallbackHost: host)
+            XCTFail("Lost response must be pending")
+        } catch MessageBoxOutboxError.notDelivered {}
+        do {
+            _ = try await outbox.discard(wallet: wallet, recipient: payee)
+            XCTFail("A delivered payment must not be aborted")
+        } catch MessageBoxOutboxError.offered {}
+
+        await transport.answer(.duplicate)
+        let txid = try await outbox.retry(wallet: wallet, recipient: payee)
+        XCTAssertFalse(txid.isEmpty)
+        let resumes = await wallet.resumes, aborts = await wallet.aborts
+        XCTAssertEqual(resumes, 1)
+        XCTAssertEqual(aborts, 0)
+        let bodies = await transport.bodies
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertEqual(Set(bodies).count, 1, "the same envelope, so the same message ID")
+        let listed3 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed3.isEmpty)
+    }
+
+    func test_aDuplicateMessageIsNotARefusal() {
+        let duplicate = MessageBoxError.refused(status: 400, code: "ERR_DUPLICATE_MESSAGE")
+        XCTAssertTrue(duplicate.isDuplicate)
+        XCTAssertFalse(duplicate.isRefusal)
+        XCTAssertFalse(MessageBoxError.refused(status: 400, code: "ERR_INVALID_BODY").isDuplicate)
+        XCTAssertFalse(MessageBoxError.recipientAccountRequired.isDuplicate)
+    }
+
+    /// A refusal whose abort storage did not confirm keeps the payment, never offered, so Discard
+    /// can release its coins: nothing is left reserved without a record.
+    func test_aRefusedPaymentWhoseAbortFailedIsKeptForDiscard() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        await transport.refuseDelivery()
         await wallet.refuseAborts()
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Refused", fallbackHost: host)
+            XCTFail("A refused delivery must fail the send")
+        } catch MessageBoxOutboxError.notReleased(_, let reason) {
+            XCTAssertTrue(reason.contains("no account"), reason)
+        }
+        let broadcasts = await wallet.broadcasts
+        XCTAssertEqual(broadcasts, 0)
+        let kept = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(kept.first?.delivery, .notOffered)
+        XCTAssertEqual(kept.first?.broadcastAccepted, false)
+
+        // Storage still answers no: the payment stays.
         do {
             _ = try await outbox.discard(wallet: wallet, recipient: payee)
             XCTFail("A payment storage will not abort must be kept")
         } catch MessageBoxOutboxError.abortRefused {}
-        let kept = try await outbox.pending(for: wallet.sender)
-        XCTAssertEqual(kept.count, 1)
+        let listed4 = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(listed4.count, 1)
 
-        let fresh = try OutboxWallet(loseBroadcastResponse: true)
-        let keptTxid = try XCTUnwrap(kept.first?.txid)
-        let outcome = try await outbox.discard(wallet: fresh, recipient: payee)
-        XCTAssertEqual(outcome, .released(txid: keptTxid))
-        let aborts = await fresh.aborts
+        // Retry is refused again, and the payment is still one Discard can release.
+        do {
+            _ = try await outbox.retry(wallet: wallet, recipient: payee)
+            XCTFail("A refused delivery must fail the retry")
+        } catch MessageBoxOutboxError.notDelivered {}
+        let resumes = await wallet.resumes
+        XCTAssertEqual(resumes, 0, "a refused payment is not broadcast")
+        let listed5 = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(listed5.first?.delivery, .notOffered)
+
+        await wallet.abortsAre(.releases)
+        let outcome = try await outbox.discard(wallet: wallet, recipient: payee)
+        XCTAssertEqual(outcome, .released(txid: try XCTUnwrap(kept.first?.txid)))
+        let aborts = await wallet.aborts
         XCTAssertEqual(aborts, 1)
+        let listed6 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed6.isEmpty)
+    }
+
+    /// TS `abortAction` throws for an action it already sent. Discard then asks storage, marks the
+    /// payment broadcast, and lets the next Discard forget it.
+    func test_aDiscardStorageRefusesFindsThePaymentSentAndOffersToForgetIt() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        await transport.refuseDelivery()
+        await wallet.refuseAborts()
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Refused", fallbackHost: host)
+            XCTFail("A refused delivery must fail the send")
+        } catch MessageBoxOutboxError.notReleased {}
+        await wallet.abortsAre(.storageRefuses)
+        await wallet.storageHasSent()
+        do {
+            _ = try await outbox.discard(wallet: wallet, recipient: payee)
+            XCTFail("A sent payment's coins do not come back")
+        } catch MessageBoxOutboxError.alreadySent {}
+        let probes = await wallet.probes
+        XCTAssertEqual(probes, 1)
+        let marked = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(marked.first?.broadcastAccepted, true)
+        let outcome = try await outbox.discard(wallet: wallet, recipient: payee)
+        XCTAssertEqual(outcome, .forgotten(txid: try XCTUnwrap(marked.first?.txid)))
+        let listed7 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed7.isEmpty)
+    }
+
+    /// An abort that went through but whose answer was lost: storage then refuses the abort and
+    /// holds nothing as sent, so nothing is reserved and the payment is dropped as released.
+    func test_aDiscardStorageRefusesForAnUnsentPaymentReleasesIt() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        await transport.refuseDelivery()
+        await wallet.refuseAborts()
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Refused", fallbackHost: host)
+            XCTFail("A refused delivery must fail the send")
+        } catch MessageBoxOutboxError.notReleased {}
+        await wallet.abortsAre(.storageRefuses)
+        let outcome = try await outbox.discard(wallet: wallet, recipient: payee)
+        guard case .released = outcome else { return XCTFail("\(outcome)") }
+        let listed8 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed8.isEmpty)
+    }
+
+    /// A payment saved before delivery was tracked might have been offered, so it is never aborted.
+    func test_aRecordWithoutDeliveryStateIsTreatedAsOffered() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet(loseBroadcastResponse: true)
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        await transport.refuseDelivery()
+        await wallet.refuseAborts()
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Old", fallbackHost: host)
+            XCTFail("A refused delivery must fail the send")
+        } catch MessageBoxOutboxError.notReleased {}
+        let url = directory.appendingPathComponent(wallet.messageBoxIdentity + "." + payee + ".json")
+        var object = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(object.removeValue(forKey: "delivery") as? String, "not-offered")
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+        let listed9 = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(listed9.first?.delivery, .offered)
+        await wallet.abortsAre(.releases)
+        do {
+            _ = try await outbox.discard(wallet: wallet, recipient: payee)
+            XCTFail("A payment that may have been offered must not be aborted")
+        } catch MessageBoxOutboxError.offered {}
+        let aborts = await wallet.aborts
+        XCTAssertEqual(aborts, 0)
+    }
+
+    /// An unreadable record from the one-file-per-sender layout is set aside, not left to fail
+    /// every send, retry and listing from that sender.
+    func test_anUnreadableOldRecordIsSetAside() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let legacy = directory.appendingPathComponent(wallet.messageBoxIdentity + ".json")
+        try Data("{not json".utf8).write(to: legacy)
+        let outbox = make(directory, transport)
+        let listed10 = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(listed10.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        XCTAssertEqual(names.filter { $0.hasPrefix(wallet.messageBoxIdentity + ".json.unreadable-") }.count, 1,
+            "the bytes are kept on disk")
+        await transport.allowDelivery()
+        let txid = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+            description: "After", fallbackHost: host)
+        XCTAssertFalse(txid.isEmpty)
+    }
+
+    func test_anOldRecordForARecipientWithASavedPaymentIsSetAside() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Stuck", fallbackHost: host)
+            XCTFail("Delivery must fail")
+        } catch MessageBoxOutboxError.notDelivered {}
+        let current = directory.appendingPathComponent(wallet.messageBoxIdentity + "." + payee + ".json")
+        let legacy = directory.appendingPathComponent(wallet.messageBoxIdentity + ".json")
+        try FileManager.default.copyItem(at: current, to: legacy)
         let pending = try await outbox.pending(for: wallet.sender)
-        XCTAssertTrue(pending.isEmpty)
+        XCTAssertEqual(pending.map(\.recipient), [payee])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+    }
+
+    /// A stray file that only looks like a saved payment does not hide the real ones.
+    func test_aStrayFileDoesNotFailTheListing() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet()
+        let outbox = make(directory, transport)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Stuck", fallbackHost: host)
+            XCTFail("Delivery must fail")
+        } catch MessageBoxOutboxError.notDelivered {}
+        try Data("{}".utf8).write(to: directory.appendingPathComponent(wallet.messageBoxIdentity + ".backup.json"))
+        try Data("{}".utf8).write(to: directory.appendingPathComponent(wallet.messageBoxIdentity + ".json.unreadable-x"))
+        let pending = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(pending.map(\.recipient), [Hex.encode(try recipient().compressedBytes)])
     }
 
     /// A payment saved by an earlier version, one file per sender, is still found and retried.

@@ -124,10 +124,17 @@ delivery (`MessageBoxError.recipientAccountRequired` when the recipient has no a
 a block, a fee, another 4xx) leaves nothing on chain: the funded action is aborted, as
 `@1sat/actions` keeps a handle payment `noSend` until it is delivered. On
 `MessageBoxOutboxError.notDelivered`, use `outbox.retry(wallet:recipient:)`, not another `send`:
-retry reuses the saved transaction and message ID, including after an app restart. A saved
-payment blocks only another payment to the same recipient. `outbox.discard(wallet:recipient:)`
-aborts a payment storage never broadcast, or, once it is on chain, drops the saved delivery,
-which is the only way the recipient learns how to claim it.
+retry reuses the saved transaction and message ID, including after an app restart, and reads a
+server's `ERR_DUPLICATE_MESSAGE` for that ID as delivered. A saved payment blocks only another
+payment to the same recipient.
+
+Each saved payment records how far delivery got (`MessageBoxDelivery`), saved as offered before
+every request leaves. A payment offered to a server is never aborted, because the recipient can
+broadcast the signed transaction by accepting it: `discard` throws `.offered` and retry
+broadcasts it, then delivers again. `outbox.discard(wallet:recipient:)` aborts only a payment no
+server holds and storage never broadcast, and drops it once storage confirms the abort; once a
+payment is on chain, it drops the saved delivery, which is the only way the recipient learns how
+to claim it.
 The recipient must understand standard PeerPay payment tokens. Server acceptance is not proof
 that the recipient has internalized the payment.
 
