@@ -22,7 +22,10 @@ import ToolboxStorage
 /// before each request leaves. Once a server may hold the signed transaction, the recipient can
 /// broadcast it by accepting the payment, so the funded action is never aborted after that: only
 /// a payment no server holds can be discarded for its coins, and anything offered goes forward
-/// with Retry, which broadcasts it.
+/// with Retry, which broadcasts it. A payment no server holds is never offered again: storage may
+/// already have released its action, so Discard is its only way out. A payment storage failed for
+/// good (it expired the unsigned action) can no longer be broadcast by this wallet and is only
+/// forgotten.
 public actor MessageBoxOutbox {
     private let directory: URL
     private let resolveHost: @Sendable (PublicKey, URL) async throws -> URL
@@ -174,7 +177,12 @@ public actor MessageBoxOutbox {
                 }
                 throw MessageBoxOutboxError.notReleased(txid: pending.txid, reason: Self.reason(refusal))
             }
-            if let pending = try load(sender, payee) {
+            if var pending = try load(sender, payee) {
+                if !pending.broadcastAccepted && Self.isFailedAction(error) {
+                    pending.broadcastRefused = true
+                    try persist(pending)
+                    throw MessageBoxOutboxError.broadcastRefused(pending.txid)
+                }
                 throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
             }
             throw error
@@ -185,11 +193,17 @@ public actor MessageBoxOutbox {
     /// the default was changed later. Returning success means server acceptance, not recipient
     /// internalization.
     ///
-    /// A payment a server may hold is broadcast first, if storage has not accepted it yet: its
-    /// signed transaction is out of this wallet's hands, so putting it on chain only settles this
-    /// wallet's own coins. A payment no server holds is delivered first and broadcast after, as
-    /// `send` does, so a refusal still leaves it for Discard. A server that answers with
-    /// `ERR_DUPLICATE_MESSAGE` already holds this envelope, which counts as delivered.
+    /// Only a payment that was offered is retried. One storage has not accepted yet is broadcast
+    /// first: its signed transaction is out of this wallet's hands, so putting it on chain only
+    /// settles this wallet's own coins. A server that answers with `ERR_DUPLICATE_MESSAGE` already
+    /// holds this envelope, which counts as delivered.
+    ///
+    /// A payment no server holds throws ``MessageBoxOutboxError/neverSent(_:)``: storage may already
+    /// have released its action (an abort whose answer was lost, or storage failing an abandoned
+    /// unsigned action), so offering it now could hand the recipient a transaction whose coins this
+    /// wallet spends elsewhere. When storage refuses the broadcast for good, because it failed the
+    /// action, the payment is marked so and ``MessageBoxOutboxError/broadcastRefused(_:)`` is thrown;
+    /// Discard then forgets it.
     public func retry(wallet: RemoteWallet, recipient: String) async throws -> String {
         try await retry(wallet: wallet as any MessageBoxPayingWallet, recipient: recipient)
     }
@@ -202,36 +216,30 @@ public actor MessageBoxOutbox {
         guard var pending = try load(sender, recipient.lowercased()) else {
             throw MessageBoxOutboxError.missingPayment
         }
+        if pending.broadcastRefused { throw MessageBoxOutboxError.broadcastRefused(pending.txid) }
+        if pending.delivery == .notOffered { throw MessageBoxOutboxError.neverSent(pending.txid) }
         do {
             try Task.checkCancellation()
-            if !pending.broadcastAccepted && pending.delivery != .notOffered {
-                try await wallet.resumeMessageBoxPayment(pending)
+            if !pending.broadcastAccepted {
+                do {
+                    try await wallet.resumeMessageBoxPayment(pending)
+                } catch let failed where Self.isFailedAction(failed) {
+                    pending.broadcastRefused = true
+                    try persist(pending)
+                    throw MessageBoxOutboxError.broadcastRefused(pending.txid)
+                }
                 pending.broadcastAccepted = true
                 try persist(pending)
             }
             if pending.delivery != .accepted {
                 try Task.checkCancellation()
                 let client = try makeClient(pending.host, wallet.protoWallet)
-                let before = pending.delivery
-                pending.delivery = .offered
-                try persist(pending)
-                do {
-                    try await Self.deliver(pending.envelope, with: client)
-                } catch let refusal as MessageBoxError where refusal.isRefusal && before == .notOffered {
-                    // Every offer of this envelope has now been turned down: no server holds it.
-                    pending.delivery = .notOffered
-                    try persist(pending)
-                    throw refusal
-                }
+                try await Self.deliver(pending.envelope, with: client)
                 pending.delivery = .accepted
                 try persist(pending)
             }
-            if !pending.broadcastAccepted {
-                try Task.checkCancellation()
-                try await wallet.resumeMessageBoxPayment(pending)
-                pending.broadcastAccepted = true
-                try persist(pending)
-            }
+        } catch let error as MessageBoxOutboxError where error == .broadcastRefused(pending.txid) {
+            throw error
         } catch {
             throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
         }
@@ -250,7 +258,12 @@ public actor MessageBoxOutbox {
     ///
     /// When storage will not abort, it is asked whether it already sent the transaction. If it
     /// did, the payment is marked broadcast and ``MessageBoxOutboxError/alreadySent(_:)`` is thrown;
-    /// discarding it again forgets it.
+    /// discarding it again forgets it. When storage refuses the abort with WERR_INVALID_PARAMETER
+    /// on `reference`, which TS `findAbortableTransaction` throws for a sent, failed or unknown
+    /// action, and does not hold it as sent, it already released it. Any other failure keeps the
+    /// payment, so Discard can be tried again.
+    ///
+    /// A payment storage failed for good is dropped without an abort, as ``MessageBoxDiscarded/abandoned(txid:)``.
     @discardableResult
     public func discard(wallet: RemoteWallet, recipient: String) async throws -> MessageBoxDiscarded {
         try await discard(wallet: wallet as any MessageBoxPayingWallet, recipient: recipient)
@@ -268,6 +281,10 @@ public actor MessageBoxOutbox {
             try remove(sender, pending.recipient)
             return .forgotten(txid: pending.txid)
         }
+        if pending.broadcastRefused {
+            try remove(sender, pending.recipient)
+            return .abandoned(txid: pending.txid)
+        }
         guard pending.delivery == .notOffered else { throw MessageBoxOutboxError.offered(pending.txid) }
         let failure: any Error
         var storageRefused = false
@@ -277,9 +294,10 @@ public actor MessageBoxOutbox {
                 return .released(txid: pending.txid)
             }
             failure = MessageBoxOutboxError.abortRefused(pending.txid)
-        } catch is WireError {
-            // Storage answered and would not abort: TS `abortAction` throws WERR_INVALID_PARAMETER
-            // for an action that is sent, or already aborted.
+        } catch WireError.invalidParameter(name: "reference", _) {
+            // TS `abortAction` refuses an action that is sent, already failed or unknown with this
+            // one error. Anything else (WERR_INTERNAL, WERR_NOT_ACTIVE, a dropped connection)
+            // decided nothing about the reservation.
             storageRefused = true
             failure = MessageBoxOutboxError.abortRefused(pending.txid)
         } catch {
@@ -313,6 +331,14 @@ public actor MessageBoxOutbox {
         } catch let error as MessageBoxError where error.isDuplicate {
             return
         }
+    }
+
+    /// Storage will never broadcast this action: TS `validatePlannedTransaction` throws
+    /// WERR_INVALID_OPERATION "invalid transaction status failed" once storage failed it (an abort,
+    /// or the monitor failing an abandoned unsigned action). Every other failure may pass.
+    static func isFailedAction(_ error: any Error) -> Bool {
+        guard case WireError.invalidOperation(let message) = error else { return false }
+        return message.contains("invalid transaction status failed")
     }
 
     private static func isKey(_ hex: String) -> Bool {
@@ -414,6 +440,10 @@ public enum MessageBoxDiscarded: Sendable, Equatable {
     case released(txid: String)
     /// Already on chain to the recipient's derived key; only the saved delivery was dropped.
     case forgotten(txid: String)
+    /// Storage failed the action, so this wallet can't broadcast it and its coins are spendable
+    /// again; only the saved delivery was dropped. The recipient's server may still hold the
+    /// signed transaction, and the recipient can put it on chain while those coins are unspent.
+    case abandoned(txid: String)
 }
 
 /// Internal seam for offline delivery-failure tests; the public API takes the
@@ -493,11 +523,15 @@ public struct MessageBoxPendingPayment: Codable, Sendable {
     public internal(set) var broadcastAccepted: Bool
     /// How far delivery got. Only a payment no server holds can be discarded for its coins.
     public internal(set) var delivery: MessageBoxDelivery
+    /// True once storage refused the broadcast for good: it failed the action, so this wallet can
+    /// never send it. Discard forgets it; the recipient may still hold it.
+    public internal(set) var broadcastRefused: Bool = false
 }
 
 extension MessageBoxPendingPayment {
     private enum CodingKeys: String, CodingKey {
         case sender, recipient, amount, txid, host, reference, atomicBEEF, envelope, broadcastAccepted, delivery
+        case broadcastRefused
     }
 
     /// A record saved before delivery was tracked reads as offered, the state that never
@@ -513,14 +547,15 @@ extension MessageBoxPendingPayment {
             atomicBEEF: try container.decode([UInt8].self, forKey: .atomicBEEF),
             envelope: try container.decode(MessageBoxEnvelope.self, forKey: .envelope),
             broadcastAccepted: try container.decode(Bool.self, forKey: .broadcastAccepted),
-            delivery: try container.decodeIfPresent(MessageBoxDelivery.self, forKey: .delivery) ?? .offered)
+            delivery: try container.decodeIfPresent(MessageBoxDelivery.self, forKey: .delivery) ?? .offered,
+            broadcastRefused: try container.decodeIfPresent(Bool.self, forKey: .broadcastRefused) ?? false)
     }
 }
 
 /// How far a saved payment's delivery got.
 public enum MessageBoxDelivery: String, Codable, Sendable {
-    /// No MessageBox server holds it: it was never sent, or every offer was refused. Its funded
-    /// action may be aborted.
+    /// No MessageBox server holds it: its one offer was refused, or it was never sent. Its funded
+    /// action may be aborted, and it is never offered again.
     case notOffered = "not-offered"
     /// Sent with no answer that settles it, so the server may hold the signed transaction and the
     /// recipient may broadcast it. It is never aborted; Retry broadcasts it and delivers again.
@@ -545,6 +580,11 @@ public enum MessageBoxOutboxError: Error, LocalizedError, Sendable, Equatable {
     /// Storage already sent the payment, so its coins do not come back. It is now saved as
     /// broadcast: Retry delivers it, and Discard forgets it.
     case alreadySent(String)
+    /// The payment was refused and never sent, so it is not offered again: Discard returns its coins.
+    case neverSent(String)
+    /// Storage failed the payment's action, so this wallet can never broadcast it. Discard forgets
+    /// it; the recipient's server may still hold it.
+    case broadcastRefused(String)
     public var errorDescription: String? {
         switch self {
         case .busy: "A MessageBox payment is already in progress for this account."
@@ -558,6 +598,8 @@ public enum MessageBoxOutboxError: Error, LocalizedError, Sendable, Equatable {
         case .abortRefused: "This payment may already be on the network, so it was not discarded. Retry delivery instead."
         case .offered: "The recipient's MessageBox server may already hold this payment, and the recipient can broadcast it, so it can't be cancelled. Retry to send it."
         case .alreadySent: "This payment was already sent, so its coins won't come back. Retry delivers it to the recipient; discarding it now only forgets the delivery."
+        case .neverSent: "This payment was turned down and never sent, so it isn't offered again. Discard it to return its coins, then send a new payment."
+        case .broadcastRefused: "Storage gave up on this payment and won't send it, so its coins are spendable again. The recipient's MessageBox server may still hold it, and the recipient could still put it on chain while those coins are unspent. Discard it to stop retrying."
         }
     }
 }

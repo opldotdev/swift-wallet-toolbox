@@ -310,7 +310,7 @@ public struct RemoteWallet: Sendable {
     /// `beforeBroadcast` runs with the signed payment before storage sees it. If it throws, nothing
     /// is broadcast and the funded action is aborted: its error is rethrown once storage confirms
     /// the abort, and ``BRC29PaymentError/notReleased(reference:)`` is thrown instead when storage
-    /// does not.
+    /// does not, since the hook was handed the reference and may hold a record of it.
     public func payToCounterparty(
         recipient recipientIdentityKey: PublicKey,
         satoshis: UInt64,
@@ -349,7 +349,13 @@ public struct RemoteWallet: Sendable {
             $0.element.lockingScript.bytes == scriptBytes
         }
         guard matches.count == 1, let index = matches.first?.offset else {
-            try await release(funded.reference)
+            do {
+                try await release(funded.reference)
+            } catch {
+                // The derivation is what failed, and nothing outside this call holds the
+                // reference, so the caller gets that error even when the abort is not confirmed.
+                // Storage fails the abandoned unsigned action on its own (TS `TaskFailAbandoned`).
+            }
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
 

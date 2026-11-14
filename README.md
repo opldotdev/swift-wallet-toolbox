@@ -134,7 +134,11 @@ broadcast the signed transaction by accepting it: `discard` throws `.offered` an
 broadcasts it, then delivers again. `outbox.discard(wallet:recipient:)` aborts only a payment no
 server holds and storage never broadcast, and drops it once storage confirms the abort; once a
 payment is on chain, it drops the saved delivery, which is the only way the recipient learns how
-to claim it.
+to claim it. A payment no server holds is never offered again (`retry` throws `.neverSent`),
+because storage may already have released its action; Discard is its way out. When storage
+refuses a broadcast for good, because it failed the action, the payment is marked
+`broadcastRefused`, `retry` throws `.broadcastRefused`, and `discard` forgets it as `.abandoned`:
+its coins are spendable again, though the recipient's server may still hold the transaction.
 The recipient must understand standard PeerPay payment tokens. Server acceptance is not proof
 that the recipient has internalized the payment.
 

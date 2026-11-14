@@ -48,7 +48,7 @@ private actor OutboxTransport: AuthenticatedTransport {
 }
 
 private actor OutboxWallet: MessageBoxPayingWallet {
-    enum Abort { case releases, answersFalse, storageRefuses }
+    enum Abort: Equatable { case releases, answersFalse, storageRefuses, fails(WireError) }
     nonisolated let messageBoxIdentity: String
     nonisolated let protoWallet: ProtoWallet
     nonisolated let sender: PublicKey
@@ -61,6 +61,8 @@ private actor OutboxWallet: MessageBoxPayingWallet {
     var abort = Abort.releases
     /// What storage says when asked whether it sent the transaction.
     var storageSent = false
+    /// What a broadcast of the saved transaction throws, if anything.
+    var resumeError: WireError?
     init(loseBroadcastResponse: Bool = false) throws {
         let key = try PrivateKey(Array(repeating: 0, count: 31) + [1])
         sender = key.publicKey
@@ -71,6 +73,7 @@ private actor OutboxWallet: MessageBoxPayingWallet {
     func refuseAborts() { abort = .answersFalse }
     func abortsAre(_ abort: Abort) { self.abort = abort }
     func storageHasSent() { storageSent = true }
+    func resumeThrows(_ error: WireError?) { resumeError = error }
     /// As `RemoteWallet.payToCounterparty`: the hook runs before the broadcast, and a hook that
     /// throws aborts the funded action and broadcasts nothing. The hook's error is rethrown once
     /// the abort is confirmed, and `notReleased` otherwise.
@@ -97,6 +100,7 @@ private actor OutboxWallet: MessageBoxPayingWallet {
         resumes += 1
         XCTAssertEqual(pending.reference, "original-reference")
         XCTAssertEqual(pending.atomicBEEF, [1, 1, 1, 1])
+        if let resumeError { throw resumeError }
     }
     func abandonMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws -> Bool {
         XCTAssertEqual(pending.reference, "original-reference")
@@ -109,6 +113,8 @@ private actor OutboxWallet: MessageBoxPayingWallet {
         case .storageRefuses:
             throw WireError.invalidParameter(name: "reference",
                 message: "an inprocess, outgoing action that has not been signed and shared to the network.")
+        case .fails(let error):
+            throw error
         }
     }
     func messageBoxPaymentWasSent(_ pending: MessageBoxPendingPayment) async throws -> Bool {
@@ -388,13 +394,17 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         let listed4 = try await outbox.pending(for: wallet.sender)
         XCTAssertEqual(listed4.count, 1)
 
-        // Retry is refused again, and the payment is still one Discard can release.
+        // A refused payment is never offered again: storage may already have released it.
+        let offers = await transport.bodies.count
         do {
             _ = try await outbox.retry(wallet: wallet, recipient: payee)
-            XCTFail("A refused delivery must fail the retry")
-        } catch MessageBoxOutboxError.notDelivered {}
-        let resumes = await wallet.resumes
+            XCTFail("A refused payment must not be retried")
+        } catch MessageBoxOutboxError.neverSent(let txid) {
+            XCTAssertEqual(txid, kept.first?.txid)
+        }
+        let resumes = await wallet.resumes, reoffers = await transport.bodies.count
         XCTAssertEqual(resumes, 0, "a refused payment is not broadcast")
+        XCTAssertEqual(reoffers, offers, "a refused payment is not offered again")
         let listed5 = try await outbox.pending(for: wallet.sender)
         XCTAssertEqual(listed5.first?.delivery, .notOffered)
 
@@ -458,6 +468,102 @@ final class MessageBoxOutboxTests: XCTestCase, @unchecked Sendable {
         guard case .released = outcome else { return XCTFail("\(outcome)") }
         let listed8 = try await outbox.pending(for: wallet.sender)
         XCTAssertTrue(listed8.isEmpty)
+    }
+
+    /// Only the one error TS `findAbortableTransaction` throws for a sent, failed or unknown action
+    /// counts as storage having let go. Any other storage error decided nothing, so the payment
+    /// and its reservation are kept for another Discard.
+    func test_aTransientAbortFailureKeepsThePayment() async throws {
+        for transient in [WireError.internalFailure("database busy"), .notActive("not the active store"),
+                          .unauthorized("session"), .invalidParameter(name: "auth.userId", message: "valid")] {
+            let directory = directory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let transport = OutboxTransport(), wallet = try OutboxWallet()
+            await transport.refuseDelivery()
+            await wallet.refuseAborts()
+            let outbox = make(directory, transport)
+            let payee = Hex.encode(try recipient().compressedBytes)
+            do {
+                _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                    description: "Refused", fallbackHost: host)
+                XCTFail("A refused delivery must fail the send")
+            } catch MessageBoxOutboxError.notReleased {}
+            await wallet.abortsAre(.fails(transient))
+            do {
+                _ = try await outbox.discard(wallet: wallet, recipient: payee)
+                XCTFail("\(transient) must not release the payment")
+            } catch let error as WireError {
+                XCTAssertEqual(error, transient)
+            }
+            let kept = try await outbox.pending(for: wallet.sender)
+            XCTAssertEqual(kept.count, 1, "\(transient)")
+            XCTAssertEqual(kept.first?.delivery, .notOffered)
+            await wallet.abortsAre(.releases)
+            let outcome = try await outbox.discard(wallet: wallet, recipient: payee)
+            guard case .released = outcome else { return XCTFail("\(outcome)") }
+        }
+    }
+
+    /// Storage failed an offered payment's unsigned action (it expired as abandoned), so its
+    /// broadcast is refused for good. The payment is marked so instead of blocking the recipient
+    /// forever, and Discard forgets it without an abort.
+    func test_aBroadcastStorageRefusesForGoodLetsDiscardForgetIt() async throws {
+        let directory = directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = OutboxTransport(), wallet = try OutboxWallet(loseBroadcastResponse: true)
+        let outbox = make(directory, transport)
+        let payee = Hex.encode(try recipient().compressedBytes)
+        do {
+            _ = try await outbox.send(wallet: wallet, to: recipient(), satoshis: 10,
+                description: "Expired", fallbackHost: host)
+            XCTFail("Lost response must be pending")
+        } catch MessageBoxOutboxError.notDelivered {}
+
+        // A storage error that decides nothing leaves it offered, for another Retry.
+        await wallet.resumeThrows(.internalFailure("database busy"))
+        do {
+            _ = try await outbox.retry(wallet: wallet, recipient: payee)
+            XCTFail("A failed broadcast must fail the retry")
+        } catch MessageBoxOutboxError.notDelivered {}
+        let stillOffered = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(stillOffered.first?.broadcastRefused, false)
+        do {
+            _ = try await outbox.discard(wallet: wallet, recipient: payee)
+            XCTFail("An offered payment must not be dropped")
+        } catch MessageBoxOutboxError.offered {}
+
+        await wallet.resumeThrows(.invalidOperation("invalid transaction status failed"))
+        do {
+            _ = try await outbox.retry(wallet: wallet, recipient: payee)
+            XCTFail("A failed action cannot be broadcast")
+        } catch MessageBoxOutboxError.broadcastRefused(let txid) {
+            XCTAssertEqual(txid, stillOffered.first?.txid)
+        }
+        let marked = try await outbox.pending(for: wallet.sender)
+        XCTAssertEqual(marked.first?.broadcastRefused, true)
+        XCTAssertEqual(marked.first?.broadcastAccepted, false)
+
+        let resumesBefore = await wallet.resumes
+        do {
+            _ = try await outbox.retry(wallet: wallet, recipient: payee)
+            XCTFail("A failed action is not retried")
+        } catch MessageBoxOutboxError.broadcastRefused {}
+        let resumesAfter = await wallet.resumes
+        XCTAssertEqual(resumesAfter, resumesBefore, "storage is not asked again")
+
+        let outcome = try await outbox.discard(wallet: wallet, recipient: payee)
+        XCTAssertEqual(outcome, .abandoned(txid: try XCTUnwrap(marked.first?.txid)))
+        let aborts = await wallet.aborts
+        XCTAssertEqual(aborts, 0, "a failed action is not aborted")
+        let left = try await outbox.pending(for: wallet.sender)
+        XCTAssertTrue(left.isEmpty)
+    }
+
+    func test_onlyAFailedActionCountsAsAFinalBroadcastRefusal() {
+        XCTAssertTrue(MessageBoxOutbox.isFailedAction(WireError.invalidOperation("invalid transaction status failed")))
+        XCTAssertFalse(MessageBoxOutbox.isFailedAction(WireError.invalidOperation("invalid transaction status nosend")))
+        XCTAssertFalse(MessageBoxOutbox.isFailedAction(WireError.internalFailure("invalid transaction status failed")))
+        XCTAssertFalse(MessageBoxOutbox.isFailedAction(URLError(.timedOut)))
     }
 
     /// A payment saved before delivery was tracked might have been offered, so it is never aborted.
