@@ -86,11 +86,24 @@ public struct RemoteWallet: Sendable {
     }
 
     /// The spendable balance of a basket, in satoshis.
+    ///
+    /// Reads every page. `listOutputs` now sends the reference's default limit of ten when a
+    /// request names none, so one unpaged read would count only the first ten outputs.
     public func balance(basket: String = "default") async throws -> Int64 {
-        let outputs = try await storage.listOutputs(
-            auth, try WalletListOutputsRequest(basket: basket)
-        )
-        return outputs.outputs.reduce(0) { $0 + Int64($1.satoshis) }
+        let pageSize = WalletABILimits.maximumProtocolPageSize
+        var total: Int64 = 0
+        var offset: UInt32 = 0
+        while true {
+            try Task.checkCancellation()
+            let page = try await storage.listOutputs(auth, try WalletListOutputsRequest(
+                basket: basket, pagination: try WalletPagination(limit: pageSize, offset: offset)
+            ))
+            total += page.outputs.reduce(0) { $0 + Int64($1.satoshis) }
+            let read = UInt32(page.outputs.count)
+            let (next, overflow) = offset.addingReportingOverflow(read)
+            if overflow || read < pageSize || next >= page.totalOutputs { return total }
+            offset = next
+        }
     }
 
     /// The wallet's transaction history, most work left to the caller's request.

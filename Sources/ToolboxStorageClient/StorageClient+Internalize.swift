@@ -15,7 +15,7 @@ extension StorageClient {
     public func internalizeAction(
         _ auth: AuthID, _ request: WalletInternalizeActionRequest
     ) async throws -> WalletInternalizeActionResult {
-        let outputs = request.outputs.map { output -> JSONValue in
+        let outputs = try request.outputs.map { output -> JSONValue in
             switch output.remittance {
             case .walletPayment(let payment):
                 return .object([
@@ -31,9 +31,11 @@ extension StorageClient {
                     ]),
                 ])
             case .basketInsertion(let insertion):
+                // `validateBasketInsertion`: basket and tags trimmed and lowercased, as storage
+                // stores and matches them.
                 var remittance: [String: JSONValue] = [
-                    "basket": .string(insertion.basket),
-                    "tags": .array(insertion.tags.map { .string($0) }),
+                    "basket": .string(try ActionBatchWire.identifier(insertion.basket, name: "basket")),
+                    "tags": .array(try ActionBatchWire.identifiers(insertion.tags, name: "tag").map { .string($0) }),
                 ]
                 if let instructions = insertion.customInstructions {
                     remittance["customInstructions"] = .string(instructions)
@@ -52,7 +54,8 @@ extension StorageClient {
                 limits: StorageLimits.beef
             ).map { .number(Double($0)) }),
             "description": .string(request.description),
-            "labels": .array(request.labels.map { .string($0) }),
+            // `validateInternalizeActionArgs` validates each label as `validateLabel` does.
+            "labels": .array(try ActionBatchWire.identifiers(request.labels, name: "label").map { .string($0) }),
             "outputs": .array(outputs),
         ]
 

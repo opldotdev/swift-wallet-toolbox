@@ -54,7 +54,7 @@ final class BasketPrefixOutputsWireTests: XCTestCase {
             .string("b9184a72141e6a4d3d148c67a6d0ad92864a4d85290579ea5bef8bd62eb01b6f")
         )
         XCTAssertEqual(arguments["tags"], .array([.string("p color")]))
-        XCTAssertNil(arguments["tagQueryMode"])
+        XCTAssertEqual(arguments["tagQueryMode"], .string("any"), "the validator's default")
         XCTAssertEqual(arguments["includeLockingScripts"], .bool(true))
         XCTAssertEqual(arguments["limit"], .number(10_000))
     }

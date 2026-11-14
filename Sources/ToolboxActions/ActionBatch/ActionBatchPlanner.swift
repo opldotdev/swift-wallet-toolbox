@@ -140,9 +140,9 @@ struct PlannedOutput: Equatable, Sendable {
     var isChange: Bool { requested == nil }
 
     /// `{ ...output, lockingScript: '' }` of the reference plan's output.
-    var compactJSON: OrderedJSON {
+    func compactJSON() throws -> OrderedJSON {
         if let requested {
-            return ActionBatchWire.output(requested, lockingScript: "")
+            return try ActionBatchWire.output(requested, lockingScript: "")
                 .setting("vout", .int(vout))
                 .setting("providedBy", .string("you"))
         }
@@ -428,18 +428,12 @@ enum ActionBatchPlanner {
         for label in request.labels ?? [] { try validateIdentifier(label, name: "label") }
     }
 
-    static let identifierBytes = 1...300
+    static let identifierBytes = ActionBatchWire.identifierBytes
 
     /// `validateIdentifier` for labels, tags and baskets: trimmed and lowercased, 1 to 300 UTF-8
     /// bytes.
     private static func validateIdentifier(_ text: String, name: String) throws {
-        let bytes = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().utf8.count
-        if bytes < identifierBytes.lowerBound {
-            throw WireError.invalidParameter(name: name, message: "at least \(identifierBytes.lowerBound) length.")
-        }
-        if bytes > identifierBytes.upperBound {
-            throw WireError.invalidParameter(name: name, message: "no more than \(identifierBytes.upperBound) length.")
-        }
+        _ = try ActionBatchWire.identifier(text, name: name)
     }
 
     static let descriptionBytes = 5...2000
