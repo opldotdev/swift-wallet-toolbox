@@ -169,6 +169,7 @@ private actor ActionTransport: AuthenticatedTransport {
     func processArguments() -> JSONValue? { processed }
 
     func send(method: String, path: String, query: String?, headers: [String: String], body: [UInt8]?) async throws -> AuthenticatedResponse {
+        if let reply = ActiveStorageFixture.reply(to: body) { return reply }
         let rpc = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
         let name = rpc["method"]?.stringValue ?? ""
         methods.append(name)

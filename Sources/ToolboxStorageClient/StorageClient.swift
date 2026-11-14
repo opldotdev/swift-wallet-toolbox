@@ -26,6 +26,8 @@ public actor StorageClient {
     /// issuing their own. Actor reentrancy across the `await` otherwise lets two callers both see
     /// no cached settings and both go to the network.
     private var settingsTask: Task<StorageSettings, Error>?
+    /// The user's record as last read, which says whether this store is the active one.
+    private var user: StorageUser?
 
     public init(endpoint: URL, transport: any AuthenticatedTransport) {
         self.endpoint = endpoint
@@ -34,6 +36,16 @@ public actor StorageClient {
 
     /// True once settings have been read, which is the only proof the far end is really there.
     public var isAvailable: Bool { settings != nil }
+
+    /// Whether this store is the user's active storage, once both records have been read; `nil`
+    /// before the first write has checked.
+    public var isActive: Bool? {
+        guard let settings, let user else { return nil }
+        return user.activeStorage == settings.storageIdentityKey
+    }
+
+    /// The identity key of the store the user's record names as active, once read.
+    public var activeStorageIdentityKey: String? { user?.activeStorage }
 
     /// This is a client, not an engine: it forwards to storage rather than owning the records.
     ///
@@ -69,6 +81,9 @@ public actor StorageClient {
     /// the action-batch manifest's digest is recomputed by storage from the key order it receives.
     /// Parameters passed here are written with `JSON.stringify`'s rules and in their own order.
     public func call(_ method: String, rawParams params: [OrderedJSON]) async throws -> JSONValue {
+        if Self.writerMethods.contains(method) {
+            try await requireActive(params.first)
+        }
         let id = nextID
         nextID += 1
 
@@ -143,6 +158,65 @@ public actor StorageClient {
         let read = try await task.value
         settings = read
         return read
+    }
+
+    /// Finds the user's record on this store, creating it if the store allows that.
+    ///
+    /// The record's `activeStorage` is what makes this store writable: see `requireActive`.
+    public func findOrInsertUser(_ identityKey: String) async throws -> StorageUser {
+        let result = try await call("findOrInsertUser", [.string(identityKey)])
+        guard let user = result["user"],
+              let userId = user["userId"]?.intValue,
+              let activeStorage = user["activeStorage"]?.stringValue else {
+            throw StorageClientError.unreadableResponse(method: "findOrInsertUser")
+        }
+        let read = StorageUser(
+            userId: userId,
+            identityKey: user["identityKey"]?.stringValue ?? identityKey,
+            activeStorage: activeStorage
+        )
+        self.user = read
+        return read
+    }
+
+    /// The calls that change the user's records, which only the active store may take.
+    ///
+    /// The TypeScript `WalletStorageManager` runs each of these through
+    /// `runAsAuthorizedWriter`, whose `getAuth(true)` throws `WERR_NOT_ACTIVE` unless the store's
+    /// `storageIdentityKey` is the user's `activeStorage`. Readers are not gated there and are not
+    /// here. Two wallets on the same keys writing to different stores diverge; one is active and
+    /// the others sync through it.
+    static let writerMethods: Set<String> = [
+        "abortAction", "createAction", "internalizeAction", "processAction",
+        "relinquishCertificate", "relinquishOutput", "insertCertificateAuth",
+        "prepareNoSendExpiry", "activateNoSendExpiry", "armNoSendExpiry",
+        "beginActionBatch", "extendActionBatch", "renewActionBatch",
+        "commitActionBatch", "abortActionBatch",
+    ]
+
+    /// Throws `WERR_NOT_ACTIVE` unless this store is the user's active storage.
+    ///
+    /// The answer is cached once it is yes. A no is read again before it is believed, so making
+    /// this store active from the other wallet takes effect without a relaunch.
+    private func requireActive(_ authParameter: OrderedJSON?) async throws {
+        guard let identityKey = authParameter?["identityKey"]?.stringValue else {
+            throw WireError.missingParameter(
+                name: "auth", message: "A storage write must name the caller's identity."
+            )
+        }
+        let settings = try await makeAvailable(AuthID(identityKey: identityKey))
+        if let user, user.identityKey == identityKey,
+           user.activeStorage == settings.storageIdentityKey {
+            return
+        }
+        let read = try await findOrInsertUser(identityKey)
+        guard read.activeStorage == settings.storageIdentityKey else {
+            throw WireError.notActive(
+                "\(settings.storageName) is not this wallet's active storage. Another wallet "
+                    + "using these keys has made a different storage active, so writing here "
+                    + "would make the two diverge. Make this storage active there, then try again."
+            )
+        }
     }
 
     private func readSettings(_ auth: AuthID) async throws -> StorageSettings {

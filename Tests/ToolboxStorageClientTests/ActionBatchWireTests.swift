@@ -22,6 +22,7 @@ final class ActionBatchWireTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            if let reply = ActiveStorageFixture.reply(to: body) { return reply }
             let bytes = body ?? []
             bodies.append(bytes)
             let request = try JSONDecoder().decode(JSONValue.self, from: Data(bytes))

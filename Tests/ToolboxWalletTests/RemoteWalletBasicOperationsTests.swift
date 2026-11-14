@@ -55,6 +55,10 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
             headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            let scriptsSettings = answers.first?.contains("storageIdentityKey") ?? false
+            if let reply = ActiveStorageFixture.reply(
+                to: body, answeringSettings: !scriptsSettings
+            ) { return reply }
             let requestBody = body ?? []
             bodies.append(requestBody)
             guard !answers.isEmpty else {

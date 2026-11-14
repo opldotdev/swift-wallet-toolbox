@@ -647,6 +647,11 @@ extension MessageBoxClient {
             throw MessageBoxPaymentError.settlementFailed
         } catch let error where isCancellation(error) {
             throw CancellationError()
+        } catch let error as WireError {
+            // Storage that is not the user's active storage refused the write before it looked at
+            // the payment. That is no verdict on the token, and the person can fix it.
+            if case .notActive = error { throw error }
+            throw MessageBoxPaymentError.settlementFailed
         } catch {
             throw MessageBoxPaymentError.settlementFailed
         }

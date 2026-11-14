@@ -37,6 +37,7 @@ private actor LoggingTransport: AuthenticatedTransport {
     }
 
     func send(method: String, path: String, query: String?, headers: [String: String], body: [UInt8]?) async throws -> AuthenticatedResponse {
+        if let reply = ActiveStorageFixture.reply(to: body) { return reply }
         requests.append((path, body))
         await log.add(String(path.split(separator: "/").last ?? ""))
         if holdFirst {
@@ -57,7 +58,8 @@ private struct StubReceiver: MessageBoxReceivingWallet {
     /// derive keys, as a wallet that locked does; `cancelled` throws what a cancelled `URLSession`
     /// request throws, here in a task that was not cancelled; `failsOnceCancelled` waits for its
     /// task to be cancelled, then throws the same `URLError(.cancelled)`.
-    enum Outcome: Sendable { case accepted, refused, fails, locked, cancelled, failsOnceCancelled }
+    /// `notActive` is storage that is not the user's active storage refusing the write.
+    enum Outcome: Sendable { case accepted, refused, fails, locked, cancelled, failsOnceCancelled, notActive }
     let keys: ProtoWallet
     let log: EventLog
     var outcome: Outcome = .accepted
@@ -92,6 +94,7 @@ private struct StubReceiver: MessageBoxReceivingWallet {
         case .refused: return WalletInternalizeActionResult(accepted: false)
         case .fails, .locked: throw URLError(.cannotConnectToHost)
         case .cancelled: throw URLError(.cancelled)
+        case .notActive: throw WireError.notActive("not the active storage")
         case .failsOnceCancelled:
             while !Task.isCancelled { await Task.yield() }
             throw URLError(.cancelled)
@@ -1380,6 +1383,20 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
             let events = await log.events
             XCTAssertEqual(events, ["listMessages", "getPublicKey"])
         }
+    }
+
+    func test_aTokenRefusedByABackupStoreSaysSoAndIsNotAcknowledged() async throws {
+        let f = try await fixture()
+        let log = EventLog()
+        let transport = LoggingTransport(log: log, [(200, try listing([f.row]))])
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver), transport: transport)
+        do {
+            _ = try await client.accept(f.payment, receiver: StubReceiver(keys: ProtoWallet(rootKey: f.receiver),
+                log: log, outcome: .notActive))
+            XCTFail("must not be accepted")
+        } catch WireError.notActive {}
+        let events = await log.events
+        XCTAssertEqual(events, ["listMessages", "getPublicKey", "internalizeAction"])
     }
 
     func test_thePaymentMustBeInTheInboxExactlyOnce() async throws {

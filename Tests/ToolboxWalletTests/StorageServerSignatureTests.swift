@@ -199,8 +199,10 @@ private actor ExpressStorageServer: HTTPTransport {
             await authenticator.close(delivered.sessionID)
             return Self.authFailed("Session not found for nonce")
         }
-        methods.append(method)
-        let envelope = try respond(to: method, arguments: rpc["params"]?.arrayValue?[1], id: rpc["id"]!)
+        // The two reads a write makes first are answered like the rest but not logged: the tests
+        // are about the writes.
+        if method != "makeAvailable" && method != "findOrInsertUser" { methods.append(method) }
+        let envelope = try respond(to: method, arguments: rpc["params"]?.arrayValue?.dropFirst().first, id: rpc["id"]!)
 
         let reply = try BRC104Response(
             requestID: inner.requestID, status: 200, headers: [],
@@ -224,6 +226,14 @@ private actor ExpressStorageServer: HTTPTransport {
     private func respond(to method: String, arguments: JSONValue?, id: JSONValue) throws -> JSONValue {
         var envelope: [String: JSONValue] = ["jsonrpc": .string("2.0"), "id": id]
         switch method {
+        case "makeAvailable":
+            envelope["result"] = .object([
+                "storageIdentityKey": .string("02bb"), "storageName": .string("express"), "chain": .string("main"),
+            ])
+        case "findOrInsertUser":
+            envelope["result"] = .object([
+                "user": .object(["userId": .number(1), "activeStorage": .string("02bb")]), "isNew": .bool(false),
+            ])
         case "createAction":
             let outputs = (arguments?["outputs"]?.arrayValue ?? []).enumerated().map { index, row -> JSONValue in
                 var value = row.objectValue ?? [:]
