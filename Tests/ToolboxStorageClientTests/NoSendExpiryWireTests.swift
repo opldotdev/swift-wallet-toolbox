@@ -1,5 +1,6 @@
 import XCTest
 import BSVWallet
+import BSVTransaction
 import ToolboxAuth
 import ToolboxCore
 import ToolboxStorage
@@ -39,10 +40,17 @@ final class NoSendExpiryWireTests: XCTestCase {
         StorageClient(endpoint: URL(string: "https://storage.example/")!, transport: transport)
     }
 
+    private let inputTxid = String(repeating: "ab", count: 32)
+
     private func target(labels: [String] = ["p nosend expiry seconds 60"],
                         noSend: Bool = true) throws -> WalletCreateActionRequest {
         try WalletCreateActionRequest(
             description: "Hand off",
+            inputs: [try WalletCreateActionInput(
+                outpoint: try Outpoint("\(inputTxid).2"),
+                inputDescription: "hand-off coin",
+                unlockingScript: [0x51, 0x52, 0x53]
+            )],
             outputs: [try WalletCreateActionOutput(
                 lockingScript: [0x51], satoshis: 1, outputDescription: "handoff"
             )],
@@ -85,10 +93,7 @@ final class NoSendExpiryWireTests: XCTestCase {
         let bodies = await transport.bodies
         XCTAssertEqual(bodies[0]["method"]?.stringValue, "prepareNoSendExpiry")
         let args = try XCTUnwrap(bodies[0]["params"]?.arrayValue?[1])
-        XCTAssertEqual(args, .object(try StorageClient.arguments(for: try target())))
-        XCTAssertEqual(args["labels"], .array([.string("p nosend expiry seconds 60")]))
-        XCTAssertEqual(args["options"]?["noSend"], .bool(true))
-        XCTAssertEqual(args["isNoSend"], .bool(true))
+        assertTargetShape(args)
     }
 
     func test_activateWrapsTheSameTarget() async throws {
@@ -104,10 +109,30 @@ final class NoSendExpiryWireTests: XCTestCase {
 
         let recorded = await transport.bodies
         let args = try XCTUnwrap(recorded[0]["params"]?.arrayValue?[1])
-        XCTAssertEqual(args["target"], .object(try StorageClient.arguments(for: try target())))
+        assertTargetShape(try XCTUnwrap(args["target"]))
         XCTAssertEqual(args["fundingReference"], .string("Zg=="))
         XCTAssertEqual(args["fundingTxid"], .string(txid))
         XCTAssertEqual(args["anchorVout"], .number(0))
+    }
+
+    /// `targetForStorage` as the reference sends it, member by member: the validated shape with
+    /// `{txid, vout}` outpoints, no unlocking script, `sequenceNumber` filled in, and the
+    /// `includeAllSourceTransactions` the reference `Wallet` sets (true).
+    private func assertTargetShape(_ args: JSONValue, file: StaticString = #filePath, line: UInt = #line) {
+        let input = args["inputs"]?.arrayValue?.first
+        XCTAssertEqual(args["inputs"]?.arrayValue?.count, 1, file: file, line: line)
+        XCTAssertEqual(input?["outpoint"], .object(["txid": .string(inputTxid), "vout": .number(2)]), file: file, line: line)
+        XCTAssertNil(input?["unlockingScript"], file: file, line: line)
+        XCTAssertEqual(input?["unlockingScriptLength"], .number(3), file: file, line: line)
+        XCTAssertEqual(input?["sequenceNumber"], .number(4_294_967_295), file: file, line: line)
+        XCTAssertEqual(args["includeAllSourceTransactions"], .bool(true), file: file, line: line)
+        XCTAssertEqual(args["labels"], .array([.string("p nosend expiry seconds 60")]), file: file, line: line)
+        XCTAssertEqual(args["options"]?["noSend"], .bool(true), file: file, line: line)
+        XCTAssertEqual(args["options"]?["signAndProcess"], .bool(false), file: file, line: line)
+        XCTAssertEqual(args["isNoSend"], .bool(true), file: file, line: line)
+        XCTAssertEqual(args["isNewTx"], .bool(true), file: file, line: line)
+        XCTAssertEqual(args["isRemixChange"], .bool(false), file: file, line: line)
+        XCTAssertEqual(args["isSignAction"], .bool(true), file: file, line: line)
     }
 
     func test_aNullDeadlineIsRead() throws {

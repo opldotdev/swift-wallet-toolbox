@@ -342,4 +342,48 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         let envelopes = try await transport.envelopes()
         XCTAssertTrue(envelopes.isEmpty)
     }
+
+    // MARK: - balance
+
+    /// A page of `count` outputs of `satoshis` each, against `total` matching outputs.
+    private func outputsPage(count: Int, satoshis: Int, total: Int, txidByte: String) -> String {
+        let txid = String(repeating: txidByte, count: 32)
+        let outputs = (0..<count).map {
+            #"{"outpoint":"\#(txid).\#($0)","satoshis":\#(satoshis),"spendable":true}"#
+        }.joined(separator: ",")
+        return #"{"result":{"totalOutputs":\#(total),"outputs":[\#(outputs)]}}"#
+    }
+
+    /// Storage answers a listing without a limit with ten rows, so `balance` asks for the largest
+    /// page and keeps reading until it has `totalOutputs`.
+    func test_balanceReadsEveryPageOfTheBasket() async throws {
+        let pageSize = Int(WalletABILimits.maximumProtocolPageSize)
+        let (wallet, transport) = try wallet(answers: [
+            outputsPage(count: pageSize, satoshis: 1, total: pageSize + 2, txidByte: "aa"),
+            outputsPage(count: 2, satoshis: 5, total: pageSize + 2, txidByte: "bb"),
+        ])
+
+        let balance = try await wallet.balance()
+
+        XCTAssertEqual(balance, Int64(pageSize) + 10)
+        let envelopes = try await transport.envelopes()
+        XCTAssertEqual(envelopes.count, 2)
+        let pages = envelopes.compactMap { $0["params"]?.arrayValue?[1] }
+        XCTAssertEqual(pages.map { $0["basket"] }, [.string("default"), .string("default")])
+        XCTAssertEqual(pages.map { $0["limit"] }, [.number(Double(pageSize)), .number(Double(pageSize))])
+        XCTAssertEqual(pages.map { $0["offset"] }, [.number(0), .number(Double(pageSize))])
+    }
+
+    func test_balanceStopsAfterOneShortPage() async throws {
+        let (wallet, transport) = try wallet(answers: [
+            outputsPage(count: 3, satoshis: 7, total: 3, txidByte: "cc"),
+        ])
+
+        let balance = try await wallet.balance(basket: "Savings ")
+
+        XCTAssertEqual(balance, 21)
+        let envelopes = try await transport.envelopes()
+        XCTAssertEqual(envelopes.count, 1)
+        XCTAssertEqual(envelopes.first?["params"]?.arrayValue?[1]["basket"], .string("savings"))
+    }
 }

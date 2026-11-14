@@ -290,11 +290,51 @@ public protocol ActionBatchStorage: Sendable {
 /// The `@bsv/sdk` validated createAction shapes (`ValidCreateActionInput`, `ValidCreateActionOutput`,
 /// `ValidCreateActionArgs`) as ordered JSON, member for member in the SDK's order.
 ///
-/// Action batches use these where ordinary `createAction` uses outpoint strings: storage reads
-/// `outpoint.txid` and `outpoint.vout` from the batch's first action and from each committed
-/// action's metadata, and the metadata is part of the manifest digest, so its member order
-/// matters too.
+/// Ordinary `createAction`, the BRC-177 target and action batches all send this shape, because
+/// storage reads it without validating it again: `outpoint.txid` and `outpoint.vout` as an object,
+/// `sequenceNumber` always present, identifiers already trimmed and lowercased, and every derived
+/// flag set. Action-batch metadata is also part of the manifest digest, so member order matters.
 public enum ActionBatchWire {
+    /// `specOpThrowReviewActions` (`@bsv/sdk` `validationHelpers.ts`). A label equal to this makes
+    /// the validator set `isTestWerrReviewActions`, which asks storage for a test review error.
+    public static let throwReviewActionsLabel =
+        "a496e747fc3ad5fabdd4ae8f91184e71f87539bd3d962aa2548942faaaf0047a"
+
+    /// A basket, label or tag as the SDK's `validateIdentifier` returns it: trimmed, lowercased,
+    /// and 1 to 300 UTF-8 bytes once trimmed. Storage stores and matches what it receives, so an
+    /// unnormalised name would be a different basket, label or tag there than the same name sent
+    /// by the reference wallet, and a whitespace-only name would reach it as `""`.
+    ///
+    /// `name` is the parameter the error names, as the SDK's `validateBasket`, `validateLabel` and
+    /// `validateTag` name theirs: `basket`, `label` or `tag`.
+    public static func identifier(_ value: String, name: String) throws -> String {
+        let normalized = value.trimmingCharacters(in: javaScriptWhitespace).lowercased()
+        let bytes = normalized.utf8.count
+        if bytes < identifierBytes.lowerBound {
+            throw WireError.invalidParameter(name: name, message: "at least \(identifierBytes.lowerBound) length.")
+        }
+        if bytes > identifierBytes.upperBound {
+            throw WireError.invalidParameter(name: name, message: "no more than \(identifierBytes.upperBound) length.")
+        }
+        return normalized
+    }
+
+    public static func identifiers(_ values: [String], name: String) throws -> [String] {
+        try values.map { try identifier($0, name: name) }
+    }
+
+    /// `validateIdentifier`'s byte bounds.
+    public static let identifierBytes = 1...300
+
+    /// What `String.prototype.trim` removes: Unicode white space and line terminators, which is
+    /// Foundation's set less NEXT LINE (U+0085) and plus ZERO WIDTH NO-BREAK SPACE (U+FEFF).
+    static let javaScriptWhitespace: CharacterSet = {
+        var set = CharacterSet.whitespacesAndNewlines
+        set.remove(Unicode.Scalar(0x85)!)
+        set.insert(Unicode.Scalar(0xFEFF)!)
+        return set
+    }()
+
     /// `{txid, vout}`, as `parseWalletOutpoint` produces it.
     public static func outpoint(_ outpoint: Outpoint) -> OrderedJSON {
         .record([
@@ -327,14 +367,14 @@ public enum ActionBatchWire {
 
     /// `ValidCreateActionOutput`. An absent basket or custom instructions is left out, as
     /// `JSON.stringify` leaves out the SDK's `undefined`.
-    public static func output(_ output: WalletCreateActionOutput, lockingScript: String? = nil) -> OrderedJSON {
+    public static func output(_ output: WalletCreateActionOutput, lockingScript: String? = nil) throws -> OrderedJSON {
         .record([
             "lockingScript": .string(lockingScript ?? hex(output.lockingScript)),
             "satoshis": .int(output.satoshis),
             "outputDescription": .string(output.outputDescription),
-            "basket": output.basket.map { .string($0) },
+            "basket": try output.basket.map { .string(try identifier($0, name: "basket")) },
             "customInstructions": output.customInstructions.map { .string($0) },
-            "tags": .strings(output.tags),
+            "tags": .strings(try identifiers(output.tags, name: "tag")),
         ])
     }
 
@@ -343,8 +383,17 @@ public enum ActionBatchWire {
     /// `compact` is the reference's `actionBatchBootstrap`: proof bytes and unlocking scripts are
     /// dropped and output scripts emptied, because storage needs only their lengths to reserve
     /// funding and derives everything else from the signed transactions at commit.
+    ///
+    /// `stripUnlockingScripts` is the reference signer's `removeUnlockScripts` and BRC-177
+    /// `targetForStorage`: storage never receives an unlocking script, only its length.
+    /// `includeAllSourceTransactions` is the value the reference `Wallet` writes over the
+    /// validator's default before calling storage.
+    ///
+    /// The derived flags are computed as `validateCreateActionArgs` computes them, with
+    /// `signAndProcess` false because this wallet signs every action itself.
     public static func createActionArguments(
-        _ request: WalletCreateActionRequest, compact: Bool, beefLimits: BEEFLimits
+        _ request: WalletCreateActionRequest, compact: Bool, beefLimits: BEEFLimits,
+        stripUnlockingScripts: Bool = false, includeAllSourceTransactions: Bool = false
     ) throws -> OrderedJSON {
         let inputs = request.inputs ?? []
         let outputs = request.outputs ?? []
@@ -372,11 +421,16 @@ public enum ActionBatchWire {
             "sendWith": .strings(sendWith),
             "randomizeOutputs": .bool(options?.randomizeOutputs ?? true),
         ])
-        let inputsJSON: [OrderedJSON] = inputs.map { input($0, includeUnlockingScript: !compact) }
-        let outputsJSON: [OrderedJSON] = outputs.map { output($0, lockingScript: compact ? "" : nil) }
+        let inputsJSON: [OrderedJSON] = inputs.map {
+            input($0, includeUnlockingScript: !compact && !stripUnlockingScripts)
+        }
+        let outputsJSON: [OrderedJSON] = try outputs.map { try output($0, lockingScript: compact ? "" : nil) }
         let lockTime: UInt32 = request.lockTime ?? 0
         let version: UInt32 = request.version ?? 1
-        let isNewTx = !inputs.isEmpty || !outputs.isEmpty
+        let labels = try identifiers(request.labels ?? [], name: "label")
+        let isSendWith = !sendWith.isEmpty
+        let isRemixChange = !isSendWith && inputs.isEmpty && outputs.isEmpty
+        let isNewTx = isRemixChange || !inputs.isEmpty || !outputs.isEmpty
         return .record([
             "description": .string(request.description),
             "inputBEEF": inputBEEF,
@@ -384,16 +438,17 @@ public enum ActionBatchWire {
             "outputs": .array(outputsJSON),
             "lockTime": .int(lockTime),
             "version": .int(version),
-            "labels": .strings(request.labels ?? []),
+            "labels": .strings(labels),
             "options": optionsJSON,
-            "isSendWith": .bool(!sendWith.isEmpty),
+            "isSendWith": .bool(isSendWith),
             "isDelayed": .bool(delayed),
             "isNoSend": .bool(noSend),
             "isNewTx": .bool(isNewTx),
-            "isRemixChange": .bool(false),
-            "isSignAction": .bool(true),
-            "includeAllSourceTransactions": .bool(false),
-            "isTestWerrReviewActions": .bool(false),
+            "isRemixChange": .bool(isRemixChange),
+            // `isNewTx && (!signAndProcess || …)`, and signAndProcess is false here.
+            "isSignAction": .bool(isNewTx),
+            "includeAllSourceTransactions": .bool(includeAllSourceTransactions),
+            "isTestWerrReviewActions": .bool(labels.contains(throwReviewActionsLabel)),
         ])
     }
 
