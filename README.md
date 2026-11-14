@@ -119,8 +119,15 @@ let outbox = MessageBoxOutbox(directory: outboxDirectory, network: .testnet)
 `init(directory:discovery:)` takes a prebuilt `MessageBoxDiscovery` instead.
 
 Keep one outbox instance per directory. Signed BEEF and the encrypted delivery envelope are
-saved before broadcast. On a pending-delivery error, use `outbox.retry(wallet:)`, not another
-`send`: retry reuses the saved transaction and message ID, including after an app restart.
+saved, and offered to the recipient's server, before broadcast. A server that refuses the
+delivery (`MessageBoxError.recipientAccountRequired` when the recipient has no account there,
+a block, a fee, another 4xx) leaves nothing on chain: the funded action is aborted, as
+`@1sat/actions` keeps a handle payment `noSend` until it is delivered. On
+`MessageBoxOutboxError.notDelivered`, use `outbox.retry(wallet:recipient:)`, not another `send`:
+retry reuses the saved transaction and message ID, including after an app restart. A saved
+payment blocks only another payment to the same recipient. `outbox.discard(wallet:recipient:)`
+aborts a payment storage never broadcast, or, once it is on chain, drops the saved delivery,
+which is the only way the recipient learns how to claim it.
 The recipient must understand standard PeerPay payment tokens. Server acceptance is not proof
 that the recipient has internalized the payment.
 

@@ -44,6 +44,11 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     /// The peer answered, but not in a form that proves it holds the key it claims. Never
     /// recoverable by retrying: an unauthenticated answer is not a slower authenticated one.
     case responseNotAuthenticated(String)
+    /// The peer refused the request with an error status and no auth frame at all, as a gate
+    /// in front of its auth middleware does. Carries the status and the start of the body, as
+    /// TS `SimplifiedFetchTransport` reports them, so a caller can say what was refused. The body
+    /// is unauthenticated: read it to describe the failure, never to act on.
+    case unauthenticatedReply(status: Int, body: [UInt8])
     /// A reply arrived for a request other than the one being awaited.
     case requestMismatch
     case transportFailed(String)
@@ -59,6 +64,8 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
             "Couldn't reconnect to storage. Try again."
         case .responseNotAuthenticated:
             "The storage server could not be verified."
+        case .unauthenticatedReply(let status, _):
+            "The server refused the request (HTTP \(status))."
         case .handshakeFailed:
             "Couldn't authenticate with storage. Try again."
         case .requestMismatch:

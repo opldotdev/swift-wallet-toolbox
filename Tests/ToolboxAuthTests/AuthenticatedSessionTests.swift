@@ -454,3 +454,56 @@ private struct CancellingTransport: HTTPTransport {
         throw CancellationError()
     }
 }
+
+/// The handshake reaches the peer; every application request is refused by a gate in front of
+/// it, as the 1Sat host's account gate refuses `/sendMessage` before its auth runs.
+private struct GatedTransport: HTTPTransport {
+    let handshake: @Sendable (HTTPRequest) async throws -> HTTPResponse
+    let status: Int
+    let body: [UInt8]
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        if request.url.path.hasSuffix(BRC104HTTPHeaderName.handshakePath) {
+            return try await handshake(request)
+        }
+        return HTTPResponse(statusCode: status, headers: ["Content-Type": "application/json"], body: body)
+    }
+}
+
+extension AuthenticatedSessionTests {
+    private func gatedSession(status: Int, body: [UInt8]) throws -> AuthenticatedSession {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        return AuthenticatedSession(
+            baseURL: baseURL, wallet: ProtoWallet(rootKey: keys.client),
+            transport: GatedTransport(handshake: { try await peer.send($0) }, status: status, body: body)
+        )
+    }
+
+    func test_anUnsignedErrorStatusCarriesTheStatusAndBody() async throws {
+        let body = Array(#"{"status":"error","code":"ERR_ACCOUNT_REQUIRED"}"#.utf8)
+        let session = try gatedSession(status: 403, body: body)
+
+        do {
+            _ = try await session.send(method: "POST", path: "/sendMessage", body: [0x01])
+            XCTFail("an unsigned refusal must not be returned as a response")
+        } catch let error as AuthTransportError {
+            XCTAssertEqual(error, .unauthenticatedReply(status: 403, body: body))
+        }
+    }
+
+    func test_anUnsignedErrorBodyIsCappedAtThePreviewLength() async throws {
+        let session = try gatedSession(status: 502, body: [UInt8](repeating: 0x41, count: 4096))
+
+        do {
+            _ = try await session.send(method: "POST", path: "/", body: [0x01])
+            XCTFail("an unsigned refusal must not be returned as a response")
+        } catch let error as AuthTransportError {
+            guard case .unauthenticatedReply(let status, let preview) = error else {
+                return XCTFail("expected unauthenticatedReply, got \(error)")
+            }
+            XCTAssertEqual(status, 502)
+            XCTAssertEqual(preview.count, AuthenticatedSession.unauthenticatedBodyPreviewBytes)
+        }
+    }
+}

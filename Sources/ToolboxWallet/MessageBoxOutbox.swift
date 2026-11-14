@@ -6,9 +6,16 @@ import BSVTransaction
 import BSVWallet
 import ToolboxStorage
 
-/// Durable PeerPay delivery. One unresolved payment per sender prevents a failed
-/// send from becoming a second spend. Recovery submits the same signed BEEF and
-/// the same encrypted envelope; it never calls createAction again.
+/// Durable PeerPay delivery, one saved payment per sender and recipient.
+///
+/// The payment is offered to the recipient's MessageBox before it is broadcast, as `@1sat/actions`
+/// `sendToHandle` keeps a handle payment `noSend` until its envelope is delivered: a server that
+/// refuses the delivery (the recipient holds no account there, blocks the sender, wants a fee)
+/// leaves nothing on chain, and the funded action is aborted. A delivery that decided nothing
+/// (a timeout, a 5xx) does not stop the broadcast; the payment is then saved and delivered again
+/// with Retry, which submits the same signed BEEF and the same encrypted envelope and never calls
+/// createAction again. A saved payment blocks only another payment to the same recipient, so a
+/// failed send cannot become a second spend while payments to anyone else go ahead.
 public actor MessageBoxOutbox {
     private let directory: URL
     private let resolveHost: @Sendable (PublicKey, URL) async throws -> URL
@@ -62,8 +69,17 @@ public actor MessageBoxOutbox {
         self.makeClient = makeClient
     }
 
-    public func pending(for sender: PublicKey) throws -> MessageBoxPendingPayment? {
-        try load(Hex.encode(sender.compressedBytes))
+    /// Every saved payment from `sender`, ordered by recipient.
+    public func pending(for sender: PublicKey) throws -> [MessageBoxPendingPayment] {
+        let hex = Hex.encode(sender.compressedBytes)
+        try migrateSingleRecord(hex)
+        let prefix = hex + "."
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        let single = hex + ".json"
+        return try names.filter { $0 != single && $0.hasPrefix(prefix) && $0.hasSuffix(".json") }.sorted().compactMap { name in
+            let recipient = String(name.dropFirst(prefix.count).dropLast(".json".count))
+            return try load(hex, recipient)
+        }
     }
 
     public func send(wallet: RemoteWallet, to recipient: PublicKey, satoshis: UInt64,
@@ -75,9 +91,11 @@ public actor MessageBoxOutbox {
     func send(wallet: any MessageBoxPayingWallet, to recipient: PublicKey, satoshis: UInt64,
         description: String, fallbackHost: URL) async throws -> String {
         let sender = wallet.messageBoxIdentity
+        let payee = Hex.encode(recipient.compressedBytes)
         guard active.insert(sender).inserted else { throw MessageBoxOutboxError.busy }
         defer { active.remove(sender) }
-        if let pending = try load(sender) { throw MessageBoxOutboxError.pending(pending.txid) }
+        try migrateSingleRecord(sender)
+        if let pending = try load(sender, payee) { throw MessageBoxOutboxError.pending(pending.txid) }
         guard satoshis > 0 else { throw MessageBoxOutboxError.invalidAmount }
         let host = try await resolveHost(recipient, fallbackHost)
         let client = try makeClient(host, wallet.protoWallet)
@@ -85,6 +103,7 @@ public actor MessageBoxOutbox {
         try Task.checkCancellation()
         let prefix = try await Self.nonce(wallet.protoWallet)
         let suffix = try await Self.nonce(wallet.protoWallet)
+        let delivery = DeliveryState()
         do {
             let payment = try await wallet.createMessageBoxPayment(recipient: recipient, satoshis: satoshis,
                 derivationPrefix: prefix, derivationSuffix: suffix, description: description,
@@ -94,63 +113,141 @@ public actor MessageBoxOutbox {
                         transaction: payment.atomicBEEF, amount: satoshis, outputIndex: payment.outputIndex)
                     let envelope = try await client.preparePayment(to: recipient, token: token)
                     try await self.persist(MessageBoxPendingPayment(sender: sender,
-                        recipient: Hex.encode(recipient.compressedBytes), amount: satoshis,
+                        recipient: payee, amount: satoshis,
                         txid: payment.transactionID.displayHex, host: host, reference: payment.reference,
                         atomicBEEF: payment.atomicBEEF, envelope: envelope, broadcastAccepted: false))
+                    do {
+                        try await client.deliver(envelope)
+                        await delivery.delivered()
+                    } catch let refusal as MessageBoxError where refusal.isRefusal {
+                        // The server said no, so nothing is broadcast: throwing here makes the
+                        // wallet abort the funded action, and the saved payment goes with it.
+                        try await self.remove(sender, payee)
+                        throw refusal
+                    } catch {
+                        // Undecided: the server may hold the message. Broadcast, and keep the
+                        // payment for Retry, which resends this same envelope.
+                    }
                 })
             guard payment.results.contains(where: {
                 $0.txid == payment.transactionID.displayHex && $0.status != .failed
             }) else { throw MessageBoxOutboxError.broadcastUncertain }
-            guard var pending = try load(sender) else { throw MessageBoxOutboxError.missingPayment }
+            guard var pending = try load(sender, payee) else { throw MessageBoxOutboxError.missingPayment }
             pending.broadcastAccepted = true
             try persist(pending)
             try Task.checkCancellation()
-            try await client.deliver(pending.envelope)
-            try remove(sender)
+            if !(await delivery.isDelivered) { try await client.deliver(pending.envelope) }
+            try remove(sender, payee)
             return pending.txid
         } catch {
-            if let pending = try load(sender) { throw MessageBoxOutboxError.pending(pending.txid) }
+            if let pending = try load(sender, payee) {
+                throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
+            }
             throw error
         }
     }
 
-    /// Uses the originally selected host, even if the default was changed later.
-    /// Returning success means server acceptance, not recipient internalization.
-    public func retry(wallet: RemoteWallet) async throws -> String {
-        try await retry(wallet: wallet as any MessageBoxPayingWallet)
+    /// Delivers the saved payment to `recipient` again, on the host it was first sent to, even if
+    /// the default was changed later. A payment whose broadcast was not confirmed is delivered
+    /// first and broadcast after, as `send` does. Returning success means server acceptance, not
+    /// recipient internalization.
+    public func retry(wallet: RemoteWallet, recipient: String) async throws -> String {
+        try await retry(wallet: wallet as any MessageBoxPayingWallet, recipient: recipient)
     }
 
-    func retry(wallet: any MessageBoxPayingWallet) async throws -> String {
+    func retry(wallet: any MessageBoxPayingWallet, recipient: String) async throws -> String {
         let sender = wallet.messageBoxIdentity
         guard active.insert(sender).inserted else { throw MessageBoxOutboxError.busy }
         defer { active.remove(sender) }
-        guard var pending = try load(sender) else { throw MessageBoxOutboxError.missingPayment }
-        if !pending.broadcastAccepted {
-            try Task.checkCancellation()
-            try await wallet.resumeMessageBoxPayment(pending)
-            pending.broadcastAccepted = true
-            try persist(pending)
+        try migrateSingleRecord(sender)
+        guard var pending = try load(sender, recipient.lowercased()) else {
+            throw MessageBoxOutboxError.missingPayment
         }
-        try Task.checkCancellation()
-        let client = try makeClient(pending.host, wallet.protoWallet)
-        try await client.deliver(pending.envelope)
-        try remove(sender)
+        do {
+            try Task.checkCancellation()
+            let client = try makeClient(pending.host, wallet.protoWallet)
+            try await client.deliver(pending.envelope)
+            if !pending.broadcastAccepted {
+                try Task.checkCancellation()
+                try await wallet.resumeMessageBoxPayment(pending)
+                pending.broadcastAccepted = true
+                try persist(pending)
+            }
+        } catch {
+            throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
+        }
+        try remove(sender, pending.recipient)
         return pending.txid
     }
 
-    private func file(_ sender: String) throws -> URL {
-        // Do not allow an identifier from persisted data to become a path.
-        _ = try PublicKey(Hex.decode(sender, maximumDecodedByteCount: 33))
-        return directory.appendingPathComponent(sender.lowercased() + ".json")
+    /// Drops the saved payment to `recipient`.
+    ///
+    /// A payment storage never accepted for broadcast is aborted first, so its coins come back;
+    /// if storage will not abort it (it may already be on the network), nothing is dropped and
+    /// Retry is the way on. A broadcast payment is on chain to a key derived for the recipient:
+    /// dropping it forgets the only delivery that tells the recipient how to claim it, and the
+    /// coins do not come back to the sender.
+    @discardableResult
+    public func discard(wallet: RemoteWallet, recipient: String) async throws -> MessageBoxDiscarded {
+        try await discard(wallet: wallet as any MessageBoxPayingWallet, recipient: recipient)
     }
 
-    private func load(_ sender: String) throws -> MessageBoxPendingPayment? {
-        let url = try file(sender)
+    func discard(wallet: any MessageBoxPayingWallet, recipient: String) async throws -> MessageBoxDiscarded {
+        let sender = wallet.messageBoxIdentity
+        guard active.insert(sender).inserted else { throw MessageBoxOutboxError.busy }
+        defer { active.remove(sender) }
+        try migrateSingleRecord(sender)
+        guard let pending = try load(sender, recipient.lowercased()) else {
+            throw MessageBoxOutboxError.missingPayment
+        }
+        if pending.broadcastAccepted {
+            try remove(sender, pending.recipient)
+            return .forgotten(txid: pending.txid)
+        }
+        guard try await wallet.abandonMessageBoxPayment(pending) else {
+            throw MessageBoxOutboxError.abortRefused(pending.txid)
+        }
+        try remove(sender, pending.recipient)
+        return .released(txid: pending.txid)
+    }
+
+    private static func reason(_ error: any Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    private func file(_ sender: String, _ recipient: String) throws -> URL {
+        // Do not allow an identifier from persisted data to become a path.
+        _ = try PublicKey(Hex.decode(sender, maximumDecodedByteCount: 33))
+        _ = try PublicKey(Hex.decode(recipient, maximumDecodedByteCount: 33))
+        return directory.appendingPathComponent(sender.lowercased() + "." + recipient.lowercased() + ".json")
+    }
+
+    /// Records saved before payments were kept per recipient sit at `<sender>.json`. Moved to the
+    /// recipient's own file the first time the sender's payments are read, so a payment saved by
+    /// an earlier version is still retried, never lost.
+    private func migrateSingleRecord(_ sender: String) throws {
+        _ = try PublicKey(Hex.decode(sender, maximumDecodedByteCount: 33))
+        let old = directory.appendingPathComponent(sender.lowercased() + ".json")
+        guard FileManager.default.fileExists(atPath: old.path) else { return }
+        let record = try decode(old, sender: sender)
+        let new = try file(sender, record.recipient)
+        if FileManager.default.fileExists(atPath: new.path) { throw MessageBoxOutboxError.invalidRecord }
+        try FileManager.default.moveItem(at: old, to: new)
+    }
+
+    private func load(_ sender: String, _ recipient: String) throws -> MessageBoxPendingPayment? {
+        let url = try file(sender, recipient)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let record = try decode(url, sender: sender)
+        guard record.recipient == recipient.lowercased() else { throw MessageBoxOutboxError.invalidRecord }
+        return record
+    }
+
+    private func decode(_ url: URL, sender: String) throws -> MessageBoxPendingPayment {
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= 64 << 20 else { throw MessageBoxOutboxError.invalidRecord }
         let record = try JSONDecoder().decode(MessageBoxPendingPayment.self, from: Data(contentsOf: url))
-        guard record.sender == sender, record.envelope.recipient == record.recipient,
+        guard record.sender == sender.lowercased(), record.envelope.recipient == record.recipient,
               record.amount > 0, record.amount <= 2_100_000_000_000_000,
               (try? PublicKey(Hex.decode(record.recipient, maximumDecodedByteCount: 33))) != nil,
               (try? TransactionID(displayHex: record.txid)) != nil,
@@ -163,12 +260,14 @@ public actor MessageBoxOutbox {
     private func persist(_ record: MessageBoxPendingPayment) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        let url = try file(record.sender)
+        let url = try file(record.sender, record.recipient)
         try JSONEncoder().encode(record).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    private func remove(_ sender: String) throws { try FileManager.default.removeItem(at: file(sender)) }
+    private func remove(_ sender: String, _ recipient: String) throws {
+        try FileManager.default.removeItem(at: file(sender, recipient))
+    }
 
     /// SDK createNonce: 16 random bytes followed by the wallet's server HMAC.
     private static func nonce(_ wallet: ProtoWallet) async throws -> String {
@@ -180,6 +279,20 @@ public actor MessageBoxOutbox {
     }
 }
 
+/// Whether the delivery made before the broadcast was accepted.
+private actor DeliveryState {
+    private(set) var isDelivered = false
+    func delivered() { isDelivered = true }
+}
+
+/// What ``MessageBoxOutbox/discard(wallet:recipient:)`` did.
+public enum MessageBoxDiscarded: Sendable, Equatable {
+    /// Never broadcast; storage aborted it and its coins are spendable again.
+    case released(txid: String)
+    /// Already on chain to the recipient's derived key; only the saved delivery was dropped.
+    case forgotten(txid: String)
+}
+
 /// Internal seam for offline delivery-failure tests; the public API takes the
 /// concrete RemoteWallet so callers cannot accidentally omit wallet validation.
 protocol MessageBoxPayingWallet: Sendable {
@@ -189,6 +302,8 @@ protocol MessageBoxPayingWallet: Sendable {
         derivationPrefix: String, derivationSuffix: String, description: String,
         beforeBroadcast: @escaping @Sendable (CounterpartyPayment) async throws -> Void) async throws -> CounterpartyPayment
     func resumeMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws
+    /// Aborts the saved payment's action. True when storage released it.
+    func abandonMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws -> Bool
 }
 
 extension RemoteWallet: MessageBoxPayingWallet {
@@ -199,6 +314,11 @@ extension RemoteWallet: MessageBoxPayingWallet {
         try await payToCounterparty(recipient: recipient, satoshis: satoshis,
             derivationPrefix: derivationPrefix, derivationSuffix: derivationSuffix,
             description: description, labels: ["peerpay"], beforeBroadcast: beforeBroadcast)
+    }
+
+    func abandonMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws -> Bool {
+        // Storage refuses (`aborted: false`) for an action already sent to the network.
+        try await abort(reference: pending.reference)
     }
 
     func resumeMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws {
@@ -234,20 +354,28 @@ public struct MessageBoxPendingPayment: Codable, Sendable {
     let reference: String
     let atomicBEEF: [UInt8]
     let envelope: MessageBoxEnvelope
-    var broadcastAccepted: Bool
+    /// True once storage accepted the transaction for broadcast: the coins have left the sender.
+    public internal(set) var broadcastAccepted: Bool
 }
 
-public enum MessageBoxOutboxError: Error, LocalizedError, Sendable {
+public enum MessageBoxOutboxError: Error, LocalizedError, Sendable, Equatable {
     case busy, invalidAmount, missingPayment, invalidRecord, broadcastUncertain
+    /// A payment to this recipient is saved and not delivered; a new one would pay them twice.
     case pending(String)
+    /// The payment is saved but its delivery failed, for `reason`.
+    case notDelivered(txid: String, reason: String)
+    /// Storage would not abort the saved payment, so it may already be on the network.
+    case abortRefused(String)
     public var errorDescription: String? {
         switch self {
         case .busy: "A MessageBox payment is already in progress for this account."
         case .invalidAmount: "Enter a positive payment amount."
-        case .missingPayment: "There is no pending MessageBox payment to retry."
+        case .missingPayment: "There is no saved MessageBox payment to this recipient."
         case .invalidRecord: "The saved payment needs recovery. A new payment was not created."
         case .broadcastUncertain: "The transaction's broadcast is not confirmed. Retry the saved payment."
-        case .pending: "A payment is saved but delivery is not confirmed. Retry delivery; do not send another payment."
+        case .pending: "A payment to this recipient is saved but not delivered. Retry or discard it before sending them another."
+        case .notDelivered(_, let reason): "The payment is saved but was not delivered. \(reason)"
+        case .abortRefused: "This payment may already be on the network, so it was not discarded. Retry delivery instead."
         }
     }
 }
