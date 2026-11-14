@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import BSVCore
+import BSVCrypto
 import BSVInterpreter
 import BSVKeys
 import BSVOverlay
@@ -69,16 +70,21 @@ private final class AdvertisingWallet: MessageBoxAdvertisingWallet, @unchecked S
     private struct State {
         var created: [WalletCreateActionRequest] = []
         var signed: [WalletSignActionRequest] = []
+        var aborted: [WalletBase64Data] = []
         var pending: (transaction: Transaction, sources: BEEF?)?
     }
     let advertisementKeys: ProtoWallet
     private let basket: [WalletOutput]
+    private let failsSigning: Bool
     private let state = Locked(State())
 
-    init(keys: ProtoWallet, basket: [WalletOutput]) { advertisementKeys = keys; self.basket = basket }
+    init(keys: ProtoWallet, basket: [WalletOutput], failsSigning: Bool = false) {
+        advertisementKeys = keys; self.basket = basket; self.failsSigning = failsSigning
+    }
 
     var created: [WalletCreateActionRequest] { state.read(\.created) }
     var signed: [WalletSignActionRequest] { state.read(\.signed) }
+    var aborted: [WalletBase64Data] { state.read(\.aborted) }
 
     func listOutputs(_ request: WalletListOutputsRequest) async throws -> WalletListOutputsResult {
         XCTAssertEqual(request.basket, "overlay advertisements")
@@ -107,6 +113,7 @@ private final class AdvertisingWallet: MessageBoxAdvertisingWallet, @unchecked S
 
     func signAction(_ request: WalletSignActionRequest) async throws -> WalletSignActionResult {
         state.write { $0.signed.append(request) }
+        if failsSigning { throw WalletActionLifecycleError.invalidSpend }
         guard let pending = state.read(\.pending) else { throw WalletActionLifecycleError.unknownReference }
         var transaction = pending.transaction
         let configuration = try ScriptExecutionConfiguration(era: .afterGenesis, flags: [.enableForkID],
@@ -132,7 +139,8 @@ private final class AdvertisingWallet: MessageBoxAdvertisingWallet, @unchecked S
     }
 
     func abortAction(_ request: WalletAbortActionRequest) async throws -> WalletAbortActionResult {
-        WalletAbortActionResult(aborted: true)
+        state.write { $0.aborted.append(request.reference) }
+        return WalletAbortActionResult(aborted: true)
     }
 
     static func atomic(_ transaction: Transaction, sources: BEEF?) throws -> AtomicBEEF {
@@ -143,13 +151,65 @@ private final class AdvertisingWallet: MessageBoxAdvertisingWallet, @unchecked S
     }
 }
 
+/// `ls_ship`: answers with a signed SHIP advertisement of `tm_messagebox` for each host, and one
+/// for another topic that must be ignored.
+private final class ShipOverlay: OverlayLookupResolving, @unchecked Sendable {
+    private let outputs: [OutputListItem]
+    private let recorded = Locked<[String]>([])
+    var queries: [String] { recorded.read { $0 } }
+
+    init(hosts: [String]) throws {
+        let operator_ = try PrivateKey(Array(repeating: 0, count: 31) + [9])
+        func token(_ host: String, topic: String) throws -> OutputListItem {
+            let fields = [Array("SHIP".utf8), operator_.publicKey.compressedBytes, Array(host.utf8), Array(topic.utf8)]
+            let signature = try operator_.sign(digest: BSVHashing.sha256(fields.flatMap { $0 }))
+            let lock = try PushDrop.lockingScript(fields: fields + [signature.derBytes],
+                publicKey: operator_.publicKey, lockPosition: .beforeCompatibility)
+            let transaction = Transaction(version: 1, inputs: [],
+                outputs: [TransactionOutput(satoshis: 1, lockingScript: lock)], lockTime: 0)
+            let beef = try BEEF(merklePaths: [], transactions: [.raw(transaction)], limits: StorageLimits.beef)
+            return try OutputListItem(beef: beef.serialized(limits: StorageLimits.beef), outputIndex: 0)
+        }
+        outputs = try hosts.map { try token($0, topic: "tm_messagebox") }
+            + [try token("https://elsewhere.example", topic: "tm_other")]
+    }
+
+    func resolve(_ question: LookupQuestion) async throws -> LookupAnswer {
+        XCTAssertEqual(question.service.rawValue, "ls_ship")
+        recorded.write { $0.append(String(decoding: question.query, as: UTF8.self)) }
+        return try LookupAnswer(outputList: outputs)
+    }
+}
+
+/// SHIP hosts answering a submission as told.
+private actor SubmitFacilitator: TopicFacilitator {
+    enum Answer: Sendable { case admitted, unacknowledged, empty, fails }
+    private let answers: [String: Answer]
+    private(set) var submitted: [String] = []
+    private(set) var topics: [[String]] = []
+    init(answers: [String: Answer]) throws { self.answers = answers }
+
+    func submit(_ taggedBEEF: TaggedBEEF, to host: OverlayHost) async throws -> Steak {
+        submitted.append(host.rawValue)
+        topics.append(taggedBEEF.topics.map(\.rawValue))
+        let topic = try OverlayTopic(rawValue: "tm_messagebox")
+        switch answers[host.rawValue] ?? .fails {
+        case .admitted: return try Steak(instructions: [topic: AdmittanceInstructions(outputsToAdmit: [0])])
+        case .unacknowledged: return try Steak(instructions: [topic: AdmittanceInstructions()])
+        case .empty: return try Steak()
+        case .fails: throw OverlayDown()
+        }
+    }
+}
+
 /// Records what is submitted to `tm_messagebox`.
 private final class Broadcasts: @unchecked Sendable {
     private let recorded = Locked<[AtomicBEEF]>([])
     var sent: [AtomicBEEF] { recorded.read { $0 } }
-    func record(_ atomic: AtomicBEEF) -> TransactionID {
+    func record(_ atomic: AtomicBEEF) -> MessageBoxAdvertisementBroadcast {
         recorded.write { $0.append(atomic) }
-        return atomic.subjectTransactionID
+        return MessageBoxAdvertisementBroadcast(transactionID: atomic.subjectTransactionID, acceptedHosts: [],
+            failedHosts: [])
     }
 }
 
@@ -257,7 +317,7 @@ final class MessageBoxAdvertisementTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sign.options?.acceptDelayedBroadcast, false)
 
         XCTAssertEqual(broadcasts.sent.count, 1)
-        XCTAssertEqual(broadcasts.sent.first?.subjectTransactionID, txid)
+        XCTAssertEqual(broadcasts.sent.first?.subjectTransactionID, txid.transactionID)
     }
 
     func test_anointLeavesAnAdvertisementTheWalletCannotSpendAndBroadcastsDirectly() async throws {
@@ -273,7 +333,7 @@ final class MessageBoxAdvertisementTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(request.inputBEEF)
         XCTAssertEqual(request.outputs.map { $0.map { Hex.encode($0.lockingScript) } }, [Vector.oneSatLock])
         XCTAssertTrue(wallet.signed.isEmpty)
-        XCTAssertEqual(broadcasts.sent.map(\.subjectTransactionID), [txid])
+        XCTAssertEqual(broadcasts.sent.map(\.subjectTransactionID), [txid.transactionID])
     }
 
     func test_anointRefusesWhenTheLookupFailsOrTheHostIsNotPublic() async throws {
@@ -313,7 +373,68 @@ final class MessageBoxAdvertisementTests: XCTestCase, @unchecked Sendable {
         let sign = try XCTUnwrap(wallet.signed.first)
         XCTAssertEqual(Hex.encode(try XCTUnwrap(sign.spends[0]).unlockingScript), Vector.revokeUnlocking)
         XCTAssertEqual(sign.options?.acceptDelayedBroadcast, false)
-        XCTAssertEqual(broadcasts.sent.map(\.subjectTransactionID), [txid])
+        XCTAssertEqual(broadcasts.sent.map(\.subjectTransactionID), [txid.transactionID])
+    }
+
+    func test_aFailedSigningAbortsTheAction() async throws {
+        let (listed, _) = try advertisementOutput(script(Vector.oneSatLock))
+        let outpoint = Outpoint(transactionID: try TransactionID(displayHex: Vector.sourceTxid), outputIndex: 0)
+        let wallet = AdvertisingWallet(keys: ProtoWallet(rootKey: try rootKey()),
+            basket: [try WalletOutput(satoshis: 1, spendable: true, outpoint: outpoint)], failsSigning: true)
+        let broadcasts = Broadcasts()
+        do {
+            _ = try await advertiser(AdvertisementOverlay([listed]), broadcasts).anoint(bsvb, using: wallet)
+            XCTFail("expected the signing failure")
+        } catch WalletActionLifecycleError.invalidSpend {}
+        XCTAssertEqual(wallet.aborted, [try WalletBase64Data(base64: "cmVm")])
+        XCTAssertTrue(broadcasts.sent.isEmpty)
+    }
+
+    /// As TS `TopicBroadcaster`: every SHIP host advertising `tm_messagebox` is sent the
+    /// transaction; one that fails, or answers with no instructions, is dropped and reported, and
+    /// one host admitting it is enough.
+    func test_submitSucceedsWhenOneHostAdmitsAndReportsTheOthers() async throws {
+        let ship = try ShipOverlay(hosts: ["https://a.example", "https://b.example", "https://c.example"])
+        let facilitator = try SubmitFacilitator(answers: [
+            "https://a.example": .admitted, "https://b.example": .fails, "https://c.example": .empty,
+        ])
+        let atomic = try AdvertisingWallet.atomic(Transaction(version: 1, inputs: [],
+            outputs: [TransactionOutput(satoshis: 1, lockingScript: script(Vector.oneSatLock))], lockTime: 0),
+            sources: nil)
+        let result = try await MessageBoxAdvertiser.submit(atomic, resolver: ship, facilitator: facilitator)
+        XCTAssertEqual(result.transactionID, atomic.subjectTransactionID)
+        XCTAssertEqual(result.acceptedHosts.map(\.rawValue), ["https://a.example"])
+        XCTAssertEqual(result.failedHosts.map(\.rawValue), ["https://b.example", "https://c.example"])
+        XCTAssertEqual(ship.queries, [#"{"topics":["tm_messagebox"]}"#])
+        let submitted = await facilitator.submitted
+        XCTAssertEqual(submitted.sorted(), ["https://a.example", "https://b.example", "https://c.example"])
+        let topics = await facilitator.topics
+        XCTAssertTrue(topics.allSatisfy { $0 == ["tm_messagebox"] })
+    }
+
+    func test_submitFailsOnlyWhenNoHostAdmits() async throws {
+        let atomic = try AdvertisingWallet.atomic(Transaction(version: 1, inputs: [],
+            outputs: [TransactionOutput(satoshis: 1, lockingScript: script(Vector.oneSatLock))], lockTime: 0),
+            sources: nil)
+        let ship = try ShipOverlay(hosts: ["https://a.example", "https://b.example"])
+        let cases: [([String: SubmitFacilitator.Answer], MessageBoxAdvertisementError)] = [
+            (["https://a.example": .fails, "https://b.example": .empty], .allHostsRejected),
+            (["https://a.example": .unacknowledged, "https://b.example": .fails], .notAcknowledged),
+        ]
+        for (answers, expected) in cases {
+            do {
+                _ = try await MessageBoxAdvertiser.submit(atomic, resolver: ship,
+                    facilitator: SubmitFacilitator(answers: answers))
+                XCTFail("expected \(expected)")
+            } catch let error as MessageBoxAdvertisementError {
+                XCTAssertEqual(error, expected)
+            }
+        }
+        do {
+            _ = try await MessageBoxAdvertiser.submit(atomic, resolver: ShipOverlay(hosts: []),
+                facilitator: SubmitFacilitator(answers: [:]))
+            XCTFail("expected noInterestedHosts")
+        } catch MessageBoxAdvertisementError.noInterestedHosts {}
     }
 
     func test_networkPresetsBuild() {

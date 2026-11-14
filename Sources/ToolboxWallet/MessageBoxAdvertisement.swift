@@ -31,6 +31,21 @@ public struct MessageBoxAdvertisement: Sendable, Equatable {
     }
 }
 
+/// What submitting an advertisement transaction to `tm_messagebox` did, as TS `TopicBroadcaster`
+/// settles it: the interested hosts that took it, and those that failed or answered with nothing.
+/// One host taking it is enough.
+public struct MessageBoxAdvertisementBroadcast: Sendable, Equatable {
+    public let transactionID: TransactionID
+    public let acceptedHosts: [OverlayHost]
+    public let failedHosts: [OverlayHost]
+
+    public init(transactionID: TransactionID, acceptedHosts: [OverlayHost], failedHosts: [OverlayHost]) {
+        self.transactionID = transactionID
+        self.acceptedHosts = acceptedHosts
+        self.failedHosts = failedHosts
+    }
+}
+
 public enum MessageBoxAdvertisementError: Error, LocalizedError, Equatable, Sendable {
     /// The host is not a public HTTPS URL, so the overlay would never hand it out
     /// (TS `normalizeOverlayMessageBoxHost` drops it).
@@ -39,12 +54,22 @@ public enum MessageBoxAdvertisementError: Error, LocalizedError, Equatable, Send
     case unexpectedLookupAnswer
     /// The wallet returned no transaction to broadcast.
     case noTransaction
+    /// No SHIP host advertises `tm_messagebox` (TS `ERR_NO_HOSTS_INTERESTED`).
+    case noInterestedHosts
+    /// Every interested host failed or answered with nothing (TS `ERR_ALL_HOSTS_REJECTED`).
+    case allHostsRejected
+    /// No host that took the transaction admitted it to `tm_messagebox`
+    /// (TS `ERR_REQUIRE_ACK_FROM_ANY_HOST_FAILED`).
+    case notAcknowledged
 
     public var errorDescription: String? {
         switch self {
         case .invalidHost: "A MessageBox host to advertise must be a public HTTPS URL."
         case .unexpectedLookupAnswer: "The overlay did not answer the advertisement lookup with outputs."
         case .noTransaction: "The wallet did not return the advertisement transaction."
+        case .noInterestedHosts: "No overlay host takes MessageBox advertisements on this network."
+        case .allHostsRejected: "Every overlay host rejected the advertisement transaction."
+        case .notAcknowledged: "No overlay host admitted the advertisement."
         }
     }
 }
@@ -88,7 +113,7 @@ public struct MessageBoxAdvertiser: Sendable {
     /// TS `anointHost` reads up to 10,000 outputs of the basket.
     static let basketLimit: UInt32 = 10_000
 
-    typealias Broadcast = @Sendable (AtomicBEEF) async throws -> TransactionID
+    typealias Broadcast = @Sendable (AtomicBEEF) async throws -> MessageBoxAdvertisementBroadcast
 
     private let resolver: any OverlayLookupResolving
     private let broadcast: Broadcast
@@ -100,17 +125,70 @@ public struct MessageBoxAdvertiser: Sendable {
         let resolver = try LookupResolver(facilitator: HTTPSOverlayLookupFacilitator(configuration: configuration),
             slapTrackers: MessageBoxDiscovery.slapTrackers(for: network).map { try OverlayHost(rawValue: $0) },
             beefLimits: StorageLimits.beef)
-        // TS `TopicBroadcaster(['tm_messagebox'], { networkPreset })`: its defaults ask no
-        // acknowledgment from every host and the topic from at least one.
-        let broadcaster = try OverlayTopicBroadcaster(topics: [OverlayTopic(rawValue: Self.topic)],
-            facilitator: HTTPSOverlayTopicFacilitator(configuration: configuration), resolver: resolver,
-            beefLimits: StorageLimits.beef)
-        self.init(resolver: resolver) { atomic in try await broadcaster.broadcast(atomic).transactionID }
+        self.init(resolver: resolver, facilitator: HTTPSOverlayTopicFacilitator(configuration: configuration))
+    }
+
+    /// Submits through `facilitator` to the SHIP hosts `resolver` finds for `tm_messagebox`.
+    init(resolver: any OverlayLookupResolving, facilitator: any TopicFacilitator) {
+        self.init(resolver: resolver) { atomic in
+            try await MessageBoxAdvertiser.submit(atomic, resolver: resolver, facilitator: facilitator)
+        }
     }
 
     init(resolver: any OverlayLookupResolving, broadcast: @escaping Broadcast) {
         self.resolver = resolver
         self.broadcast = broadcast
+    }
+
+    /// TS `TopicBroadcaster(['tm_messagebox'], { networkPreset }).broadcast`: submits to every
+    /// SHIP host advertising the topic at once and keeps the hosts that answered with
+    /// instructions; a host that failed, or answered with none, is dropped and reported. It
+    /// succeeds once one host took the transaction and one of those admitted it to the topic (TS
+    /// defaults: no acknowledgment asked of every host, the topic of any one).
+    static func submit(
+        _ atomic: AtomicBEEF, resolver: any OverlayLookupResolving, facilitator: any TopicFacilitator
+    ) async throws -> MessageBoxAdvertisementBroadcast {
+        let topic = try OverlayTopic(rawValue: Self.topic)
+        let tagged = try TaggedBEEF(beef: atomic.serialized(limits: StorageLimits.beef), topics: [topic])
+        let hosts = try await interestedHosts(topic, resolver: resolver)
+        guard !hosts.isEmpty else { throw MessageBoxAdvertisementError.noInterestedHosts }
+        try Task.checkCancellation()
+        let answers = await withTaskGroup(of: (OverlayHost, Steak?).self,
+                                          returning: [OverlayHost: Steak].self) { group in
+            for host in hosts {
+                group.addTask {
+                    guard let steak = try? await facilitator.submit(tagged, to: host),
+                          !steak.instructions.isEmpty else { return (host, nil) }
+                    return (host, steak)
+                }
+            }
+            var answers: [OverlayHost: Steak] = [:]
+            for await (host, steak) in group { answers[host] = steak }
+            return answers
+        }
+        let accepted = hosts.filter { answers[$0] != nil }
+        guard !accepted.isEmpty else { throw MessageBoxAdvertisementError.allHostsRejected }
+        guard accepted.contains(where: { answers[$0]?.acknowledges(topic) == true }) else {
+            throw MessageBoxAdvertisementError.notAcknowledged
+        }
+        return MessageBoxAdvertisementBroadcast(transactionID: atomic.subjectTransactionID,
+            acceptedHosts: accepted, failedHosts: hosts.filter { answers[$0] == nil })
+    }
+
+    /// The hosts whose SHIP advertisement names `topic`, as TS `findInterestedHosts` reads them.
+    static func interestedHosts(_ topic: OverlayTopic, resolver: any OverlayLookupResolving) async throws -> [OverlayHost] {
+        let answer = try await resolver.resolve(LookupQuestion(service: OverlayService(rawValue: "ls_ship"),
+            query: Array(#"{"topics":["\#(topic.rawValue)"]}"#.utf8)))
+        guard case .outputList(let outputs) = answer else { throw MessageBoxAdvertisementError.unexpectedLookupAnswer }
+        var hosts: Set<OverlayHost> = []
+        for output in outputs {
+            guard let transaction = try? subject(output.beef),
+                  Int(output.outputIndex) < transaction.outputs.count,
+                  let token = try? OverlayAdminTokenCodec.decode(transaction.outputs[Int(output.outputIndex)].lockingScript),
+                  case .ship(let advertised) = token.subject, advertised == topic else { continue }
+            hosts.insert(token.host)
+        }
+        return hosts.sorted()
     }
 
     static func protocolID() throws -> WalletProtocolID {
@@ -220,20 +298,20 @@ public struct MessageBoxAdvertiser: Sendable {
 
     /// Advertises `host` for the wallet's identity, as TS `anointHost`: one transaction that
     /// creates the new advertisement and spends every earlier one the overlay lists and the
-    /// wallet holds as spendable in the basket. Returns the broadcast transaction's ID.
+    /// wallet holds as spendable in the basket. Returns what the overlay submission did.
     ///
     /// TS goes on with no earlier advertisements to spend when the lookup fails. This throws
     /// instead, so a failed lookup never leaves an older advertisement live beside the new one.
-    public func anoint(_ host: URL, wallet: RemoteWallet) async throws -> TransactionID {
+    public func anoint(_ host: URL, wallet: RemoteWallet) async throws -> MessageBoxAdvertisementBroadcast {
         try await anoint(host, using: wallet)
     }
 
     /// Spends one advertisement without replacing it, as TS `revokeHostAdvertisement`.
-    public func revoke(_ advertisement: MessageBoxAdvertisement, wallet: RemoteWallet) async throws -> TransactionID {
+    public func revoke(_ advertisement: MessageBoxAdvertisement, wallet: RemoteWallet) async throws -> MessageBoxAdvertisementBroadcast {
         try await revoke(advertisement, using: wallet)
     }
 
-    func anoint(_ host: URL, using wallet: some MessageBoxAdvertisingWallet) async throws -> TransactionID {
+    func anoint(_ host: URL, using wallet: some MessageBoxAdvertisingWallet) async throws -> MessageBoxAdvertisementBroadcast {
         guard Self.advertisedText(host) != nil else { throw MessageBoxAdvertisementError.invalidHost }
         let keys = wallet.advertisementKeys
         let identity = try await keys.getPublicKey(.init(selection: .identity)).publicKey
@@ -265,7 +343,7 @@ public struct MessageBoxAdvertiser: Sendable {
         return try await finish(created, spending: spending, using: wallet)
     }
 
-    func revoke(_ advertisement: MessageBoxAdvertisement, using wallet: some MessageBoxAdvertisingWallet) async throws -> TransactionID {
+    func revoke(_ advertisement: MessageBoxAdvertisement, using wallet: some MessageBoxAdvertisingWallet) async throws -> MessageBoxAdvertisementBroadcast {
         let created = try await wallet.createAction(WalletCreateActionRequest(
             description: "Revoke MessageBox host advertisement",
             inputBEEF: advertisement.beef,
@@ -276,26 +354,31 @@ public struct MessageBoxAdvertiser: Sendable {
     }
 
     /// Signs the advertisements the action spends, has the wallet finish and broadcast it, then
-    /// submits it to `tm_messagebox`.
+    /// submits it to `tm_messagebox`. Should signing fail, or the task be cancelled, before the
+    /// wallet signed, the action is aborted so its inputs are released.
     private func finish(
         _ created: WalletCreateActionResult, spending: [MessageBoxAdvertisement],
         using wallet: some MessageBoxAdvertisingWallet
-    ) async throws -> TransactionID {
+    ) async throws -> MessageBoxAdvertisementBroadcast {
         guard let signable = created.signableTransaction else {
             guard let transaction = created.transaction, spending.isEmpty else {
                 throw MessageBoxAdvertisementError.noTransaction
             }
             return try await broadcast(transaction)
         }
-        let spends: [UInt32: WalletSignActionSpend]
+        let signed: WalletSignActionResult
         do {
-            spends = try await Self.spends(signable.transaction, spending: spending, keys: wallet.advertisementKeys)
+            try Task.checkCancellation()
+            let spends = try await Self.spends(signable.transaction, spending: spending, keys: wallet.advertisementKeys)
+            try Task.checkCancellation()
+            signed = try await wallet.signAction(WalletSignActionRequest(reference: signable.reference,
+                spends: spends, options: WalletSignActionOptions(acceptDelayedBroadcast: false)))
         } catch {
-            _ = try? await wallet.abortAction(WalletAbortActionRequest(reference: signable.reference))
+            let reference = signable.reference
+            // Not in this task, which may be the cancelled one.
+            await Task { _ = try? await wallet.abortAction(WalletAbortActionRequest(reference: reference)) }.value
             throw error
         }
-        let signed = try await wallet.signAction(WalletSignActionRequest(reference: signable.reference,
-            spends: spends, options: WalletSignActionOptions(acceptDelayedBroadcast: false)))
         guard let transaction = signed.transaction else { throw MessageBoxAdvertisementError.noTransaction }
         return try await broadcast(transaction)
     }

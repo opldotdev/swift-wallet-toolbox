@@ -269,6 +269,7 @@ let package = Package(
                 "ToolboxPermissions", "ToolboxAuth", "ToolboxServices",
                 .product(name: "BSVAuth", package: "swift-sdk"),
                 .product(name: "BSVCore", package: "swift-sdk"),
+                .product(name: "BSVCrypto", package: "swift-sdk"),
                 .product(name: "BSVInterpreter", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),
                 .product(name: "BSVOverlay", package: "swift-sdk"),
