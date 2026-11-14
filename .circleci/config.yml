@@ -1,0 +1,45 @@
+# macOS CI for swift-wallet-toolbox: swift test on every push to any branch.
+#
+# Mac builds run on CircleCI only, never on GitHub Actions macOS runners. Linux jobs stay
+# in .github/workflows/ci.yml. Image and resource class match opldotdev/1sat-wallet-mobile:
+# macos / Xcode 26.6.0 on m4pro.medium.
+version: 2.1
+
+jobs:
+  swift-test-macos:
+    macos:
+      xcode: 26.6.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - run:
+          name: Require Xcode 26
+          command: |
+            set -euo pipefail
+            ver="$(xcodebuild -version | awk 'NR==1 {print; exit}')"
+            echo "$ver"
+            swift --version
+            case "$ver" in
+              "Xcode 26."*) ;;
+              *) echo "error: need Xcode 26, got: $ver" >&2; exit 1 ;;
+            esac
+      - restore_cache:
+          keys:
+            - spm-v1-{{ arch }}-{{ checksum "Package.resolved" }}
+      - run:
+          name: Resolve packages
+          command: swift package resolve
+      - save_cache:
+          key: spm-v1-{{ arch }}-{{ checksum "Package.resolved" }}
+          paths:
+            - .build/repositories
+            - ~/Library/Caches/org.swift.swiftpm
+      - run:
+          name: Test
+          no_output_timeout: 20m
+          command: swift test --disable-sandbox
+
+workflows:
+  macos:
+    jobs:
+      - swift-test-macos
