@@ -48,25 +48,26 @@ public actor StorageClient {
     /// A server-side failure is raised as a `WireError` carrying the server's own name for it. An
     /// application has to tell "you do not have enough money" from "the server broke", and a
     /// client that kept only the message would make both of them prose.
+    ///
+    /// The body is written with `JSON.stringify`'s rules, never `JSONEncoder`'s. The storage server
+    /// (`@bsv/auth-express-middleware` behind `express.json()`) does not verify the bytes it
+    /// received: it rebuilds the signed BRC-104 payload from `JSON.stringify(req.body)`. Any byte
+    /// where our text differs from that re-serialisation breaks the signature, and the server
+    /// answers an unsigned 401 that looks exactly like an evicted session. `JSONEncoder` writes
+    /// `/` as `\/`, so every call carrying a slash failed: a `type:text/plain` inscription tag on
+    /// every inscribe, and a server-issued base64 `reference` on roughly one send in five, in
+    /// `processAction` and then again in the `abortAction` meant to release its inputs. The
+    /// TypeScript `StorageClient` sends `JSON.stringify(body)`, which is what this matches.
     public func call(_ method: String, _ params: [JSONValue]) async throws -> JSONValue {
-        let id = nextID
-        nextID += 1
-
-        let request = JSONValue.object([
-            "jsonrpc": .string("2.0"),
-            "method": .string(method),
-            "params": .array(params),
-            "id": .number(Double(id)),
-        ])
-        return try await send(method, id: id, body: Array(try JSONEncoder().encode(request)))
+        try await call(method, rawParams: params.map { OrderedJSON($0) })
     }
 
     /// Issues one call whose parameters are written member for member as given.
     ///
-    /// `call(_:_:)` encodes through a dictionary, which does not keep key order. That is fine for
-    /// every argument a server reads by name, and wrong for one it hashes: the action-batch
-    /// manifest's digest is recomputed by storage from the key order it receives. Parameters
-    /// passed here are written with `JSON.stringify`'s rules and in their own order.
+    /// `call(_:_:)` starts from a dictionary, which has no key order, and writes members sorted by
+    /// key. That is fine for every argument a server reads by name, and wrong for one it hashes:
+    /// the action-batch manifest's digest is recomputed by storage from the key order it receives.
+    /// Parameters passed here are written with `JSON.stringify`'s rules and in their own order.
     public func call(_ method: String, rawParams params: [OrderedJSON]) async throws -> JSONValue {
         let id = nextID
         nextID += 1
