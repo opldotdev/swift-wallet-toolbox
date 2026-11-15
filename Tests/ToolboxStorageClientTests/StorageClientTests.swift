@@ -35,6 +35,12 @@ final class StorageClientTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            let scriptsSettings = answers.first.map {
+                String(decoding: $0.body, as: UTF8.self).contains("storageIdentityKey")
+            } ?? false
+            if let reply = ActiveStorageFixture.reply(
+                to: body, answeringSettings: !scriptsSettings
+            ) { return reply }
             bodiesSent.append(body ?? [])
             guard !answers.isEmpty else {
                 return AuthenticatedResponse(statusCode: 500, headers: [:], body: [])
@@ -164,10 +170,11 @@ final class StorageClientTests: XCTestCase {
 
         let body = await transport.bodiesSent[0]
         let text = String(decoding: body, as: UTF8.self)
+        // Ids 1 and 2 went to `makeAvailable` and `findOrInsertUser`, which a write reads first.
         XCTAssertEqual(
             text,
             #"{"jsonrpc":"2.0","method":"abortAction","params":[{"identityKey":"02aa","userId":7},"#
-                + #"{"reference":"dGVz/A==","satoshis":1500000,"tags":["type:text/plain"]}],"id":1}"#
+                + #"{"reference":"dGVz/A==","satoshis":1500000,"tags":["type:text/plain"]}],"id":3}"#
         )
         XCTAssertEqual(
             try OrderedJSON.parse(text).serialized(), text,
@@ -233,7 +240,7 @@ final class StorageClientTests: XCTestCase {
         let client = StorageClient(endpoint: endpoint, transport: transport)
 
         do {
-            _ = try await client.call("createAction", [])
+            _ = try await client.call("createAction", [.object(auth.jsonObject)])
             XCTFail("a reported failure must not return a result")
         } catch let error as WireError {
             XCTAssertEqual(error, .insufficientFunds("need 500 more"))
@@ -249,7 +256,7 @@ final class StorageClientTests: XCTestCase {
         let client = StorageClient(endpoint: endpoint, transport: transport)
 
         do {
-            _ = try await client.call("processAction", [])
+            _ = try await client.call("processAction", [.object(auth.jsonObject)])
             XCTFail("a response carrying an error must not be treated as a success")
         } catch let error as WireError {
             XCTAssertEqual(error, .unauthorized("no"))

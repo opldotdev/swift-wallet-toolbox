@@ -670,6 +670,7 @@ private actor ScriptedPermissionTransport: AuthenticatedTransport {
         headers: [String: String],
         body: [UInt8]?
     ) async throws -> AuthenticatedResponse {
+        if let reply = ActiveStorageFixture.reply(to: body) { return reply }
         calls += 1
         let request = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
         let envelope = JSONValue.object([
@@ -747,6 +748,7 @@ private actor MutationTransport: AuthenticatedTransport {
         headers: [String: String],
         body: [UInt8]?
     ) async throws -> AuthenticatedResponse {
+        if let reply = ActiveStorageFixture.reply(to: body) { return reply }
         let request = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
         let rpcMethod = request["method"]?.stringValue ?? ""
         calledMethods.append(rpcMethod)

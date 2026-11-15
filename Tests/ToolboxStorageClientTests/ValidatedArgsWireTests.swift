@@ -29,6 +29,7 @@ final class ValidatedArgsWireTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            if let reply = ActiveStorageFixture.reply(to: body) { return reply }
             let bytes = body ?? []
             bodies.append(String(decoding: bytes, as: UTF8.self))
             let request = try JSONDecoder().decode(JSONValue.self, from: Data(bytes))
@@ -106,9 +107,10 @@ final class ValidatedArgsWireTests: XCTestCase {
 
         let bodies = await transport.bodies
         XCTAssertEqual(bodies.count, 1)
+        // Ids 1 and 2 went to `makeAvailable` and `findOrInsertUser`, which a write reads first.
         XCTAssertEqual(
             bodies.first,
-            #"{"jsonrpc":"2.0","method":"createAction","params":[{"identityKey":"02aa","userId":7},\#(fixtureArguments)],"id":1}"#
+            #"{"jsonrpc":"2.0","method":"createAction","params":[{"identityKey":"02aa","userId":7},\#(fixtureArguments)],"id":3}"#
         )
     }
 
@@ -198,7 +200,7 @@ final class ValidatedArgsWireTests: XCTestCase {
         let bodies = await transport.bodies
         XCTAssertEqual(
             bodies.first,
-            #"{"jsonrpc":"2.0","method":"createAction","params":[{"identityKey":"02aa","userId":7},{"description":"remix change","inputs":[],"outputs":[],"lockTime":0,"version":1,"labels":[],"options":{"signAndProcess":false,"acceptDelayedBroadcast":true,"knownTxids":[],"returnTXIDOnly":false,"noSend":false,"noSendChange":[],"sendWith":[],"randomizeOutputs":true},"isSendWith":false,"isDelayed":true,"isNoSend":false,"isNewTx":true,"isRemixChange":true,"isSignAction":true,"includeAllSourceTransactions":false,"isTestWerrReviewActions":false}],"id":1}"#
+            #"{"jsonrpc":"2.0","method":"createAction","params":[{"identityKey":"02aa","userId":7},{"description":"remix change","inputs":[],"outputs":[],"lockTime":0,"version":1,"labels":[],"options":{"signAndProcess":false,"acceptDelayedBroadcast":true,"knownTxids":[],"returnTXIDOnly":false,"noSend":false,"noSendChange":[],"sendWith":[],"randomizeOutputs":true},"isSendWith":false,"isDelayed":true,"isNoSend":false,"isNewTx":true,"isRemixChange":true,"isSignAction":true,"includeAllSourceTransactions":false,"isTestWerrReviewActions":false}],"id":3}"#
         )
 
         let begin = try StorageClient.beginArguments(

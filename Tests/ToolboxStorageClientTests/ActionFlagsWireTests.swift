@@ -25,6 +25,7 @@ final class ActionFlagsWireTests: XCTestCase {
             method: String, path: String, query: String?, headers: [String: String],
             body: [UInt8]?
         ) async throws -> AuthenticatedResponse {
+            if let reply = ActiveStorageFixture.reply(to: body) { return reply }
             let request = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
             bodies.append(request)
             let result = results.isEmpty ? "null" : results.removeFirst()

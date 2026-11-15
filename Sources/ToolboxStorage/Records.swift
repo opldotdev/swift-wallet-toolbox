@@ -24,6 +24,23 @@ public struct StorageSettings: Equatable, Sendable {
     }
 }
 
+/// The user's record on one store, as `findOrInsertUser` returns it.
+///
+/// `activeStorage` names the one store this user's wallet writes to. Every other store holding
+/// the same keys is a backup that syncs through it; writing to a backup directly makes the two
+/// diverge.
+public struct StorageUser: Equatable, Sendable {
+    public let userId: Int
+    public let identityKey: String
+    public let activeStorage: String
+
+    public init(userId: Int, identityKey: String, activeStorage: String) {
+        self.userId = userId
+        self.identityKey = identityKey
+        self.activeStorage = activeStorage
+    }
+}
+
 public enum Chain: String, Equatable, Sendable {
     case main
     case test
