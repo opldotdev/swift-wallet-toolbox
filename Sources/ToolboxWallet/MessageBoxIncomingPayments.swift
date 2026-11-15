@@ -256,6 +256,11 @@ extension MessageBoxClient {
     /// such as the `URLError(.cancelled)` a cancelled request throws) throws `CancellationError`;
     /// the wallet may or may not have taken the payment then, and the message is not acknowledged.
     ///
+    /// A wallet whose storage is not the user's active storage refuses the token's internalize,
+    /// and `WireError.notActive` is thrown as it came: it is no verdict on the payment, and the
+    /// message is not acknowledged. Any other failure to take the token throws
+    /// ``MessageBoxPaymentError/settlementFailed``.
+    ///
     /// `beforeAcknowledge`, when given, runs after everything is internalized and right before
     /// the acknowledgement. If it throws, the message is not acknowledged and the result reports
     /// `acknowledged` false, because the funds are already in the wallet. Use it to keep the

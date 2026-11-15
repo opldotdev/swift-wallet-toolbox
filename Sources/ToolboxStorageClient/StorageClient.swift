@@ -45,7 +45,7 @@ public actor StorageClient {
     }
 
     /// The identity key of the store the user's record names as active, once read.
-    public var activeStorageIdentityKey: String? { user?.activeStorage }
+    public var activeStorageIdentityKey: String? { user?.activeStorage ?? nil }
 
     /// This is a client, not an engine: it forwards to storage rather than owning the records.
     ///
@@ -165,15 +165,15 @@ public actor StorageClient {
     /// The record's `activeStorage` is what makes this store writable: see `requireActive`.
     public func findOrInsertUser(_ identityKey: String) async throws -> StorageUser {
         let result = try await call("findOrInsertUser", [.string(identityKey)])
-        guard let user = result["user"],
-              let userId = user["userId"]?.intValue,
-              let activeStorage = user["activeStorage"]?.stringValue else {
+        guard let user = result["user"], let userId = user["userId"]?.intValue else {
             throw StorageClientError.unreadableResponse(method: "findOrInsertUser")
         }
+        // A record with no `activeStorage` names no store active, so this one is not: writes are
+        // refused as `WERR_NOT_ACTIVE`, as TS `isActiveEnabled` is false for it.
         let read = StorageUser(
             userId: userId,
             identityKey: user["identityKey"]?.stringValue ?? identityKey,
-            activeStorage: activeStorage
+            activeStorage: user["activeStorage"]?.stringValue
         )
         self.user = read
         return read

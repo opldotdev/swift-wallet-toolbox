@@ -15,12 +15,12 @@ final class ActiveStorageTests: XCTestCase {
     /// Answers by method name. `activeStorage` is what the user record names, and can change
     /// between calls the way it does when another wallet switches its active store.
     private actor RoutedTransport: AuthenticatedTransport {
-        var activeStorage: String
+        var activeStorage: String?
         private(set) var methods: [String] = []
 
-        init(activeStorage: String) { self.activeStorage = activeStorage }
+        init(activeStorage: String?) { self.activeStorage = activeStorage }
 
-        func setActiveStorage(_ key: String) { activeStorage = key }
+        func setActiveStorage(_ key: String?) { activeStorage = key }
 
         func send(
             method: String, path: String, query: String?, headers: [String: String],
@@ -29,7 +29,16 @@ final class ActiveStorageTests: XCTestCase {
             let request = try JSONDecoder().decode(JSONValue.self, from: Data(body ?? []))
             let name = request["method"]?.stringValue ?? ""
             methods.append(name)
-            if let reply = ActiveStorageFixture.reply(to: body, activeStorage: activeStorage) {
+            if name == "findOrInsertUser", activeStorage == nil {
+                let id = request["id"]?.intValue ?? 0
+                return AuthenticatedResponse(
+                    statusCode: 200, headers: [:],
+                    body: Array(#"{"jsonrpc":"2.0","id":\#(id),"result":{"user":{"userId":7,"identityKey":"02aa","activeStorage":null},"isNew":false}}"#.utf8)
+                )
+            }
+            if let reply = ActiveStorageFixture.reply(
+                to: body, activeStorage: activeStorage ?? ActiveStorageFixture.storageIdentityKey
+            ) {
                 return reply
             }
             // Every other call succeeds with a result no decoder will mistake for real data; the
@@ -55,14 +64,20 @@ final class ActiveStorageTests: XCTestCase {
         .object(["identityKey": .string(auth.identityKey), "userId": .number(7)])
     }
 
-    func test_writerListMatchesTheReferenceManager() {
-        XCTAssertEqual(StorageClient.writerMethods, [
-            "abortAction", "createAction", "internalizeAction", "processAction",
-            "relinquishCertificate", "relinquishOutput", "insertCertificateAuth",
-            "prepareNoSendExpiry", "activateNoSendExpiry", "armNoSendExpiry",
-            "beginActionBatch", "extendActionBatch", "renewActionBatch",
-            "commitActionBatch", "abortActionBatch",
-        ])
+    /// Every writer TS `WalletStorageManager` sends through `getAuth(true)` (older toolbox
+    /// `src/storage/WalletStorageManager.ts:431-479`) is gated here; the current manager gates the
+    /// no-send-expiry and action-batch writers as well, which the list also holds.
+    func test_everyReferenceWriterIsGated() {
+        let reference: Set<String> = [
+            "abortAction", "createAction", "internalizeAction", "relinquishCertificate",
+            "relinquishOutput", "processAction", "insertCertificateAuth",
+        ]
+        XCTAssertTrue(reference.isSubset(of: StorageClient.writerMethods),
+            "\(reference.subtracting(StorageClient.writerMethods))")
+        for reader in ["listActions", "listOutputs", "listCertificates", "getCapabilities",
+                       "makeAvailable", "findOrInsertUser"] {
+            XCTAssertFalse(StorageClient.writerMethods.contains(reader), reader)
+        }
     }
 
     func test_activeStorePassesWritesAndReadsTheUserOnce() async throws {
@@ -147,6 +162,25 @@ final class ActiveStorageTests: XCTestCase {
         ])
         let isActive = await client.isActive
         XCTAssertEqual(isActive, true)
+    }
+
+    /// A user record that names no active storage makes no store active: a write is refused as
+    /// not active, not reported as an unreadable reply.
+    func test_aUserWithNoActiveStorageIsNotActive() async throws {
+        let transport = RoutedTransport(activeStorage: nil)
+        let client = client(transport)
+
+        let user = try await client.findOrInsertUser("02aa")
+        XCTAssertNil(user.activeStorage)
+        do {
+            _ = try await client.call("createAction", [authParameter, .object([:])])
+            XCTFail("createAction reached a store no record names active")
+        } catch WireError.notActive {}
+
+        let methods = await transport.methods
+        XCTAssertFalse(methods.contains("createAction"))
+        let isActive = await client.isActive
+        XCTAssertEqual(isActive, false)
     }
 
     func test_findOrInsertUserSendsTheIdentityKeyAndReadsTheRecord() async throws {
