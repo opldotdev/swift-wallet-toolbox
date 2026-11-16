@@ -84,7 +84,9 @@ extension StorageClient {
         }
 
         let beefBytes = try byteArray(result["BEEF"] ?? result["beef"])
-        let beef = try beefBytes.map { try BEEF(bytes: $0, limits: StorageLimits.beef) }
+        let beef = try beefBytes.map {
+            try BEEF(bytes: $0, limits: StorageLimits.beef, transactionOrder: .any)
+        }
         return try WalletListOutputsResult(
             totalOutputs: totalOutputs,
             beef: beef,

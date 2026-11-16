@@ -417,7 +417,9 @@ public actor ActionBatchController {
         }
         workspace.state.add(reserved: extension_.reservedOutputs, explicit: extension_.explicitOutputs)
         if let bytes = extension_.inputBeef, !bytes.isEmpty {
-            try workspace.state.merge(BEEF(bytes: bytes, limits: PlannerState.beefLimits))
+            try workspace.state.merge(
+                BEEF(bytes: bytes, limits: PlannerState.beefLimits, transactionOrder: .any)
+            )
         }
         workspace.expiresAt = extension_.expiresAt
         return (

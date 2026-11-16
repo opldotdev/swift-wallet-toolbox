@@ -24,11 +24,13 @@ public struct SignedAction: Sendable {
 
     /// Packages a signed transaction using the proof graph from the action that funded it.
     ///
-    /// `funded.inputBEEF` is the graph storage returned. The signed subject is appended without
-    /// changing that graph's version, entries, or BUMPs, then BRC-95 validation proves that every
-    /// retained record belongs to the subject's ancestry and that no ancestor is missing. A funded
-    /// graph that is unrelated, incomplete, internally conflicting, or collides with the subject is
-    /// rejected here, before a process request can be produced.
+    /// `funded.inputBEEF` is the graph storage returned. Storage writes it with `@bsv/sdk`, whose
+    /// writer lists a transaction that is not fully proven ahead of its own parents, so it is read
+    /// in any order and reordered parents-first, as that SDK's reader does. The signed subject is
+    /// appended without changing that graph's version, entries, or BUMPs, then BRC-95 validation
+    /// proves that every retained record belongs to the subject's ancestry and that no ancestor is
+    /// missing. A funded graph that is unrelated, incomplete, internally conflicting, or collides
+    /// with the subject is rejected here, before a process request can be produced.
     public init(
         funded: StorageCreateActionResult,
         transaction: Transaction,
@@ -42,7 +44,7 @@ public struct SignedAction: Sendable {
 
         let sourceGraph: BEEF
         if let graph = funded.inputBEEF {
-            sourceGraph = try BEEF(bytes: graph, limits: beefLimits)
+            sourceGraph = try BEEF(bytes: graph, limits: beefLimits, transactionOrder: .any)
         } else {
             sourceGraph = try BEEF(
                 version: .v2,

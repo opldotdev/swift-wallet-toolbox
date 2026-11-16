@@ -488,7 +488,7 @@ extension MessageBoxClient {
             }
             let transaction: AtomicBEEF
             do {
-                transaction = try AtomicBEEF(bytes: tx, limits: StorageLimits.beef)
+                transaction = try AtomicBEEF(bytes: tx, limits: StorageLimits.beef, transactionOrder: .any)
             } catch {
                 throw recipientPaymentReadFailure(error)
             }
@@ -631,7 +631,9 @@ extension MessageBoxClient {
                 keyID: WalletKeyID(BRC29.keyID(prefix: prefix, suffix: suffix)),
                 counterparty: .publicKey(sender), forSelf: true)))
             let expected = try BRC29.lockingScript(for: derived.publicKey)
-            let atomic = try AtomicBEEF(bytes: token.transaction, limits: StorageLimits.beef)
+            let atomic = try AtomicBEEF(
+                bytes: token.transaction, limits: StorageLimits.beef, transactionOrder: .any
+            )
             guard let subject = try atomic.beef.transaction(for: atomic.subjectTransactionID, limits: StorageLimits.transaction),
                   token.outputIndex < subject.outputs.count,
                   subject.outputs[token.outputIndex].satoshis == token.amount,

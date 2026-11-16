@@ -604,7 +604,7 @@ public struct RemoteWallet: Sendable {
         let graph: BEEF
         if let bytes = funded.inputBEEF {
             do {
-                graph = try BEEF(bytes: bytes, limits: StorageLimits.beef)
+                graph = try BEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)
             } catch {
                 throw PermissionTokenMutationError.untrustworthyFundedBEEF
             }

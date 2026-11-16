@@ -1031,6 +1031,70 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         let dependency = try XCTUnwrap(blobs.first { $0.key == digest }?.value.arrayValue)
         try check(dependency.compactMap { $0.int64Value.flatMap(UInt8.init(exactly:)) })
     }
+
+    /// Storage writes the reservation's BEEF with `@bsv/sdk`, whose `sortTxs()` puts a transaction
+    /// with an input missing from the graph ahead of everything proven, its own parent included.
+    /// One unusable reserved output must not stop the batch funding from the others.
+    func test_aReservationWrittenChildFirstStillFunds() async throws {
+        let auth = try auth
+        let limits = WalletTransactionLimits.standard
+        let script = try Script(bytes: [0x51], maximumByteCount: 1)
+        let parent = Transaction(
+            version: 1, inputs: [],
+            outputs: [
+                TransactionOutput(satoshis: 5_000, lockingScript: script),
+                TransactionOutput(satoshis: 5_000, lockingScript: script),
+            ],
+            lockTime: 0
+        )
+        let parentID = try parent.transactionID(limits: limits)
+        let parentPath = try MerklePath(
+            blockHeight: 100,
+            levels: [[.hash(offset: 0, hash: try Hash256(parentID.wireBytes), isTransactionID: true)]]
+        )
+        let usable = try utxo(tag: 1, spending: Outpoint(transactionID: parentID, outputIndex: 0))
+        let partial = try utxo(tag: 2, spending: Outpoint(transactionID: parentID, outputIndex: 1))
+        let absent = try TransactionID(wireBytes: [UInt8](repeating: 0xee, count: 32))
+        let unusable = Transaction(
+            version: partial.version,
+            inputs: partial.inputs + [TransactionInput(
+                previousOutput: Outpoint(transactionID: absent, outputIndex: 0),
+                unlockingScript: try Script(bytes: [], maximumByteCount: 0)
+            )],
+            outputs: partial.outputs,
+            lockTime: partial.lockTime
+        )
+        // Wire order as `Beef.toBinary()` writes it: the transaction with a missing input, then the
+        // proven parent, then the transaction that chains to the proof.
+        var source: [UInt8] = [0x02, 0x00, 0xbe, 0xef, 0x01]
+        source += try parentPath.serialized(limits: WalletBEEFLimits.standard.merklePathLimits)
+        source += [0x03, 0x00] + (try unusable.serialized(limits: limits))
+        source += [0x01, 0x00] + (try parent.serialized(limits: limits))
+        source += [0x00] + (try usable.serialized(limits: limits))
+        let reservationBEEF = source
+        XCTAssertThrowsError(try BEEF(bytes: source, limits: WalletBEEFLimits.standard)) { error in
+            guard case BEEFError.parentAfterChild = error else {
+                return XCTFail("expected parentAfterChild, got \(error)")
+            }
+        }
+
+        let storage = FakeBatchStorage(capabilities: capabilities()) {
+            try self.begin($0, funding: [usable, unusable], inputBeef: reservationBEEF)
+        }
+        let batch = controller(storage)
+        let request = try anchorRequest()
+        let funded = try await XCTUnwrapAsync(await batch.plan(auth, request))
+        XCTAssertEqual(funded.inputs.map(\.sourceTXID), [try txid(usable)])
+        let graph = try BEEF(bytes: try XCTUnwrap(funded.inputBEEF), limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(
+            try graph.transactions.map { try $0.transactionID(limits: limits).displayHex },
+            [parentID.displayHex, try txid(usable)]
+        )
+        let anchor = try sign(funded, request)
+        try verifyScripts(anchor.transaction)
+        let envelope = try AtomicBEEF(bytes: try anchor.atomicBEEF(), limits: WalletBEEFLimits.standard)
+        XCTAssertEqual(envelope.subjectTransactionID, anchor.transactionID)
+    }
 }
 
 // MARK: - Doubles

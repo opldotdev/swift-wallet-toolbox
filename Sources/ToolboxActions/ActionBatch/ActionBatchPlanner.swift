@@ -202,7 +202,10 @@ struct PlannerState: Sendable {
         self.begin = begin
         var beef = try BEEF(version: .v2, merklePaths: [], transactions: [], limits: Self.beefLimits)
         if let bytes = begin.inputBeef, !bytes.isEmpty {
-            beef = try beef.merging(BEEF(bytes: bytes, limits: Self.beefLimits), limits: Self.beefLimits)
+            beef = try beef.merging(
+                BEEF(bytes: bytes, limits: Self.beefLimits, transactionOrder: .any),
+                limits: Self.beefLimits
+            )
         }
         if let firstActionBEEF {
             beef = try beef.merging(firstActionBEEF, limits: Self.beefLimits)
