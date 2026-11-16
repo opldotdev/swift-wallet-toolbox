@@ -22,6 +22,8 @@ final class AuthenticatedSessionTests: XCTestCase {
         var responseStatus: Int
         /// Every path the peer was asked for, so a test can assert the handshake happened once.
         private(set) var pathsSeen: [String] = []
+        /// Every query the peer received on the wire, encoded as sent.
+        private(set) var queriesSeen: [String?] = []
         /// Set to refuse the handshake.
         var refuseHandshake = false
         /// After a session is open, answer later application requests with an unsigned body.
@@ -51,6 +53,7 @@ final class AuthenticatedSessionTests: XCTestCase {
 
         func send(_ request: HTTPRequest) async throws -> HTTPResponse {
             pathsSeen.append(request.url.path)
+            queriesSeen.append(request.url.query)
             if request.url.path.hasSuffix(BRC104HTTPHeaderName.handshakePath) {
                 return try await handshake(request)
             }
@@ -163,6 +166,54 @@ final class AuthenticatedSessionTests: XCTestCase {
 
         XCTAssertEqual(response.statusCode, 200)
         XCTAssertEqual(String(decoding: response.body, as: UTF8.self), "{\"result\":42}")
+    }
+
+    /// The frame signs the query as the caller wrote it, already percent-encoded, as AuthFetch
+    /// signs `url.search`. The URL must carry the same bytes, or the peer verifies a different
+    /// query and refuses the request. Base64 values (`+`, `/`, `=`) are the case that matters.
+    func test_aPercentEncodedQueryGoesOutExactlyAsSigned() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+        let query = "?tokenId=abc_0&derivationPrefix=a%2Bb%2Fc%3D%3D&x=1"
+
+        let response = try await session.send(method: "POST", path: "/enable", query: query)
+
+        XCTAssertEqual(response.statusCode, 200)
+        let seen = await peer.queriesSeen.last ?? nil
+        XCTAssertEqual(seen, String(query.dropFirst()))
+    }
+
+    /// A query with characters the caller left unencoded is signed in the same encoded form it
+    /// is sent in, so the peer still verifies it.
+    func test_anUnencodedQueryIsSignedAsItIsSent() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        let response = try await session.send(method: "GET", path: "/list", query: "?q=a b[1]&k=%2B&n='x'")
+
+        XCTAssertEqual(response.statusCode, 200)
+        let seen = await peer.queriesSeen.last ?? nil
+        XCTAssertEqual(seen, "q=a%20b%5B1%5D&k=%2B&n=%27x%27")
+    }
+
+    /// A `%` that is not an escape cannot be put on a URL; it is refused before any request.
+    func test_aMalformedEscapeIsRefusedBeforeSending() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        for query in ["?a=%", "?a=%zz", "?a=%2", "?a=100%&b=1"] {
+            do {
+                _ = try await session.send(method: "GET", path: "/list", query: query)
+                XCTFail("sent \(query)")
+            } catch {
+                XCTAssertEqual(error as? AuthTransportError, .invalidQuery(query))
+            }
+        }
+        let paths = await peer.pathsSeen
+        XCTAssertEqual(paths, [])
     }
 
     /// The handshake is the expensive part and must happen once, not per request.
