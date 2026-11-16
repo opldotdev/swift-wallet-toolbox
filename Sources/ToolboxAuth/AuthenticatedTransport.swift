@@ -57,6 +57,9 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     /// The peer is not the one expected. Raised only when a caller named the peer up front, which
     /// is the case worth failing loudly for.
     case unexpectedPeer
+    /// The caller's query holds a `%` that is not a two-digit escape, so no URL can carry it as
+    /// signed. Raised before anything is sent.
+    case invalidQuery(String)
 
     public var errorDescription: String? {
         switch self {
@@ -78,6 +81,8 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
             "This storage operation is not available."
         case .unexpectedPeer:
             "Connected to an unexpected storage server."
+        case .invalidQuery:
+            "The request could not be sent: its query is malformed."
         }
     }
 }

@@ -82,6 +82,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         method: String, path: String, query: String?,
         headers: [String: String], body: [UInt8]?
     ) async throws -> AuthenticatedResponse {
+        let query = try Self.wireQuery(query)
         let session = try await establishedSession()
         let requestID = randomRequestID()
 
@@ -305,17 +306,43 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         // endpoint already had a path and the caller passed the same one.
         parts.path = path.hasPrefix("/") ? path : "/" + path
         if let query, !query.isEmpty {
-            // The frame carries the `?`; `URLComponents` writes its own. The query is already in
-            // wire form, as AuthFetch signs `url.search`, so it goes out as `percentEncodedQuery`:
-            // setting `query` would encode its `%` again and the peer would verify a different
-            // query from the one signed. Anything a caller left unencoded is encoded so the URL
-            // stays valid; a query already in wire form passes through unchanged.
-            let raw = query.hasPrefix("?") ? String(query.dropFirst()) : query
-            parts.percentEncodedQuery = raw.addingPercentEncoding(
-                withAllowedCharacters: Self.wireQueryCharacters
-            ) ?? raw
+            // The frame carries the `?`; `URLComponents` writes its own. The query is the frame's,
+            // already in wire form (`wireQuery`), so it goes out as `percentEncodedQuery`: setting
+            // `query` would encode its `%` again and the peer would verify a different query.
+            parts.percentEncodedQuery = query.hasPrefix("?") ? String(query.dropFirst()) : query
         }
         return parts.url ?? baseURL
+    }
+
+    /// The caller's query in the one form that is both signed and sent, as AuthFetch signs
+    /// `url.search`: a query already in wire form is unchanged, anything left unencoded (a space,
+    /// `[`, non-ASCII) is percent-encoded, and a `%` that is not a two-digit escape is refused,
+    /// since no URL can carry it and `percentEncodedQuery` would trap on it.
+    static func wireQuery(_ query: String?) throws -> String? {
+        guard let query, !query.isEmpty else { return query }
+        let raw = query.hasPrefix("?") ? String(query.dropFirst()) : query
+        guard let encoded = raw.addingPercentEncoding(withAllowedCharacters: wireQueryCharacters) else {
+            throw AuthTransportError.invalidQuery(query)
+        }
+        let bytes = Array(encoded.utf8)
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == UInt8(ascii: "%") {
+                guard index + 2 < bytes.count, isHexDigit(bytes[index + 1]), isHexDigit(bytes[index + 2]) else {
+                    throw AuthTransportError.invalidQuery(query)
+                }
+                index += 3
+            } else {
+                index += 1
+            }
+        }
+        return "?" + encoded
+    }
+
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+            || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+            || (UInt8(ascii: "A")...UInt8(ascii: "F")).contains(byte)
     }
 
     /// The characters a query may carry on the wire as they are: those a URL query allows, and

@@ -184,6 +184,38 @@ final class AuthenticatedSessionTests: XCTestCase {
         XCTAssertEqual(seen, String(query.dropFirst()))
     }
 
+    /// A query with characters the caller left unencoded is signed in the same encoded form it
+    /// is sent in, so the peer still verifies it.
+    func test_anUnencodedQueryIsSignedAsItIsSent() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        let response = try await session.send(method: "GET", path: "/list", query: "?q=a b[1]&k=%2B")
+
+        XCTAssertEqual(response.statusCode, 200)
+        let seen = await peer.queriesSeen.last ?? nil
+        XCTAssertEqual(seen, "q=a%20b%5B1%5D&k=%2B")
+    }
+
+    /// A `%` that is not an escape cannot be put on a URL; it is refused before any request.
+    func test_aMalformedEscapeIsRefusedBeforeSending() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        for query in ["?a=%", "?a=%zz", "?a=%2", "?a=100%&b=1"] {
+            do {
+                _ = try await session.send(method: "GET", path: "/list", query: query)
+                XCTFail("sent \(query)")
+            } catch {
+                XCTAssertEqual(error as? AuthTransportError, .invalidQuery(query))
+            }
+        }
+        let paths = await peer.pathsSeen
+        XCTAssertEqual(paths, [])
+    }
+
     /// The handshake is the expensive part and must happen once, not per request.
     func test_theHandshakeHappensOnlyOnce() async throws {
         let keys = try keyPair()
