@@ -247,8 +247,9 @@ final class AuthenticatedSessionTests: XCTestCase {
         XCTAssertEqual(handshakes.count, 1)
     }
 
-    /// A request over the authenticated payload limit is refused once, not treated as a lost
-    /// session: a new handshake cannot make it smaller, and AuthFetch does not retry it either.
+    /// A request over the BRC-104 payload limit is refused once, not treated as a lost session:
+    /// a new handshake cannot make it smaller, and AuthFetch does not retry it either. With the
+    /// default limits the codec refuses it before the authenticator sees it.
     func test_anOversizedRequestIsRefusedWithoutRehandshaking() async throws {
         let keys = try keyPair()
         let peer = TestPeer(key: keys.server)
@@ -262,6 +263,36 @@ final class AuthenticatedSessionTests: XCTestCase {
             XCTFail("an oversized request was sent")
         } catch {
             XCTAssertEqual(error as? BRC104Error, .resourceLimit)
+        }
+        let paths = await peer.pathsSeen
+        XCTAssertEqual(paths, [BRC104HTTPHeaderName.handshakePath])
+
+        let response = try await session.send(method: "POST", path: "/", body: [0x01])
+        XCTAssertEqual(response.statusCode, 200)
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 1, "the open session must survive the refusal")
+    }
+
+    /// When the authenticator's payload limit is below the codec's, `makeGeneralMessage` throws
+    /// `resourceLimit` with the session still open. That is a refusal of this request, not a
+    /// spent session, so it reaches the caller after one handshake and the session is reused.
+    func test_anAuthenticatorPayloadRefusalIsNotTreatedAsALostSession() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = AuthenticatedSession(
+            baseURL: baseURL, wallet: ProtoWallet(rootKey: keys.client), transport: peer,
+            expectedPeer: nil, authenticatorLimits: try AuthLimits(maximumPayloadBytes: 1024)
+        )
+
+        do {
+            _ = try await session.send(
+                method: "POST", path: "/", body: Array(repeating: 0x61, count: 2048)
+            )
+            XCTFail("a request over the authenticator's limit was sent")
+        } catch {
+            XCTAssertEqual(error as? AuthError, .resourceLimit)
         }
         let paths = await peer.pathsSeen
         XCTAssertEqual(paths, [BRC104HTTPHeaderName.handshakePath])
