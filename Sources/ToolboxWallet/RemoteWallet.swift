@@ -401,7 +401,14 @@ public struct RemoteWallet: Sendable {
                 throw error
             }
         }
-        try Task.checkCancellation()
+        // A cancel here comes before anything is sent: release the funded inputs, as for any
+        // other failure before the broadcast, rather than leave them reserved.
+        do {
+            try Task.checkCancellation()
+        } catch {
+            try await release(funded.reference)
+            throw error
+        }
         let processed = try await storage.processAction(auth, try signed.processRequest())
         try Self.requireNotFailed(processed.sendWithResults, transactionID: signed.transactionID)
         return CounterpartyPayment(
