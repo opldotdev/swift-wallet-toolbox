@@ -52,7 +52,7 @@ extension RemoteWallet {
             return try WalletListActionsResult(totalActions: result.totalActions, actions: actions)
         } catch {
             ToolboxLog.error("ToolboxWallet", "listActions: the result was refused with inputs and "
-                + "outputs, so they are left out: \(String(reflecting: error))")
+                + "outputs, so they are left out: \(ErrorDetail.describe(error))")
             // Each row was accepted above with more fields; one refused with fewer is a row the
             // result could not hold either way, and the failure above is already logged.
             let stripped = actions.compactMap { action in
@@ -72,7 +72,7 @@ extension RemoteWallet {
     }
 
     private static func logDroppedRow(_ what: String, _ error: any Error) {
-        ToolboxLog.error("ToolboxWallet", "listActions left out \(what): \(String(reflecting: error))")
+        ToolboxLog.error("ToolboxWallet", "listActions left out \(what): \(ErrorDetail.describe(error))")
     }
 
     /// Abandons an unfinished action and returns storage's actual decision. A signed `noSend`

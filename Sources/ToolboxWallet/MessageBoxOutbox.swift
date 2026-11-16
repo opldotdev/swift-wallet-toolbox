@@ -147,7 +147,7 @@ public actor MessageBoxOutbox {
                         // payment for Retry, which resends this same envelope. Logged, since the
                         // caller sees only that delivery is pending.
                         Self.log("delivery of payment \(record.txid) was undecided; broadcasting and "
-                            + "keeping it for Retry: \(String(reflecting: error))")
+                            + "keeping it for Retry: \(ErrorDetail.describe(error))")
                         return
                     }
                     // Nothing may throw from here: the wallet would abort an action the server
@@ -312,7 +312,7 @@ public actor MessageBoxOutbox {
         } catch {
             // The abort's failure is the answer; the probe's own failure is logged.
             Self.log("discarding payment \(pending.txid): the sent probe failed: "
-                + String(reflecting: error))
+                + ErrorDetail.describe(error))
             throw failure
         }
         guard sent else {
@@ -353,7 +353,7 @@ public actor MessageBoxOutbox {
 
     /// The saved payment's delivery failed: logged in full, and reported by the error's own text.
     private static func notDelivered(_ txid: String, _ error: any Error) -> MessageBoxOutboxError {
-        log("payment \(txid) is saved but was not delivered: \(String(reflecting: error))")
+        log("payment \(txid) is saved but was not delivered: \(ErrorDetail.describe(error))")
         return .notDelivered(txid: txid, reason: reason(error))
     }
 
@@ -387,7 +387,7 @@ public actor MessageBoxOutbox {
             new = try file(sender, record.recipient)
         } catch {
             Self.log("an old saved payment record could not be read and is set aside: "
-                + String(reflecting: error))
+                + ErrorDetail.describe(error))
             return try quarantine(old)
         }
         if FileManager.default.fileExists(atPath: new.path) { return try quarantine(old) }
@@ -520,7 +520,7 @@ extension RemoteWallet: MessageBoxPayingWallet {
             throw CancellationError()
         } catch {
             ToolboxLog.error("ToolboxWallet.MessageBox", "resuming payment \(pending.txid): the sent "
-                + "probe failed, so the transaction is processed again: \(String(reflecting: error))")
+                + "probe failed, so the transaction is processed again: \(ErrorDetail.describe(error))")
         }
         try Task.checkCancellation()
         let envelope = try AtomicBEEF(bytes: pending.atomicBEEF, limits: StorageLimits.beef)

@@ -140,7 +140,7 @@ public enum ActionAssembler {
             )
         } catch {
             ToolboxLog.error("ToolboxActions", "a \(bytes.count)-byte script was refused: "
-                + String(reflecting: error))
+                + ErrorDetail.describe(error))
             throw ActionError.unusableInput("a script exceeds the transaction limits")
         }
     }

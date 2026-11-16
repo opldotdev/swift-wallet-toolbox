@@ -97,7 +97,7 @@ extension StorageClient {
         do {
             return try body()
         } catch {
-            Self.log("listActions left out \(part) of \(txid): \(String(reflecting: error))")
+            Self.log("listActions left out \(part) of \(txid): \(ErrorDetail.describe(error))")
             return nil
         }
     }
@@ -131,7 +131,7 @@ extension StorageClient {
             } catch let error as StorageClientError {
                 throw error
             } catch {
-                Self.log("listActions: a row could not be read: \(String(reflecting: error))")
+                Self.log("listActions: a row could not be read: \(ErrorDetail.describe(error))")
                 throw StorageClientError.unreadableResponse(method: "listActions")
             }
         }
@@ -162,7 +162,7 @@ extension StorageClient {
             } catch let error as StorageClientError {
                 throw error
             } catch {
-                Self.log("listActions: a row could not be read: \(String(reflecting: error))")
+                Self.log("listActions: a row could not be read: \(ErrorDetail.describe(error))")
                 throw StorageClientError.unreadableResponse(method: "listActions")
             }
         }

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import ToolboxCore
 
@@ -48,6 +49,53 @@ final class ErrorDetailTests: XCTestCase {
         XCTAssertEqual(ErrorDetail.hostPath(url), "wallet.1sat.app:8443/api/x")
         XCTAssertEqual(ErrorDetail.hostPath(host: "h", path: "/p?q=1"), "h/p")
         XCTAssertEqual(ErrorDetail.hostPath(host: "h", path: ""), "h/")
+    }
+
+    func test_aURLErrorIsLoggedWithoutItsQuery() throws {
+        let url = try XCTUnwrap(URL(string: "https://wallet.example/api/x?auth_token=SECRET#frag"))
+        let error = URLError(.timedOut, userInfo: [
+            "NSErrorFailingURLKey": url,
+            "NSErrorFailingURLStringKey": url.absoluteString,
+            NSLocalizedDescriptionKey: "The request to https://wallet.example/api/x?auth_token=SECRET timed out.",
+        ])
+        let logged = ErrorDetail.describe(error)
+        XCTAssertFalse(logged.contains("SECRET"), logged)
+        XCTAssertFalse(logged.contains("auth_token"), logged)
+        XCTAssertTrue(logged.contains(NSURLErrorDomain), logged)
+        XCTAssertTrue(logged.contains("\(URLError.Code.timedOut.rawValue)"), logged)
+        XCTAssertTrue(logged.contains("wallet.example/api/x"), logged)
+    }
+
+    func test_anNSErrorAndItsUnderlyingErrorsAreLoggedWithoutQueries() {
+        let inner = NSError(domain: "kCFErrorDomainCFNetwork", code: -1001, userInfo: [
+            "NSErrorFailingURLStringKey": "https://wallet.example/inner?auth_token=SECRET",
+        ])
+        let middle = NSError(domain: NSCocoaErrorDomain, code: 1, userInfo: [NSUnderlyingErrorKey: inner])
+        let outer = NSError(domain: NSURLErrorDomain, code: -1001, userInfo: [
+            "NSErrorFailingURLStringKey": "https://wallet.example/outer?auth_token=SECRET",
+            NSUnderlyingErrorKey: middle,
+        ])
+        let logged = ErrorDetail.describe(outer)
+        XCTAssertFalse(logged.contains("SECRET"), logged)
+        XCTAssertTrue(logged.contains("wallet.example/outer"), logged)
+        XCTAssertTrue(logged.contains("wallet.example/inner"), logged)
+        XCTAssertTrue(logged.contains("kCFErrorDomainCFNetwork -1001"), logged)
+    }
+
+    func test_otherErrorsAreLoggedAsTheyReflect() {
+        XCTAssertEqual(
+            ErrorDetail.describe(WireError.insufficientFunds("need 500 more")),
+            "WireError WERR_INSUFFICIENT_FUNDS: need 500 more"
+        )
+        let plain = NSError(domain: "dev.opl.test", code: 7)
+        XCTAssertEqual(ErrorDetail.describe(plain), String(reflecting: plain))
+    }
+
+    func test_withoutQueriesCutsOnlyURLs() {
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries("GET https://h.example/p?token=x failed? yes https://h.example/q#f h.example/r?a=b"),
+            "GET https://h.example/p failed? yes https://h.example/q h.example/r"
+        )
     }
 
     func test_wireErrorDebugDescriptionCarriesNameAndMessage() {

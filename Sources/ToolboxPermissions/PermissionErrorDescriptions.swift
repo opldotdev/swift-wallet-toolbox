@@ -1,18 +1,11 @@
 import Foundation
-
-#if canImport(os)
-    import os
-#endif
+import ToolboxCore
 
 /// Logs where a permission check turns a failure into a denial or skips a token, so the reason
-/// is not lost. This module stands apart from ToolboxCore, so it carries its own logger.
+/// is not lost.
 enum PermissionLog {
     static func error(_ message: @autoclosure () -> String) {
-        #if canImport(os)
-            let text = message()
-            Logger(subsystem: "dev.opl.toolbox", category: "ToolboxPermissions")
-                .error("\(text, privacy: .public)")
-        #endif
+        ToolboxLog.error("ToolboxPermissions", message())
     }
 }
 

@@ -37,7 +37,7 @@ public struct WhatsOnChainUTXOSource: UTXOSource {
             ).bytes
         } catch {
             ToolboxLog.error("ToolboxServices", "whatsonchain: \(address) is not a P2PKH address: "
-                + String(reflecting: error))
+                + ErrorDetail.describe(error))
             throw UTXOSourceError.invalidAddress(address)
         }
 

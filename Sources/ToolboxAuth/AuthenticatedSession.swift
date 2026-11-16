@@ -142,7 +142,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            Self.log("\(Self.describe(context)) did not get a reply: \(String(reflecting: error))")
+            Self.log("\(Self.describe(context)) did not get a reply: \(ErrorDetail.describe(error))")
             throw error
         }
 
@@ -253,7 +253,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             } catch {
                 throw Self.logged(.handshakeFailed(
                     "\(handshakeCall) answered HTTP \(response.statusCode) with a reply that could "
-                        + "not be read (\(response.body.count) bytes): \(String(reflecting: error))"
+                        + "not be read (\(response.body.count) bytes): \(ErrorDetail.describe(error))"
                 ))
             }
             // Verifying the reply is the authenticator's job, and it throws when the signature does
@@ -272,7 +272,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             return session
         } catch {
             if !(error is AuthTransportError), !(error is CancellationError) {
-                Self.log("\(handshakeCall) failed: \(String(reflecting: error))")
+                Self.log("\(handshakeCall) failed: \(ErrorDetail.describe(error))")
             }
             await authenticator.close(session)
             throw error
@@ -321,7 +321,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             // on; knowing which header or field failed can.
             throw Self.logged(.responseNotAuthenticated(
                 "\(Self.describe(context)) answered HTTP \(response.statusCode) with no valid auth "
-                    + "frame: \(String(reflecting: error))"
+                    + "frame: \(ErrorDetail.describe(error))"
             ))
         }
 
@@ -348,7 +348,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         } catch {
             Self.log(
                 "\(Self.describe(context)): the signed reply could not be read as the response to "
-                    + "this request: \(String(reflecting: error))"
+                    + "this request: \(ErrorDetail.describe(error))"
             )
             throw error
         }
@@ -435,7 +435,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
 
     /// Logs an error at the place it is raised and returns it to be thrown.
     private static func logged(_ error: AuthTransportError) -> AuthTransportError {
-        log(String(reflecting: error))
+        log(ErrorDetail.describe(error))
         return error
     }
 

@@ -110,7 +110,7 @@ public enum ActionSigner {
                 // That means the derivation and the output disagree, which is worth saying plainly
                 // rather than reporting as a signature failure. The SDK's own error is logged.
                 ToolboxLog.error("ToolboxActions", "signing input \(index) failed: "
-                    + String(reflecting: error))
+                    + ErrorDetail.describe(error))
                 throw ActionError.unusableInput(
                     "input \(index) is not locked to the key its derivation produces"
                 )
@@ -205,7 +205,7 @@ public enum ActionSigner {
                     )
                 } catch {
                     ToolboxLog.error("ToolboxActions", "permission token \(outpoint) did not decode: "
-                        + String(reflecting: error))
+                        + ErrorDetail.describe(error))
                     throw ActionError.unusableInput(
                         "permission token \(outpoint) is not a BRC-48 PushDrop output"
                     )

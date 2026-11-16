@@ -1,3 +1,5 @@
+import Foundation
+
 /// Resource and KDF bounds applied before a BRC-39 importer allocates KDF memory or decrypts data.
 public struct BRC39Limits: Equatable, Sendable {
     public let maximumFileByteCount: Int

@@ -156,8 +156,17 @@ public struct MessageBoxClient: Sendable {
               start >= 0, Int64(start) <= Self.maximumListOffset else { throw MessageBoxError.invalidMessage }
         var rows: [ListedRow] = []
         var skipped = 0
+        var firstSkipped: String?
         var received = 0
         var offset = start
+        // Skipped rows stay on the server and come back on every listing, so a listing logs them
+        // once, as a count with the first one.
+        defer {
+            if let firstSkipped {
+                log("POST listMessages on \(serverHost): skipped \(skipped) unreadable row(s) in "
+                    + "\(messageBox); the first \(firstSkipped)")
+            }
+        }
         for _ in 0..<maxPages {
             let remaining = limit.map { $0 - received }
             var fields: [String: Any] = [
@@ -173,21 +182,23 @@ public struct MessageBoxClient: Sendable {
             }
             let taken = remaining.map { Array(page.prefix($0)) } ?? page
             received += taken.count
-            for item in taken {
-                // A row that cannot be read is counted in `skipped` or fails the listing; either way
-                // the log says which row.
+            for (index, item) in taken.enumerated() {
+                // A row that cannot be read fails the listing, and the log names it; or it is
+                // counted in `skipped`, and the one line logged for the listing names the first.
+                // The init's only error is `invalidResponse`: the row's ID, sender or body could
+                // not be read.
                 if let row = item as? [String: Any], let sender = row["sender"] as? String,
                    let message = try? MessageBoxMessage(row: row) {
                     rows.append(ListedRow(message: message, rawSender: sender))
-                } else if skipMalformed {
-                    skipped += 1
-                    log("POST listMessages on \(serverHost): skipped an unreadable row in \(messageBox) "
-                        + "at offset \(offset)")
-                } else {
-                    log("POST listMessages on \(serverHost): an unreadable row in \(messageBox) "
-                        + "at offset \(offset)")
+                    continue
+                }
+                let place = "at offset \(offset + index)\(Self.rowID(item))"
+                guard skipMalformed else {
+                    log("POST listMessages on \(serverHost): an unreadable row in \(messageBox) \(place)")
                     throw MessageBoxError.invalidResponse
                 }
+                skipped += 1
+                if firstSkipped == nil { firstSkipped = place }
             }
             let hasMore = object["hasMore"] as? Bool == true
             let cut = taken.count < page.count
@@ -202,6 +213,12 @@ public struct MessageBoxClient: Sendable {
             }
         }
         return (rows, true, offset, skipped)
+    }
+
+    /// A listed row's message ID for the log, when it has one, kept short.
+    private static func rowID(_ item: Any) -> String {
+        guard let row = item as? [String: Any], let id = row["messageId"] else { return "" }
+        return " (messageId \(ErrorDetail.oneLine("\(id)", limit: 80)))"
     }
 
     /// `Number.MAX_SAFE_INTEGER`, the largest offset TS sends.
@@ -339,7 +356,7 @@ public struct MessageBoxClient: Sendable {
         do {
             parsed = try JSONSerialization.jsonObject(with: Data(response.body))
         } catch {
-            throw logged(.invalidResponse, call, response, "not JSON: \(String(reflecting: error))")
+            throw logged(.invalidResponse, call, response, "not JSON: \(ErrorDetail.describe(error))")
         }
         guard let object = parsed as? [String: Any] else {
             throw logged(.invalidResponse, call, response, "not a JSON object")
@@ -355,7 +372,7 @@ public struct MessageBoxClient: Sendable {
         _ error: MessageBoxError, _ call: String, _ response: AuthenticatedResponse, _ why: String
     ) -> MessageBoxError {
         log("\(call) on \(serverHost) answered HTTP \(response.statusCode) (\(why)): "
-            + "\(String(reflecting: error)); body: \(ErrorDetail.bodyPreview(response.body))")
+            + "\(ErrorDetail.describe(error)); body: \(ErrorDetail.bodyPreview(response.body))")
         return error
     }
 

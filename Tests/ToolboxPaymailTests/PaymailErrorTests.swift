@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import ToolboxPaymail
 
@@ -11,6 +12,23 @@ final class PaymailErrorTests: XCTestCase {
             error.localizedDescription,
             "The paymail provider (paymail.example) could not complete the lookup (HTTP 500): database offline. Try again."
         )
+    }
+
+    func test_aLookupSaysTryAgainOnlyWhereRetryingCanHelp() {
+        for status in [0, 408, 429, 500, 503] {
+            XCTAssertTrue(
+                PaymailError.httpFailure(statusCode: status).localizedDescription.hasSuffix(" Try again."), "\(status)"
+            )
+        }
+        XCTAssertEqual(
+            PaymailError.httpFailure(statusCode: 400, host: "paymail.example", reason: "bad alias").localizedDescription,
+            "The paymail provider (paymail.example) could not complete the lookup (HTTP 400): bad alias."
+        )
+        for status in [401, 403, 410, 422] {
+            XCTAssertFalse(
+                PaymailError.httpFailure(statusCode: status).localizedDescription.contains("Try again"), "\(status)"
+            )
+        }
     }
 
     func test_aFailedDeliveryNamesTheProviderAndItsReason() {

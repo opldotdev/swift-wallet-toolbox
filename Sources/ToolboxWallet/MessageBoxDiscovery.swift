@@ -62,7 +62,7 @@ public struct MessageBoxDiscovery: Sendable {
         catch {
             // The reference client falls back on an unavailable overlay; the reason is logged.
             ToolboxLog.error("ToolboxWallet.MessageBox", "MessageBox host lookup failed, using the "
-                + "default host: \(String(reflecting: error))")
+                + "default host: \(ErrorDetail.describe(error))")
         }
         try Task.checkCancellation()
         return fallback

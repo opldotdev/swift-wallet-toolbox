@@ -149,7 +149,7 @@ public struct Paymail: Sendable {
             } catch {
                 // The raw-transaction route may still deliver; this failure is logged either way.
                 ToolboxLog.error("ToolboxPaymail", "BEEF delivery to \(address.domain) failed: "
-                    + String(reflecting: error))
+                    + ErrorDetail.describe(error))
                 beefError = error
             }
         }
@@ -549,10 +549,17 @@ public enum PaymailError: Error, Equatable, Sendable, LocalizedError {
         case .httpFailure(let status, _, _) where status == 404:
             "The paymail provider could not find that recipient or service. Check the address."
         case .httpFailure(let status, let host, let reason):
-            "\(Self.provider(host)) could not complete the lookup (HTTP \(status))\(Self.because(reason)). Try again."
+            "\(Self.provider(host)) could not complete the lookup (HTTP \(status))\(Self.because(reason)).\(Self.retryHint(status))"
         case .deliveryFailed(let status, let host, let reason):
             "\(Self.provider(host)) did not accept the transaction delivery (HTTP \(status))\(Self.because(reason))."
         }
+    }
+
+    /// " Try again." after no status (0), a timeout (408), a rate limit (429) or a server error,
+    /// where asking again may work; nothing after any other client error, which will be refused
+    /// again.
+    private static func retryHint(_ status: Int) -> String {
+        status == 0 || status == 408 || status == 429 || status >= 500 ? " Try again." : ""
     }
 
     private static func provider(_ host: String?) -> String {

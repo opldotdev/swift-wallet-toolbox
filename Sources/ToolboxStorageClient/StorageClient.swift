@@ -110,7 +110,7 @@ public actor StorageClient {
             throw CancellationError()
         } catch {
             // Rethrown as it is; the log adds which storage call it was.
-            Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) failed: \(String(reflecting: error))")
+            Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) failed: \(ErrorDetail.describe(error))")
             throw error
         }
 
@@ -118,7 +118,7 @@ public actor StorageClient {
         do {
             envelope = try JSONDecoder().decode(JSONValue.self, from: Data(response.body))
         } catch {
-            throw logged(.unreadableResponse(method: method), response, "not JSON: \(String(reflecting: error))")
+            throw logged(.unreadableResponse(method: method), response, "not JSON: \(ErrorDetail.describe(error))")
         }
 
         // A well-formed JSON-RPC reply names its version and echoes the request's id. The
@@ -134,7 +134,7 @@ public actor StorageClient {
         if let failure = envelope["error"], failure != .null {
             let error = WireError.decode(jsonObject: failure)
             Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) answered HTTP "
-                + "\(response.statusCode): \(String(reflecting: error))")
+                + "\(response.statusCode): \(ErrorDetail.describe(error))")
             throw error
         }
         // A missing `result` is not the same as a null one. JSON-RPC allows a null result, and

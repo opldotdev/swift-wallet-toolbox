@@ -288,7 +288,7 @@ public struct RemoteWallet: Sendable {
                 // Delivery goes ahead without the optional sender signature; the reason is logged.
                 metadata = nil
                 ToolboxLog.error("ToolboxWallet", "paymail delivery of \(txid): the sender signature "
-                    + "could not be made: \(String(reflecting: error))")
+                    + "could not be made: \(ErrorDetail.describe(error))")
             }
             do {
                 try await resolver.deliver(
@@ -302,7 +302,7 @@ public struct RemoteWallet: Sendable {
                 )
             } catch {
                 ToolboxLog.error("ToolboxWallet", "paymail delivery of \(txid) failed after the "
-                    + "broadcast: \(String(reflecting: error))")
+                    + "broadcast: \(ErrorDetail.describe(error))")
                 throw WalletError.paymailDeliveryFailed(txid: txid)
             }
             return result.sent
@@ -384,7 +384,7 @@ public struct RemoteWallet: Sendable {
                 // reference, so the caller gets that error even when the abort is not confirmed.
                 // Storage fails the abandoned unsigned action on its own (TS `TaskFailAbandoned`).
                 ToolboxLog.error("ToolboxWallet", "the paid output was not found exactly once and "
-                    + "the release failed: \(String(reflecting: error))")
+                    + "the release failed: \(ErrorDetail.describe(error))")
             }
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
@@ -438,7 +438,7 @@ public struct RemoteWallet: Sendable {
             released = try await Task { try await self.abort(reference: reference) }.value
         } catch {
             ToolboxLog.error("ToolboxWallet", "abort did not release funded action \(reference): "
-                + String(reflecting: error))
+                + ErrorDetail.describe(error))
             throw BRC29PaymentError.notReleased(reference: reference)
         }
         guard released else {
@@ -510,8 +510,8 @@ public struct RemoteWallet: Sendable {
                     _ = try await Task { try await self.abort(reference: reference) }.value
                 } catch let abortError {
                     ToolboxLog.error("ToolboxWallet", "building the payment's BEEF failed "
-                        + "(\(String(reflecting: error))) and abort did not release its inputs: "
-                        + "\(String(reflecting: abortError))")
+                        + "(\(ErrorDetail.describe(error))) and abort did not release its inputs: "
+                        + "\(ErrorDetail.describe(abortError))")
                 }
                 throw error
             }
@@ -696,8 +696,8 @@ public struct RemoteWallet: Sendable {
                     )
                 } catch {
                     ToolboxLog.error("ToolboxWallet", "the permission-token action failed "
-                        + "(\(String(reflecting: primaryError))) and abortAction did not release "
-                        + "its inputs: \(String(reflecting: error))")
+                        + "(\(ErrorDetail.describe(primaryError))) and abortAction did not release "
+                        + "its inputs: \(ErrorDetail.describe(error))")
                 }
             }.value
             throw primaryError
@@ -727,7 +727,7 @@ public struct RemoteWallet: Sendable {
                 graph = try BEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)
             } catch {
                 ToolboxLog.error("ToolboxWallet", "the funded permission-token BEEF could not be "
-                    + "read: \(String(reflecting: error))")
+                    + "read: \(ErrorDetail.describe(error))")
                 throw PermissionTokenMutationError.untrustworthyFundedBEEF
             }
         } else {
@@ -799,7 +799,7 @@ public struct RemoteWallet: Sendable {
             )
         } catch {
             ToolboxLog.error("ToolboxWallet", "the funded permission-token BEEF did not prove its "
-                + "inputs: \(String(reflecting: error))")
+                + "inputs: \(ErrorDetail.describe(error))")
             throw PermissionTokenMutationError.untrustworthyFundedBEEF
         }
         return graph

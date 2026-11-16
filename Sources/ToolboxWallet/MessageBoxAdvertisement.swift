@@ -169,7 +169,7 @@ public struct MessageBoxAdvertiser: Sendable {
                         return (host, steak)
                     } catch {
                         ToolboxLog.error("ToolboxWallet.MessageBox",
-                            "advertisement: overlay host \(host) refused the submit: \(String(reflecting: error))")
+                            "advertisement: overlay host \(host) refused the submit: \(ErrorDetail.describe(error))")
                         return (host, nil)
                     }
                 }
@@ -402,8 +402,8 @@ public struct MessageBoxAdvertiser: Sendable {
                     _ = try await wallet.abortAction(WalletAbortActionRequest(reference: reference))
                 } catch let abortError {
                     ToolboxLog.error("ToolboxWallet.MessageBox", "advertisement signing failed "
-                        + "(\(String(reflecting: error))) and abortAction did not release its inputs: "
-                        + "\(String(reflecting: abortError))")
+                        + "(\(ErrorDetail.describe(error))) and abortAction did not release its inputs: "
+                        + "\(ErrorDetail.describe(abortError))")
                 }
             }.value
             throw error

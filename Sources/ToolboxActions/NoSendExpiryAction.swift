@@ -319,7 +319,7 @@ public enum NoSendExpiryAction {
             _ = try await storage.abortAction(auth, WalletAbortActionRequest(reference: encoded))
         } catch {
             ToolboxLog.error("ToolboxActions",
-                "no-send expiry abortAction did not release its inputs: \(String(reflecting: error))")
+                "no-send expiry abortAction did not release its inputs: \(ErrorDetail.describe(error))")
         }
     }
 }

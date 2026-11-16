@@ -142,8 +142,8 @@ extension RemoteWallet {
                     reference: WalletBase64Data(base64: funded.reference)
                 ))
             } catch let abortError {
-                ToolboxLog.error("ToolboxWallet", "createAction failed (\(String(reflecting: error))) "
-                    + "and abortAction did not release its inputs: \(String(reflecting: abortError))")
+                ToolboxLog.error("ToolboxWallet", "createAction failed (\(ErrorDetail.describe(error))) "
+                    + "and abortAction did not release its inputs: \(ErrorDetail.describe(abortError))")
             }
             throw error
         }
@@ -160,8 +160,8 @@ extension RemoteWallet {
             do {
                 _ = try await storage.abortAction(auth, WalletAbortActionRequest(reference: request.reference))
             } catch let abortError {
-                ToolboxLog.error("ToolboxWallet", "signAction failed (\(String(reflecting: error))) "
-                    + "and abortAction did not release its inputs: \(String(reflecting: abortError))")
+                ToolboxLog.error("ToolboxWallet", "signAction failed (\(ErrorDetail.describe(error))) "
+                    + "and abortAction did not release its inputs: \(ErrorDetail.describe(abortError))")
             }
             throw error
         }

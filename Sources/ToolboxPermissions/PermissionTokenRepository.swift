@@ -1,4 +1,5 @@
 import BSVCore
+import ToolboxCore
 import BSVScript
 import BSVTransaction
 import BSVWallet
@@ -283,7 +284,7 @@ public actor PermissionTokenRepository {
                     try requireActive(epoch)
                     // A token that does not decode grants nothing and is skipped; the log says why.
                     PermissionLog.error("permission token \(output.outpoint) in \(query.basket) was "
-                        + "skipped: \(String(reflecting: error))")
+                        + "skipped: \(ErrorDetail.describe(error))")
                     continue
                 }
 

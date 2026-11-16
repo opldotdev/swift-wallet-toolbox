@@ -119,7 +119,7 @@ public struct URLSessionHTTPTransport: HTTPTransport {
     }
 
     private static func logged(_ error: AuthTransportError) -> AuthTransportError {
-        ToolboxLog.error("ToolboxAuth", String(reflecting: error))
+        ToolboxLog.error("ToolboxAuth", ErrorDetail.describe(error))
         return error
     }
 }

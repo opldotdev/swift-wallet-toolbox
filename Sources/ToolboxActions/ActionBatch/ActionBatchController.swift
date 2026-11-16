@@ -210,7 +210,7 @@ public actor ActionBatchController {
             // Storage that cannot say falls back to unbatched actions; the reason is logged.
             read = nil
             ToolboxLog.error("ToolboxActions", "action batch capabilities could not be read, so "
-                + "actions are not batched: \(String(reflecting: error))")
+                + "actions are not batched: \(ErrorDetail.describe(error))")
         }
         // Format-1 manifests are not built here, so only storage that takes format 2 is batched.
         let usable = read.flatMap { $0.version == 1 && $0.manifestVersion == 2 ? $0 : nil }
@@ -387,8 +387,8 @@ public actor ActionBatchController {
             _ = try await storage.abortActionBatch(auth, batchId: batchId)
         } catch let abortError {
             ToolboxLog.error("ToolboxActions", "beginning action batch \(batchId) failed "
-                + "(\(String(reflecting: error))) and abortActionBatch did not release it: "
-                + String(reflecting: abortError))
+                + "(\(ErrorDetail.describe(error))) and abortActionBatch did not release it: "
+                + ErrorDetail.describe(abortError))
         }
     }
 
@@ -402,7 +402,7 @@ public actor ActionBatchController {
             } catch {
                 // Best effort, reported to the caller as `false`; the reason is logged.
                 ToolboxLog.error("ToolboxActions", "abortActionBatch \(workspace.batchId) failed: "
-                    + String(reflecting: error))
+                    + ErrorDetail.describe(error))
             }
         }
         if self.workspace === workspace { self.workspace = nil }
