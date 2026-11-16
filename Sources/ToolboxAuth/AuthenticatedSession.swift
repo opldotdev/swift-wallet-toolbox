@@ -305,11 +305,22 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         // endpoint already had a path and the caller passed the same one.
         parts.path = path.hasPrefix("/") ? path : "/" + path
         if let query, !query.isEmpty {
-            // The frame carries the `?`; `URLComponents` writes its own.
-            parts.query = query.hasPrefix("?") ? String(query.dropFirst()) : query
+            // The frame carries the `?`; `URLComponents` writes its own. The query is already in
+            // wire form, as AuthFetch signs `url.search`, so it goes out as `percentEncodedQuery`:
+            // setting `query` would encode its `%` again and the peer would verify a different
+            // query from the one signed. Anything a caller left unencoded is encoded so the URL
+            // stays valid; a query already in wire form passes through unchanged.
+            let raw = query.hasPrefix("?") ? String(query.dropFirst()) : query
+            parts.percentEncodedQuery = raw.addingPercentEncoding(
+                withAllowedCharacters: Self.wireQueryCharacters
+            ) ?? raw
         }
         return parts.url ?? baseURL
     }
+
+    /// The characters a query may carry on the wire as they are: those a URL query allows, and
+    /// `%` because the caller has already done the encoding.
+    private static let wireQueryCharacters = CharacterSet.urlQueryAllowed.union(["%"])
 
     /// Thirty-two bytes, which is the length the framing requires.
     ///
