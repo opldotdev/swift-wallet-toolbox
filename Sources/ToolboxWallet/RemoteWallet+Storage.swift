@@ -1,5 +1,6 @@
 import BSVWallet
 import ToolboxCore
+import ToolboxStorage
 
 /// The BRC-100 operations whose state is owned entirely by storage.
 extension RemoteWallet {
@@ -87,10 +88,37 @@ extension RemoteWallet {
 
     /// Lists the outputs in the requested application basket without applying any 1Sat-specific
     /// basket aliases or naming conventions.
+    ///
+    /// A BRC-112 balance request, basket `balance <basket>`, asks storage for the balance of
+    /// `<basket>` instead: `totalOutputs` is the sum of its satoshis and `outputs` is empty.
     public func listOutputs(
         _ request: WalletListOutputsRequest
     ) async throws -> WalletListOutputsResult {
-        try await storage.listOutputs(auth, request)
+        try await storage.listOutputs(auth, try Self.balanceBasketRequest(request))
+    }
+
+    /// TS `Wallet.ts` `validateListOutputsArgs` (BRC-112). The basket is read as the SDK
+    /// validates it, trimmed and lowercased. `balance <basket>` becomes `<basket>` with the
+    /// wallet-balance special-operation tag appended, which storage answers with the sum of that
+    /// basket's satoshis. `balance p <module> <basket>` is refused: a BRC-99 module that offers a
+    /// balance does so as `p <module> balance <basket>`, which the module handles. Every other
+    /// basket is passed on unchanged.
+    static func balanceBasketRequest(_ request: WalletListOutputsRequest) throws -> WalletListOutputsRequest {
+        let prefix = "balance "
+        let basket = try ActionBatchWire.identifier(request.basket, name: "basket")
+        guard basket.hasPrefix(prefix) else { return request }
+        let target = String(basket.dropFirst(prefix.count))
+        if target.hasPrefix("p ") {
+            throw WireError.invalidParameter(name: "basket", message: "not a BRC-99 module basket: BRC-112 "
+                + "rejects `balance p <module> <basket>`; use `p <module> balance <basket>` if the module offers it.")
+        }
+        return try WalletListOutputsRequest(
+            basket: target, tags: request.tags + [ListOutputsSpecOp.walletBalance],
+            tagQueryMode: request.tagQueryMode, include: request.include,
+            includeCustomInstructions: request.includeCustomInstructions, includeTags: request.includeTags,
+            includeLabels: request.includeLabels, pagination: request.pagination,
+            seekPermission: request.seekPermission
+        )
     }
 
     /// Stops tracking an output in a basket without spending it.
