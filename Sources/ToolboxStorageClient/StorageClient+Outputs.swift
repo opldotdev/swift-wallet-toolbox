@@ -58,7 +58,7 @@ extension StorageClient {
             throw StorageClientError.unreadableResponse(method: "listOutputs")
         }
 
-        guard let totalOutputs = UInt32(exactly: total) else {
+        guard let totalOutputs = UInt64(exactly: total) else {
             throw StorageClientError.unreadableResponse(method: "listOutputs")
         }
 

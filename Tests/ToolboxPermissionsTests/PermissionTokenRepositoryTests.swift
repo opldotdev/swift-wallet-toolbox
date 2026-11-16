@@ -389,7 +389,7 @@ final class PermissionTokenRepositoryTests: XCTestCase {
         )
 
         await assertRepositoryError(
-            .candidateLimitExceeded(total: UInt64(UInt32.max), maximum: 10_000)
+            .candidateLimitExceeded(total: .max, maximum: 10_000)
         ) {
             try await self.repository(wallet: wallet).findCovering(
                 .basketAccess(try self.dbapScope()), nowUnixTime: 1
@@ -729,7 +729,7 @@ private func candidate(
 }
 
 private func page(
-    total: UInt32,
+    total: UInt64,
     tokens: [PermissionToken],
     wallet: RepositoryTestWallet
 ) async throws -> WalletListOutputsResult {
@@ -741,7 +741,7 @@ private func page(
 }
 
 private func page(
-    total: UInt32,
+    total: UInt64,
     candidates: [RepositoryCandidate]
 ) throws -> WalletListOutputsResult {
     try WalletListOutputsResult(

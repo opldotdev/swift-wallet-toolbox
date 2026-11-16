@@ -89,7 +89,7 @@ private final class AdvertisingWallet: MessageBoxAdvertisingWallet, @unchecked S
     func listOutputs(_ request: WalletListOutputsRequest) async throws -> WalletListOutputsResult {
         XCTAssertEqual(request.basket, "overlay advertisements")
         XCTAssertEqual(request.pagination.limit, 10_000)
-        return try WalletListOutputsResult(totalOutputs: UInt32(basket.count), outputs: basket)
+        return try WalletListOutputsResult(totalOutputs: UInt64(basket.count), outputs: basket)
     }
 
     func createAction(_ request: WalletCreateActionRequest) async throws -> WalletCreateActionResult {

@@ -150,10 +150,17 @@ final class OutputDecodingTests: XCTestCase {
         )
     }
 
+    func test_aTotalPastUInt32IsReadAsTheTSWalletDoes() throws {
+        let decoded = try StorageClient.decodeOutputs(
+            try result(#"{"totalOutputs": 4294967296, "outputs": []}"#)
+        )
+        XCTAssertEqual(decoded.totalOutputs, 4_294_967_296)
+    }
+
     func test_aTotalLargerThanTheABIIsRefusedWithoutTrapping() throws {
         XCTAssertThrowsError(
             try StorageClient.decodeOutputs(
-                try result(#"{"totalOutputs": 4294967296, "outputs": []}"#)
+                try result(#"{"totalOutputs": 18446744073709551616, "outputs": []}"#)
             )
         )
     }
