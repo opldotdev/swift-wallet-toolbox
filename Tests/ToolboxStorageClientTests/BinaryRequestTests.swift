@@ -23,9 +23,15 @@ final class BinaryRequestTests: XCTestCase {
 
     private actor Storage: AuthenticatedTransport {
         let echoesBinary: Bool
+        /// The `result` text for each method this store answers specially, written as storage
+        /// writes it for the encoding the request asked for.
+        let results: [String: (_ binary: Bool) -> String]
         private(set) var requests: [(headers: [String: String], body: [UInt8])] = []
 
-        init(echoesBinary: Bool) { self.echoesBinary = echoesBinary }
+        init(echoesBinary: Bool, results: [String: (_ binary: Bool) -> String] = [:]) {
+            self.echoesBinary = echoesBinary
+            self.results = results
+        }
 
         func send(
             method: String, path: String, query: String?, headers: [String: String],
@@ -37,13 +43,15 @@ final class BinaryRequestTests: XCTestCase {
             let id = request["id"]?.intValue ?? 0
             let result: String
             var replyHeaders: [String: String] = [:]
+            // `StorageServer` echoes the header, lower-cased inside the signed response, on every
+            // reply to a request that asked for it, and then writes that reply's bytes as base64.
+            let binary = echoesBinary && headers["X-BSV-Binary-Encoding"] == "base64"
+            if binary { replyHeaders["x-bsv-binary-encoding"] = "base64" }
             switch request["method"]?.stringValue {
+            case let method? where results[method] != nil:
+                result = results[method]!(binary)
             case "makeAvailable":
                 result = #"{"storageIdentityKey":"\#(ActiveStorageFixture.storageIdentityKey)","storageName":"s","chain":"main"}"#
-                // The server echoes the header, lower-cased, inside the signed response.
-                if echoesBinary, headers["X-BSV-Binary-Encoding"] == "base64" {
-                    replyHeaders["x-bsv-binary-encoding"] = "base64"
-                }
             case "findOrInsertUser":
                 result = #"{"user":{"userId":7,"identityKey":"02","activeStorage":"\#(ActiveStorageFixture.storageIdentityKey)"},"isNew":false}"#
             case "commitActionBatch":
@@ -191,6 +199,92 @@ final class BinaryRequestTests: XCTestCase {
         let sent = try await storage.request("makeAvailable")
         XCTAssertEqual(sent.headers["X-BSV-Binary-Encoding"], "base64")
         XCTAssertNil(sent.headers["X-BSV-Binary-Request-Encoding"])
+    }
+
+    /// `StorageClient.rpcCall` sends `X-BSV-Binary-Encoding: base64` on every call, so storage
+    /// writes every response's bytes as base64. Sent only on the settings read, the replies that
+    /// carry bytes (`createAction`, `beginActionBatch`) came back as arrays of numbers.
+    func test_everyCallAsksForBinaryResponses() async throws {
+        for echoes in [true, false] {
+            let storage = Storage(echoesBinary: echoes)
+            let client = client(storage)
+
+            _ = try await client.findOrInsertUser(auth.identityKey)
+            _ = try await client.processAction(auth, StorageProcessActionRequest(
+                reference: "cmVm", isNewTx: true, isSendWith: false, rawTX: try largeTransaction(),
+                sendWith: []
+            ))
+            _ = try await client.call("listOutputs", [.object(auth.jsonObject), .object([:])])
+
+            let requests = await storage.requests
+            XCTAssertGreaterThanOrEqual(requests.count, 4)
+            for request in requests {
+                XCTAssertEqual(request.headers["X-BSV-Binary-Encoding"], "base64")
+            }
+        }
+    }
+
+    /// The funded action's proof graph, as a 1Sat store writes it for a binary request: about a
+    /// third larger than the bytes, where an array of numbers was about four times larger.
+    func test_aBinaryReplysBytesAreReadAsBytes() async throws {
+        let beef = try largeTransaction()
+        let storage = Storage(echoesBinary: true, results: ["createAction": { binary in
+            let inputBeef = binary
+                ? #"{"$bsvBinary":"base64","data":"\#(Data(beef).base64EncodedString())"}"#
+                : "[" + beef.map(String.init).joined(separator: ",") + "]"
+            return #"{"reference":"cmVm","version":1,"lockTime":0,"inputs":[],"outputs":[],"inputBeef":\#(inputBeef),"derivationPrefix":"cA=="}"#
+        }])
+
+        let result = try await client(storage).call(
+            "createAction", [.object(auth.jsonObject), .object([:])]
+        )
+
+        XCTAssertEqual(try StorageClient.decodeCreateAction(result).inputBEEF, beef)
+        let sent = try await storage.request("createAction")
+        XCTAssertEqual(sent.headers["X-BSV-Binary-Encoding"], "base64")
+    }
+
+    /// A literal object shaped like a marker arrives escaped and is read back as itself.
+    func test_anEscapedObjectInABinaryReplyIsReadBackAsItself() async throws {
+        let storage = Storage(echoesBinary: true, results: ["listOutputs": { _ in
+            #"{"customInstructions":{"$bsvBinary":"escaped","entries":[["$bsvBinary","base64"],["data","AQID"]]}}"#
+        }])
+
+        let result = try await client(storage).call("listOutputs", [.object(auth.jsonObject)])
+
+        XCTAssertEqual(
+            result["customInstructions"],
+            .object(["$bsvBinary": .string("base64"), "data": .string("AQID")])
+        )
+    }
+
+    /// Without the echoed header the reply is plain JSON: nothing in it is read as a marker.
+    func test_aPlainReplyIsNotReadAsBinary() async throws {
+        let storage = Storage(echoesBinary: false, results: ["listOutputs": { _ in
+            #"{"customInstructions":{"$bsvBinary":"base64","data":"AQID"}}"#
+        }])
+
+        let result = try await client(storage).call("listOutputs", [.object(auth.jsonObject)])
+
+        XCTAssertEqual(
+            result["customInstructions"],
+            .object(["$bsvBinary": .string("base64"), "data": .string("AQID")])
+        )
+    }
+
+    /// Bytes that are not canonical base64 are a reply that cannot be read, as `fromBase64`
+    /// throws in `parseJsonRpc`.
+    func test_aBinaryReplyWithInvalidBase64IsUnreadable() async throws {
+        let storage = Storage(echoesBinary: true, results: ["listOutputs": { _ in
+            #"{"outputs":{"$bsvBinary":"base64","data":"AQJ="}}"#
+        }])
+
+        do {
+            _ = try await client(storage).call("listOutputs", [.object(auth.jsonObject)])
+            XCTFail("an invalid binary value was read")
+        } catch let error as StorageClientError {
+            XCTAssertEqual(error, .unreadableResponse(method: "listOutputs"))
+        }
     }
 
     /// A store that does not echo the header gets bytes as numbers, as before.
