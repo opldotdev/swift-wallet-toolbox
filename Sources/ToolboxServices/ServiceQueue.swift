@@ -41,7 +41,7 @@ public struct ServiceQueue<Answer: Sendable>: Sendable {
             do {
                 return try await provider.answer()
             } catch {
-                failures.append((provider: provider.name, reason: String(describing: error)))
+                failures.append((provider: provider.name, reason: ErrorDetail.describe(error)))
                 ToolboxLog.error("ToolboxServices", "provider \(provider.name) failed: "
                     + ErrorDetail.describe(error))
             }

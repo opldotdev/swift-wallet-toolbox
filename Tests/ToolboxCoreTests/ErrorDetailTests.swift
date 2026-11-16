@@ -91,10 +91,56 @@ final class ErrorDetailTests: XCTestCase {
         XCTAssertEqual(ErrorDetail.describe(plain), String(reflecting: plain))
     }
 
+    func test_anErrorWrappingAURLErrorIsLoggedWithoutItsQuery() throws {
+        struct Wrapper: Error { let underlying: any Error }
+        enum Wrapped: Error { case failed(any Error) }
+        let url = try XCTUnwrap(URL(string: "https://wallet.example/api/x?auth_token=SECRET"))
+        let urlError = URLError(.timedOut, userInfo: [
+            "NSErrorFailingURLKey": url,
+            "NSErrorFailingURLStringKey": url.absoluteString,
+            NSLocalizedDescriptionKey: "The request to \(url.absoluteString) timed out.",
+        ])
+        let ns = NSError(domain: "dev.opl.test", code: 3, userInfo: [
+            NSLocalizedDescriptionKey: "GET \(url.absoluteString) failed",
+        ])
+        for error in [Wrapper(underlying: urlError), Wrapped.failed(urlError), Wrapper(underlying: ns)] as [any Error] {
+            let logged = ErrorDetail.describe(error)
+            XCTAssertFalse(logged.contains("SECRET"), logged)
+            XCTAssertFalse(logged.contains("auth_token"), logged)
+        }
+    }
+
+    func test_anUnderlyingSwiftErrorIsLoggedWithoutItsQuery() {
+        struct Inner: Error, CustomDebugStringConvertible {
+            var debugDescription: String { "Inner: GET https://wallet.example/inner?auth_token=SECRET" }
+        }
+        let outer = NSError(domain: NSURLErrorDomain, code: -1001, userInfo: [NSUnderlyingErrorKey: Inner()])
+        let logged = ErrorDetail.describe(outer)
+        XCTAssertFalse(logged.contains("SECRET"), logged)
+        XCTAssertTrue(logged.contains("underlying: Inner: GET https://wallet.example/inner"), logged)
+    }
+
     func test_withoutQueriesCutsOnlyURLs() {
         XCTAssertEqual(
             ErrorDetail.withoutQueries("GET https://h.example/p?token=x failed? yes https://h.example/q#f h.example/r?a=b"),
             "GET https://h.example/p failed? yes https://h.example/q h.example/r"
+        )
+    }
+
+    func test_withoutQueriesEndsTheCutWhereTheURLEnds() {
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries(#"{"url":"https://h/p?x=1","txid":"abc"}"#),
+            #"{"url":"https://h/p","txid":"abc"}"#
+        )
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries(#"{"a":"https://h/p?x=1","b":"https://h/q?y=2","n":"why?"}"#),
+            #"{"a":"https://h/p","b":"https://h/q","n":"why?"}"#
+        )
+        XCTAssertEqual(ErrorDetail.withoutQueries("see https://h/p?ids=a,b&token=SECRET now"), "see https://h/p now")
+        XCTAssertEqual(ErrorDetail.withoutQueries("(https://h/p?x=1), next"), "(https://h/p), next")
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries("UserInfo={NSErrorFailingURLKey=https://w.example/x?auth_token=SECRET}"),
+            "UserInfo={NSErrorFailingURLKey=https://w.example/x}"
         )
     }
 

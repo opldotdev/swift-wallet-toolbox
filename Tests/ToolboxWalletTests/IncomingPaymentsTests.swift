@@ -1516,3 +1516,25 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
 ]
 """#
 }
+
+/// The one log line for payment messages a listing could not open holds the server's sender and
+/// message ID on one short line, whatever the server sent.
+final class UnopenedPaymentMessagesTests: XCTestCase {
+    private struct Unreadable: Error {}
+
+    func test_theFirstMessageIsNamedOnOneShortLine() throws {
+        let longSender = String(repeating: "ab", count: 200)
+        let row = MessageBoxClient.ListedRow(
+            message: MessageBoxMessage(messageId: "id\nforged log line", body: "", sender: "02" + longSender),
+            rawSender: "\(longSender)\nforged log line"
+        )
+        var unopened = UnopenedPaymentMessages()
+        unopened.add(row, Unreadable())
+        let first = try XCTUnwrap(unopened.first)
+        XCTAssertFalse(first.contains("\n"), first)
+        XCTAssertTrue(first.hasPrefix("id forged log line from "), first)
+        XCTAssertFalse(first.contains(longSender), first)
+        XCTAssertTrue(first.contains("…: "), first)
+        XCTAssertEqual(unopened.count, 1)
+    }
+}

@@ -59,6 +59,28 @@ final class ServiceQueueTests: XCTestCase {
         }
     }
 
+    /// A reason is logged detail, so a URL error's query (which can carry a token) stays out.
+    func test_aFailureReasonCarriesNoURLQuery() async throws {
+        let url = try XCTUnwrap(URL(string: "https://chain.example/v1/tx?api_key=SECRET"))
+        let queue = ServiceQueue<Int>([
+            .init(name: "woc") {
+                throw URLError(.timedOut, userInfo: [
+                    "NSErrorFailingURLKey": url, "NSErrorFailingURLStringKey": url.absoluteString,
+                ])
+            },
+        ])
+
+        do {
+            _ = try await queue.resolve()
+            XCTFail("a queue where every provider failed must not return an answer")
+        } catch ServiceError.allProvidersFailed(let failures) {
+            XCTAssertEqual(failures.map(\.provider), ["woc"])
+            let reason = try XCTUnwrap(failures.first?.reason)
+            XCTAssertFalse(reason.contains("SECRET"), reason)
+            XCTAssertTrue(reason.contains("chain.example/v1/tx"), reason)
+        }
+    }
+
     func test_anEmptyQueueFailsRatherThanHanging() async {
         let queue = ServiceQueue<Int>([])
 
