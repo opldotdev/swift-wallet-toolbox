@@ -31,8 +31,12 @@ extension StorageClient {
                     ]),
                 ])
             case .basketInsertion(let insertion):
-                // `validateBasketInsertion`: basket and tags trimmed and lowercased, as storage
-                // stores and matches them.
+                // Deliberately not what TS sends. The TS client passes the caller's raw basket and
+                // tags, and TS storage files basket insertions from those raw args (its own
+                // `validateInternalizeActionArgs` result is used only for labels), so a mixed-case
+                // name lands in a basket that `listOutputs`, which lowercases, never finds. Sending
+                // them as `validateBasketInsertion` normalises them keeps internalized outputs in
+                // the basket every other call names.
                 var remittance: [String: JSONValue] = [
                     "basket": .string(try ActionBatchWire.identifier(insertion.basket, name: "basket")),
                     "tags": .array(try ActionBatchWire.identifiers(insertion.tags, name: "tag").map { .string($0) }),
@@ -49,19 +53,21 @@ extension StorageClient {
         }
 
         let arguments: [String: JSONValue] = [
-            // The transaction travels as a JSON byte array, the shape storage sends and takes BEEF.
-            "tx": .array(try request.transaction.serialized(
-                limits: StorageLimits.beef
-            ).map { .number(Double($0)) }),
             "description": .string(request.description),
-            // `validateInternalizeActionArgs` validates each label as `validateLabel` does.
+            // TS storage reads labels from its own `validateInternalizeActionArgs`, which
+            // normalises each as `validateLabel` does; sending them normalised gives the same rows.
             "labels": .array(try ActionBatchWire.identifiers(request.labels, name: "label").map { .string($0) }),
             "outputs": .array(outputs),
         ]
+        // The Atomic BEEF travels as bytes, as the reference signer sends it
+        // (`ab.toUint8ArrayAtomic(txid)`): base64 once storage reads binary requests, so a large
+        // received transaction stays within the auth layer's 100,000-value cap.
+        let transaction = try request.transaction.serialized(limits: StorageLimits.beef)
 
-        let result = try await call(
-            "internalizeAction", [.object(auth.jsonObject), .object(arguments)]
-        )
+        let result = try await call("internalizeAction", rawParams: [
+            OrderedJSON(.object(auth.jsonObject)),
+            OrderedJSON(.object(arguments)).setting("tx", .bytes(transaction)),
+        ])
         return WalletInternalizeActionResult(accepted: result["accepted"]?.boolValue ?? true)
     }
 }

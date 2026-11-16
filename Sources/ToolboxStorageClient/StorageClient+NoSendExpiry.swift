@@ -44,15 +44,16 @@ extension StorageClient: NoSendExpiryStorage {
     }
 
     public func armNoSendExpiry(_ auth: AuthID, _ arm: NoSendExpiryArm) async throws {
-        _ = try await call("armNoSendExpiry", [
-            .object(auth.jsonObject),
-            .object([
+        // `reclaimRawTx` is bytes, as the reference signer sends it (`reclaim.tx.toUint8Array()`).
+        _ = try await call("armNoSendExpiry", rawParams: [
+            OrderedJSON(.object(auth.jsonObject)),
+            .record([
                 "reference": .string(arm.reference),
                 "reclaimTxid": .string(arm.reclaimTxid),
-                "reclaimRawTx": .array(arm.reclaimRawTx.map { .number(Double($0)) }),
+                "reclaimRawTx": .bytes(arm.reclaimRawTx),
                 "reclaimDerivationPrefix": .string(arm.reclaimDerivationPrefix),
                 "reclaimDerivationSuffix": .string(arm.reclaimDerivationSuffix),
-                "reclaimSatoshis": .number(Double(arm.reclaimSatoshis)),
+                "reclaimSatoshis": .int(arm.reclaimSatoshis),
             ]),
         ])
     }

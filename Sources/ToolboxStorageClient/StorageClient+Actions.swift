@@ -50,23 +50,32 @@ extension StorageClient {
     public func processAction(
         _ auth: AuthID, _ request: StorageProcessActionRequest
     ) async throws -> StorageProcessActionResult {
-        var arguments: [String: JSONValue] = [
-            "reference": .string(request.reference),
-            "isNewTx": .bool(request.isNewTx),
-            "isSendWith": .bool(request.isSendWith),
-            "isNoSend": .bool(request.isNoSend),
-            "isDelayed": .bool(request.isDelayed),
-            "sendWith": .array(request.sendWith.map { .string($0) }),
-        ]
+        // Members in the order the dictionary form wrote them (sorted by key).
+        var txid: OrderedJSON?
+        var rawTx: OrderedJSON?
         // Both reference implementations require raw Bitcoin bytes plus their exact txid.
         // Atomic BEEF belongs to the wallet result, not the storage processAction request.
         if let rawTX = request.rawTX {
             let transaction = try Transaction(bytes: rawTX, limits: StorageLimits.transaction)
-            arguments["txid"] = .string(try transaction.transactionID(limits: StorageLimits.transaction).displayHex)
-            arguments["rawTx"] = .array(rawTX.map { .number(Double($0)) })
+            txid = .string(try transaction.transactionID(limits: StorageLimits.transaction).displayHex)
+            // Bytes, as the reference sends `tx.toUint8Array()`: base64 in a binary request, so a
+            // transaction over ~100 KB is not refused as 100,000+ JSON values.
+            rawTx = .bytes(rawTX)
         }
+        let arguments = OrderedJSON.record([
+            "isDelayed": .bool(request.isDelayed),
+            "isNewTx": .bool(request.isNewTx),
+            "isNoSend": .bool(request.isNoSend),
+            "isSendWith": .bool(request.isSendWith),
+            "rawTx": rawTx,
+            "reference": .string(request.reference),
+            "sendWith": .strings(request.sendWith),
+            "txid": txid,
+        ])
 
-        let result = try await call("processAction", [.object(auth.jsonObject), .object(arguments)])
+        let result = try await call(
+            "processAction", rawParams: [OrderedJSON(.object(auth.jsonObject)), arguments]
+        )
         return try Self.decodeProcessAction(result)
     }
 
