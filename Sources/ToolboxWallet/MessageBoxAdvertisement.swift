@@ -141,66 +141,40 @@ public struct MessageBoxAdvertiser: Sendable {
         self.broadcast = broadcast
     }
 
-    /// TS `TopicBroadcaster(['tm_messagebox'], { networkPreset }).broadcast`: submits to every
-    /// SHIP host advertising the topic at once and keeps the hosts that answered with
-    /// instructions; a host that failed, or answered with none, is dropped and reported. It
-    /// succeeds once one host took the transaction and one of those admitted it to the topic (TS
-    /// defaults: no acknowledgment asked of every host, the topic of any one).
+    /// TS `TopicBroadcaster(['tm_messagebox'], { networkPreset }).broadcast`, through the SDK's
+    /// ``OverlayTopicBroadcaster``, which follows `@bsv/sdk` `SHIPBroadcaster`: it reads the SHIP
+    /// advertisements for the topic (canonical, 1-satoshi, identity-linked, public HTTPS hosts
+    /// only), submits to every interested host at once, and counts a host that failed, answered
+    /// with no instructions or named a topic it was not sent as failed. It succeeds once some
+    /// host admitted the transaction to the topic (TS defaults: no acknowledgment asked of every
+    /// host, the topic of any one).
     static func submit(
         _ atomic: AtomicBEEF, resolver: any OverlayLookupResolving, facilitator: any TopicFacilitator
     ) async throws -> MessageBoxAdvertisementBroadcast {
-        let topic = try OverlayTopic(rawValue: Self.topic)
-        let tagged = try TaggedBEEF(beef: atomic.serialized(limits: StorageLimits.beef), topics: [topic])
-        let hosts = try await interestedHosts(topic, resolver: resolver)
-        guard !hosts.isEmpty else { throw MessageBoxAdvertisementError.noInterestedHosts }
-        try Task.checkCancellation()
-        let answers = await withTaskGroup(of: (OverlayHost, Steak?).self,
-                                          returning: [OverlayHost: Steak].self) { group in
-            for host in hosts {
-                group.addTask {
-                    // One host failing is counted in `failedHosts`; its reason goes to the log.
-                    do {
-                        let steak = try await facilitator.submit(tagged, to: host)
-                        guard !steak.instructions.isEmpty else {
-                            ToolboxLog.error("ToolboxWallet.MessageBox",
-                                "advertisement: overlay host \(host) admitted nothing")
-                            return (host, nil)
-                        }
-                        return (host, steak)
-                    } catch {
-                        ToolboxLog.error("ToolboxWallet.MessageBox",
-                            "advertisement: overlay host \(host) refused the submit: \(ErrorDetail.describe(error))")
-                        return (host, nil)
-                    }
-                }
-            }
-            var answers: [OverlayHost: Steak] = [:]
-            for await (host, steak) in group { answers[host] = steak }
-            return answers
+        let broadcaster = try OverlayTopicBroadcaster(topics: [OverlayTopic(rawValue: Self.topic)],
+            facilitator: facilitator, resolver: resolver, beefLimits: StorageLimits.beef)
+        let report: OverlayBroadcastReport
+        do {
+            report = try await broadcaster.broadcastDetailed(atomic)
+        } catch OverlayPolicyError.noInterestedHosts {
+            throw MessageBoxAdvertisementError.noInterestedHosts
         }
-        let accepted = hosts.filter { answers[$0] != nil }
-        guard !accepted.isEmpty else { throw MessageBoxAdvertisementError.allHostsRejected }
-        guard accepted.contains(where: { answers[$0]?.acknowledges(topic) == true }) else {
-            throw MessageBoxAdvertisementError.notAcknowledged
+        // The SDK's overlay log has each host's failure; this line ties them to the advertisement.
+        for failure in report.hostFailures {
+            ToolboxLog.error("ToolboxWallet.MessageBox", "advertisement \(report.transactionID): overlay host "
+                + "\(failure.host) failed the submit: \(ErrorDetail.describe(failure.error))")
         }
-        return MessageBoxAdvertisementBroadcast(transactionID: atomic.subjectTransactionID,
-            acceptedHosts: accepted, failedHosts: hosts.filter { answers[$0] == nil })
-    }
-
-    /// The hosts whose SHIP advertisement names `topic`, as TS `findInterestedHosts` reads them.
-    static func interestedHosts(_ topic: OverlayTopic, resolver: any OverlayLookupResolving) async throws -> [OverlayHost] {
-        let answer = try await resolver.resolve(LookupQuestion(service: OverlayService(rawValue: "ls_ship"),
-            query: Array(#"{"topics":["\#(topic.rawValue)"]}"#.utf8)))
-        guard case .outputList(let outputs) = answer else { throw MessageBoxAdvertisementError.unexpectedLookupAnswer }
-        var hosts: Set<OverlayHost> = []
-        for output in outputs {
-            guard let transaction = try? subject(output.beef),
-                  Int(output.outputIndex) < transaction.outputs.count,
-                  let token = try? OverlayAdminTokenCodec.decode(transaction.outputs[Int(output.outputIndex)].lockingScript),
-                  case .ship(let advertised) = token.subject, advertised == topic else { continue }
-            hosts.insert(token.host)
+        if let failure = report.failure {
+            ToolboxLog.error("ToolboxWallet.MessageBox", "advertisement \(report.transactionID) was not "
+                + "admitted to \(Self.topic): \(ErrorDetail.describe(failure)); \(report.acknowledgedTopics.count) "
+                + "host(s) answered, \(report.hostFailures.count) failed")
+            throw report.acknowledgedTopics.isEmpty
+                ? MessageBoxAdvertisementError.allHostsRejected
+                : MessageBoxAdvertisementError.notAcknowledged
         }
-        return hosts.sorted()
+        return MessageBoxAdvertisementBroadcast(transactionID: report.transactionID,
+            acceptedHosts: report.acknowledgedTopics.keys.sorted(),
+            failedHosts: report.hostFailures.map(\.host).sorted())
     }
 
     static func protocolID() throws -> WalletProtocolID {
@@ -267,7 +241,7 @@ public struct MessageBoxAdvertiser: Sendable {
     /// One lookup output as an advertisement of `identity`, or nil when it is not a valid one.
     static func advertisement(_ output: OutputListItem, identity: PublicKey) async -> MessageBoxAdvertisement? {
         guard let beef = try? graph(output.beef),
-              let transaction = try? subject(output.beef),
+              let transaction = try? output.transaction(beefLimits: StorageLimits.beef),
               let transactionID = try? transaction.transactionID(limits: StorageLimits.transaction),
               Int(output.outputIndex) < transaction.outputs.count else { return nil }
         let spent = transaction.outputs[Int(output.outputIndex)]
@@ -292,21 +266,8 @@ public struct MessageBoxAdvertiser: Sendable {
             satoshis: spent.satoshis, lockingScript: spent.lockingScript, beef: beef)
     }
 
-    /// TS `Transaction.fromBEEF`: the subject of an Atomic BEEF, else the last transaction.
-    ///
-    /// Overlay BEEF is written by `@bsv/sdk`, which can list a child before its parents, so it is
-    /// read in any order and reordered parents-first; `last` is then a transaction nothing else
-    /// in the graph spends. TS takes the record last on the wire without reordering, so the two
-    /// differ when the writer put a parent last. This keeps the reordered choice.
-    static func subject(_ bytes: [UInt8]) throws -> Transaction? {
-        if bytes.starts(with: [1, 1, 1, 1]) {
-            let atomic = try AtomicBEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)
-            return try atomic.beef.transaction(for: atomic.subjectTransactionID, limits: StorageLimits.transaction)
-        }
-        return try BEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)
-            .transactions.last?.transaction
-    }
-
+    /// The whole BEEF graph of a lookup output, kept so the advertisement can later be spent.
+    /// The output's own transaction is read with ``OutputListItem/transaction(beefLimits:)``.
     static func graph(_ bytes: [UInt8]) throws -> BEEF {
         if bytes.starts(with: [1, 1, 1, 1]) {
             return try AtomicBEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any).beef

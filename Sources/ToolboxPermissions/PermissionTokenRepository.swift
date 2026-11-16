@@ -232,9 +232,9 @@ public actor PermissionTokenRepository {
             try requireActive(epoch)
 
             let returned = try exactUInt32(page.outputs.count, offset: offset)
-            guard UInt64(page.totalOutputs) <= Self.maximumCandidateCount else {
+            guard page.totalOutputs <= Self.maximumCandidateCount else {
                 throw PermissionTokenRepositoryError.candidateLimitExceeded(
-                    total: UInt64(page.totalOutputs),
+                    total: page.totalOutputs,
                     maximum: Self.maximumCandidateCount
                 )
             }
