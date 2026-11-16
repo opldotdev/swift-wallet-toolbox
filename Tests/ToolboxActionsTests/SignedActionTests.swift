@@ -275,13 +275,172 @@ final class SignedActionTests: XCTestCase {
         XCTAssertEqual(parsed.beef.transactions[2], .raw(value.transaction))
     }
 
-    func test_rejectsAnUnrelatedFundedTransaction() throws {
+    /// v2 BEEF bytes with records in the order given, the way `@bsv/sdk`'s `Beef.toBinary()` can
+    /// write them: `sortTxs()` puts a transaction that does not chain to a proof ahead of its
+    /// proven parents. The SDK's own writer refuses that order, so these are written by hand.
+    private func wireOrder(paths: [MerklePath], _ entries: [BEEFTransaction]) throws -> [UInt8] {
+        let limits = WalletBEEFLimits.standard
+        var bytes: [UInt8] = [0x02, 0x00, 0xbe, 0xef, UInt8(paths.count)]
+        for path in paths { bytes += try path.serialized(limits: limits.merklePathLimits) }
+        bytes.append(UInt8(entries.count))
+        for entry in entries {
+            switch entry {
+            case .raw(let transaction):
+                bytes += [0x00] + (try transaction.serialized(limits: limits.transactionLimits))
+            case .rawWithMerklePath(let transaction, let index):
+                bytes += [0x01, UInt8(index)]
+                bytes += try transaction.serialized(limits: limits.transactionLimits)
+            case .transactionID(let id):
+                bytes += [0x02] + id.wireBytes
+            }
+        }
+        return bytes
+    }
+
+    private func proven(_ transaction: Transaction, height: UInt32 = 900_002) throws -> MerklePath {
+        let id = try transaction.transactionID(limits: WalletTransactionLimits.standard)
+        return try MerklePath(
+            blockHeight: height,
+            levels: [[.hash(offset: 0, hash: try Hash256(id.wireBytes), isTransactionID: true)]]
+        )
+    }
+
+    func test_acceptsAFundedGraphWrittenChildFirst() throws {
+        let ancestor = Transaction(outputs: [TransactionOutput(
+            satoshis: 6_000,
+            lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+        )])
+        let ancestorID = try ancestor.transactionID(limits: WalletTransactionLimits.standard)
+        let source = try sourceTransaction(parent: ancestorID)
+        let path = try proven(ancestor)
+        let bytes = try wireOrder(paths: [path], [
+            .raw(source),
+            .rawWithMerklePath(transaction: ancestor, merklePathIndex: 0),
+        ])
+        XCTAssertThrowsError(try BEEF(bytes: bytes, limits: WalletBEEFLimits.standard)) { error in
+            guard case BEEFError.parentAfterChild = error else {
+                return XCTFail("expected parentAfterChild, got \(error)")
+            }
+        }
+        let value = try parts(source: source, inputBEEF: bytes)
+
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+        let parsed = try AtomicBEEF(
+            bytes: action.atomicBEEF(), limits: WalletBEEFLimits.standard
+        )
+
+        XCTAssertEqual(parsed.beef.transactions, [
+            .rawWithMerklePath(transaction: ancestor, merklePathIndex: 0),
+            .raw(source),
+            .raw(value.transaction),
+        ])
+    }
+
+    /// The funded source spends a proven parent and a parent storage left out, so `sortTxs()`
+    /// writes it first. Reordering cannot supply the missing parent. The action can still be
+    /// processed, as the TypeScript client processes it from the reference and raw transaction;
+    /// only the BEEF accessors fail, and they name the missing parent rather than the order.
+    func test_childFirstGraphWithAnAbsentParentFailsOnlyTheBEEFAccessors() throws {
+        let ancestor = Transaction(outputs: [TransactionOutput(
+            satoshis: 6_000,
+            lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+        )])
+        let ancestorID = try ancestor.transactionID(limits: WalletTransactionLimits.standard)
+        let absentID = try TransactionID(wireBytes: [UInt8](repeating: 0xee, count: 32))
+        var source = try sourceTransaction(parent: ancestorID)
+        source = Transaction(
+            version: source.version,
+            inputs: source.inputs + [TransactionInput(
+                previousOutput: Outpoint(transactionID: absentID, outputIndex: 0),
+                unlockingScript: try Script(bytes: [], maximumByteCount: 0)
+            )],
+            outputs: source.outputs,
+            lockTime: source.lockTime
+        )
+        let sourceID = try source.transactionID(limits: WalletTransactionLimits.standard)
+        let bytes = try wireOrder(paths: [try proven(ancestor)], [
+            .raw(source),
+            .rawWithMerklePath(transaction: ancestor, merklePathIndex: 0),
+        ])
+        let value = try parts(source: source, inputBEEF: bytes)
+
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+        let request = try action.processRequest()
+
+        XCTAssertEqual(
+            request.rawTX,
+            try value.transaction.serialized(limits: WalletTransactionLimits.standard)
+        )
+        let expected = BEEFError.missingAncestor(transaction: sourceID, ancestor: absentID)
+        XCTAssertThrowsError(try action.atomicBEEF()) { error in
+            XCTAssertEqual(error as? BEEFError, expected)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The transaction data is incomplete: a transaction it depends on is missing."
+            )
+        }
+        XCTAssertThrowsError(try action.beef()) { error in
+            XCTAssertEqual(error as? BEEFError, expected)
+        }
+    }
+
+    /// The graph the review probed: `P` is proven and spends `G`, which is proven too and so is
+    /// not needed; `U` is unrelated; `S` spends `P` and funds the subject. Written `P, G, U, S`,
+    /// as `sortTxs()` lists proven transactions in merge order. The envelope keeps `P` and `S`
+    /// and drops the rest, as Atomic BEEF requires, instead of refusing the graph.
+    func test_keepsOnlyTheSubjectsAncestryFromAProvenChildFirstGraph() throws {
+        let grandparent = Transaction(outputs: [TransactionOutput(
+            satoshis: 7_000,
+            lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+        )])
+        let grandparentID = try grandparent.transactionID(limits: WalletTransactionLimits.standard)
+        let parent = Transaction(
+            inputs: [TransactionInput(
+                previousOutput: Outpoint(transactionID: grandparentID, outputIndex: 0),
+                unlockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+            )],
+            outputs: [TransactionOutput(
+                satoshis: 6_000,
+                lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+            )]
+        )
+        let parentID = try parent.transactionID(limits: WalletTransactionLimits.standard)
+        let unrelated = Transaction(outputs: [TransactionOutput(
+            satoshis: 1,
+            lockingScript: try Script(bytes: [0x52], maximumByteCount: 1)
+        )])
+        let source = try sourceTransaction(parent: parentID)
+        let parentPath = try proven(parent, height: 900_003)
+        let bytes = try wireOrder(paths: [parentPath, try proven(grandparent, height: 900_001)], [
+            .rawWithMerklePath(transaction: parent, merklePathIndex: 0),
+            .rawWithMerklePath(transaction: grandparent, merklePathIndex: 1),
+            .raw(unrelated),
+            .raw(source),
+        ])
+        XCTAssertThrowsError(try BEEF(bytes: bytes, limits: WalletBEEFLimits.standard)) { error in
+            XCTAssertEqual(
+                error as? BEEFError, .parentAfterChild(parent: grandparentID, child: parentID)
+            )
+        }
+        let value = try parts(source: source, inputBEEF: bytes)
+
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+        let parsed = try AtomicBEEF(bytes: action.atomicBEEF(), limits: WalletBEEFLimits.standard)
+
+        XCTAssertEqual(parsed.beef.merklePaths, [parentPath])
+        XCTAssertEqual(parsed.beef.transactions, [
+            .rawWithMerklePath(transaction: parent, merklePathIndex: 0),
+            .raw(source),
+            .raw(value.transaction),
+        ])
+    }
+
+    func test_dropsAFundedTransactionOutsideTheSubjectsAncestry() throws {
         let source = try sourceTransaction()
         let unrelated = Transaction(outputs: [TransactionOutput(
             satoshis: 1,
             lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
         )])
-        let unrelatedID = try unrelated.transactionID(limits: WalletTransactionLimits.standard)
         let graph = try BEEF(
             merklePaths: [],
             transactions: [.raw(source), .raw(unrelated)],
@@ -289,14 +448,13 @@ final class SignedActionTests: XCTestCase {
         )
         let value = try parts(source: source, inputBEEF: try serialized(graph))
 
-        XCTAssertThrowsError(
-            try SignedAction(funded: value.funded, transaction: value.transaction)
-        ) { error in
-            XCTAssertEqual(error as? BEEFError, .unrelatedTransaction(unrelatedID))
-        }
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+        let parsed = try AtomicBEEF(bytes: action.atomicBEEF(), limits: WalletBEEFLimits.standard)
+
+        XCTAssertEqual(parsed.beef.transactions, [.raw(source), .raw(value.transaction)])
     }
 
-    func test_rejectsAMissingFundedAncestor() throws {
+    func test_aMissingFundedAncestorFailsOnlyTheBEEFAccessors() throws {
         let source = try sourceTransaction()
         let sourceID = try source.transactionID(limits: WalletTransactionLimits.standard)
         let value = try parts(source: source, inputBEEF: nil)
@@ -304,9 +462,10 @@ final class SignedActionTests: XCTestCase {
             limits: WalletTransactionLimits.standard
         )
 
-        XCTAssertThrowsError(
-            try SignedAction(funded: value.funded, transaction: value.transaction)
-        ) { error in
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+
+        XCTAssertEqual(try action.processRequest().reference, "ref")
+        XCTAssertThrowsError(try action.atomicBEEF()) { error in
             XCTAssertEqual(
                 error as? BEEFError,
                 .missingAncestor(transaction: subjectID, ancestor: sourceID)
@@ -346,7 +505,9 @@ final class SignedActionTests: XCTestCase {
         }
     }
 
-    func test_rejectsConflictingBUMPsForOneBlockHeight() throws {
+    /// A second BUMP for the source's block that no record uses is outside the ancestry and is
+    /// dropped with it.
+    func test_dropsABUMPNoAncestorUses() throws {
         let source = try sourceTransaction()
         let sourceID = try source.transactionID(limits: WalletTransactionLimits.standard)
         let sourceHash = try Hash256(sourceID.wireBytes)
@@ -372,9 +533,50 @@ final class SignedActionTests: XCTestCase {
         )
         let value = try parts(source: source, inputBEEF: try serialized(graph))
 
-        XCTAssertThrowsError(
-            try SignedAction(funded: value.funded, transaction: value.transaction)
-        ) { error in
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+        let parsed = try AtomicBEEF(bytes: action.atomicBEEF(), limits: WalletBEEFLimits.standard)
+
+        XCTAssertEqual(parsed.beef.merklePaths, [singleton])
+    }
+
+    /// Two ancestors whose BUMPs claim different roots for one block cannot both be right. The
+    /// action can still be processed; the BEEF accessors report the conflict.
+    func test_conflictingBUMPsInTheAncestryFailOnlyTheBEEFAccessors() throws {
+        let first = Transaction(outputs: [TransactionOutput(
+            satoshis: 3_000,
+            lockingScript: try Script(bytes: [0x51], maximumByteCount: 1)
+        )])
+        let second = Transaction(outputs: [TransactionOutput(
+            satoshis: 4_000,
+            lockingScript: try Script(bytes: [0x52], maximumByteCount: 1)
+        )])
+        let firstID = try first.transactionID(limits: WalletTransactionLimits.standard)
+        let secondID = try second.transactionID(limits: WalletTransactionLimits.standard)
+        var source = try sourceTransaction(parent: firstID)
+        source = Transaction(
+            version: source.version,
+            inputs: source.inputs + [TransactionInput(
+                previousOutput: Outpoint(transactionID: secondID, outputIndex: 0),
+                unlockingScript: try Script(bytes: [], maximumByteCount: 0)
+            )],
+            outputs: source.outputs,
+            lockTime: source.lockTime
+        )
+        let graph = try BEEF(
+            merklePaths: [try proven(first), try proven(second)],
+            transactions: [
+                .rawWithMerklePath(transaction: first, merklePathIndex: 0),
+                .rawWithMerklePath(transaction: second, merklePathIndex: 1),
+                .raw(source),
+            ],
+            limits: WalletBEEFLimits.standard
+        )
+        let value = try parts(source: source, inputBEEF: try serialized(graph))
+
+        let action = try SignedAction(funded: value.funded, transaction: value.transaction)
+
+        XCTAssertNoThrow(try action.processRequest())
+        XCTAssertThrowsError(try action.atomicBEEF()) { error in
             XCTAssertEqual(error as? BEEFError, .conflictingMerkleRoot(blockHeight: 900_002))
         }
     }

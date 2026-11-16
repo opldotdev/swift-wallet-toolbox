@@ -118,6 +118,9 @@ public enum NoSendExpiryAction {
             )
 
             let signed = try SignedAction(funded: target, transaction: transaction)
+            // The caller hands this held action on as Atomic BEEF, so a funded graph that cannot
+            // prove it fails here, before storage holds it, and the action is aborted below.
+            _ = try signed.atomicBEEF()
             let process = StorageProcessActionRequest(
                 reference: target.reference,
                 isNewTx: true,

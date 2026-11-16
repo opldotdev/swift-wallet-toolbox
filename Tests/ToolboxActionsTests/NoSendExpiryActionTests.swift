@@ -28,6 +28,8 @@ final class NoSendExpiryActionTests: XCTestCase {
         var fundingStatus: SendWithResult.Status = .unproven
         var armFails = false
         var activateMode = "seconds"
+        /// Activation returns a graph without the funding transaction the action spends.
+        var omitsFundingFromTarget = false
         private(set) var calls: [Call] = []
         private(set) var armed: NoSendExpiryArm?
         private(set) var processed: [StorageProcessActionRequest] = []
@@ -50,8 +52,10 @@ final class NoSendExpiryActionTests: XCTestCase {
 
         func configure(
             supported: Bool = true, fundingStatus: SendWithResult.Status = .unproven,
-            armFails: Bool = false, activateMode: String = "seconds"
+            armFails: Bool = false, activateMode: String = "seconds",
+            omitsFundingFromTarget: Bool = false
         ) {
+            self.omitsFundingFromTarget = omitsFundingFromTarget
             self.supported = supported
             self.fundingStatus = fundingStatus
             self.armFails = armFails
@@ -133,11 +137,10 @@ final class NoSendExpiryActionTests: XCTestCase {
                     unlockingScriptLength: 107, derivationPrefix: Self.fundingPrefix,
                     derivationSuffix: Self.anchorSuffix
                 )],
-                inputBEEF: try graph([
-                    try XCTUnwrap(source),
+                inputBEEF: try graph([try XCTUnwrap(source)] + (omitsFundingFromTarget ? [] : [
                     try Transaction(bytes: try XCTUnwrap(processed.first?.rawTX),
                                     limits: WalletTransactionLimits.standard),
-                ]),
+                ])),
                 derivationPrefix: Self.fundingPrefix
             )
             return NoSendExpiryActivated(
@@ -345,6 +348,28 @@ final class NoSendExpiryActionTests: XCTestCase {
             )
             XCTFail("expected a refusal")
         } catch {}
+        let calls = await storage.calls
+        XCTAssertEqual(calls.last, .abort(reference: ScriptedStorage.targetReference))
+        XCTAssertFalse(calls.contains(.process(reference: ScriptedStorage.targetReference, isNoSend: true)))
+    }
+
+    /// The caller hands the held action on as Atomic BEEF. When the activated graph cannot prove
+    /// it, the action is aborted before storage is asked to hold it.
+    func test_aGraphThatCannotProveTheActionAbortsItBeforeProcessing() async throws {
+        let identity = try identity()
+        let storage = ScriptedStorage(identity: identity)
+        await storage.configure(omitsFundingFromTarget: true)
+        do {
+            _ = try await NoSendExpiryAction.run(
+                storage: storage, auth: auth, identity: identity, request: try request(),
+                maximumFee: 1_000, signCallerInputs: { _, _ in [:] }
+            )
+            XCTFail("expected a refusal")
+        } catch {
+            guard case BEEFError.missingAncestor = error else {
+                return XCTFail("expected missingAncestor, got \(error)")
+            }
+        }
         let calls = await storage.calls
         XCTAssertEqual(calls.last, .abort(reference: ScriptedStorage.targetReference))
         XCTAssertFalse(calls.contains(.process(reference: ScriptedStorage.targetReference, isNoSend: true)))

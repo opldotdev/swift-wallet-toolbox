@@ -9,6 +9,9 @@ import ToolboxStorage
 public enum ActionBatchError: Error, Equatable, Sendable, LocalizedError {
     /// The reserved funding, plus whatever storage would add, does not cover the action.
     case insufficientFunds(moreSatoshisNeeded: UInt64)
+    /// As `insufficientFunds`, when storage reserved coins whose transaction history it did not
+    /// send in full, so they could not be spent, and has nothing more to add.
+    case fundingHistoryIncomplete(moreSatoshisNeeded: UInt64)
     /// An input or `fundFrom` outpoint cannot be used as given.
     case invalidInput(String)
     /// The batch is in a state where the call makes no sense.
@@ -19,6 +22,8 @@ public enum ActionBatchError: Error, Equatable, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .insufficientFunds(let more): "Action batch needs \(more) more satoshis."
+        case .fundingHistoryIncomplete:
+            "Some of this wallet's coins can't be spent right now because their transaction history is incomplete, and the rest don't cover this action."
         case .invalidInput(let reason): "Action batch input: \(reason)"
         case .invalidOperation(let reason): "Action batch: \(reason)"
         case .manifestTooLarge(let bytes, let limit):
@@ -202,7 +207,10 @@ struct PlannerState: Sendable {
         self.begin = begin
         var beef = try BEEF(version: .v2, merklePaths: [], transactions: [], limits: Self.beefLimits)
         if let bytes = begin.inputBeef, !bytes.isEmpty {
-            beef = try beef.merging(BEEF(bytes: bytes, limits: Self.beefLimits), limits: Self.beefLimits)
+            beef = try beef.merging(
+                BEEF(bytes: bytes, limits: Self.beefLimits, transactionOrder: .any),
+                limits: Self.beefLimits
+            )
         }
         if let firstActionBEEF {
             beef = try beef.merging(firstActionBEEF, limits: Self.beefLimits)
@@ -273,6 +281,58 @@ struct PlannerState: Sendable {
         let key = outpoint.description
         return staged[key] != nil || explicit[key] != nil || reserved[key] != nil
             || transaction(outpoint.transactionID.displayHex) != nil
+    }
+
+    /// The shared graph's records by transaction ID, built once per funding pass.
+    func graphIndex() -> [TransactionID: BEEFTransaction] {
+        let limits = Self.beefLimits.transactionLimits
+        var entries: [TransactionID: BEEFTransaction] = [:]
+        for entry in sharedBeef.transactions {
+            guard let id = try? entry.transactionID(limits: limits) else { continue }
+            entries[id] = entry
+        }
+        return entries
+    }
+
+    /// Whether the shared graph holds everything needed to prove `txid`: the transaction itself
+    /// and, below each transaction without a merkle path, every parent it spends. A
+    /// transaction-ID-only record or a transaction with a merkle path ends a line. `entries` is
+    /// `graphIndex()`.
+    ///
+    /// A reserved output that fails this cannot be funded from: the member's input graph would be
+    /// cut short, and its Atomic BEEF could not be built however often the action is retried.
+    func hasCompleteAncestry(_ txid: TransactionID, in entries: [TransactionID: BEEFTransaction]) -> Bool {
+        var visited = Set<TransactionID>()
+        var stack = [txid]
+        while let next = stack.popLast() {
+            guard visited.insert(next).inserted else { continue }
+            guard let entry = entries[next] else { return false }
+            guard let transaction = entry.transaction,
+                  entry.merklePathIndex == nil, sharedBeef.merklePath(for: next) == nil else { continue }
+            stack.append(contentsOf: transaction.inputs.map(\.previousOutput.transactionID))
+        }
+        return true
+    }
+
+    /// The unconsumed reservations funding may use, and the ones it passes over because the
+    /// shared graph cannot prove them.
+    func fundableReservations() -> (provable: [PlannerOutput], unprovable: [PlannerOutput]) {
+        let entries = graphIndex()
+        var known: [String: Bool] = [:]
+        var provable: [PlannerOutput] = []
+        var unprovable: [PlannerOutput] = []
+        for output in reserved.values where !consumed.contains(output.outpoint) {
+            let complete: Bool
+            if let cached = known[output.txid] {
+                complete = cached
+            } else {
+                complete = (try? TransactionID(displayHex: output.txid))
+                    .map { hasCompleteAncestry($0, in: entries) } ?? false
+                known[output.txid] = complete
+            }
+            if complete { provable.append(output) } else { unprovable.append(output) }
+        }
+        return (provable, unprovable)
     }
 
     /// `stageTransactionOutputs`: a processed member's outputs become spendable by the next.
@@ -471,7 +531,8 @@ enum ActionBatchPlanner {
     ///
     /// `fundFrom` outputs are taken first, last one first as the reference pops its
     /// `noSendChange` list, then unconsumed reservations by the canonical exact / least-over /
-    /// largest-under rule. Inputs are added until the action can pay its fee and a change output
+    /// largest-under rule, skipping any reservation whose ancestry the shared graph cannot prove
+    /// (`PlannerState.hasCompleteAncestry`). Inputs are added until the action can pay its fee and a change output
     /// worth at least the dust floor; failing that, until it can pay its fee with no change.
     ///
     /// The no-change fallback is tried only once every `fundFrom` output and every unconsumed
@@ -491,7 +552,10 @@ enum ActionBatchPlanner {
         let outputLengths = requestedOutputs.map(\.lockingScript.count)
         var queue = fundFrom
         var allocated: [PlannerOutput] = []
-        var candidates = state.reserved.values.filter { !state.consumed.contains($0.outpoint) }
+        // A reservation whose source cannot be proven from the shared graph is passed over, so
+        // the next usable one funds the action instead; a later extension can still supply the
+        // missing ancestry and make it eligible.
+        var candidates = state.fundableReservations().provable
 
         while true {
             let inputSatoshis = fixedInputSatoshis + allocated.reduce(UInt64(0)) { $0 + $1.satoshis }
@@ -589,8 +653,8 @@ enum ActionBatchPlanner {
     /// `trimInputBeef`: the proof graph the signer needs for exactly these inputs.
     ///
     /// The reference also merges the caller's whole `inputBEEF` back in. Here it was merged into
-    /// the shared graph when planning began, and the result is cut to the inputs' ancestry, because
-    /// `SignedAction` builds BRC-95 Atomic BEEF from it and refuses any unrelated record.
+    /// the shared graph when planning began, and the result is cut to the inputs' ancestry, which
+    /// is all `SignedAction` keeps when it builds BRC-95 Atomic BEEF from it.
     static func trimmedInputBEEF(
         _ state: PlannerState, request: WalletCreateActionRequest, inputs: [PlannedInput]
     ) throws -> [UInt8]? {
@@ -614,8 +678,13 @@ enum ActionBatchBEEF {
     /// transaction with a merkle path. A transaction in `known` is kept as a transaction-ID-only
     /// record and not walked past, so the result is an exact graph `AtomicBEEF` accepts; the
     /// reference instead marks it ID-only and keeps the ancestry below it.
-    static func subgraph(_ source: BEEF, txids: [TransactionID], known: Set<TransactionID> = []) throws -> BEEF {
-        let limits = PlannerState.beefLimits
+    ///
+    /// A transaction missing from `source` is left out rather than reported here; `AtomicBEEF`
+    /// names it as the missing ancestor when the result is used.
+    static func subgraph(
+        _ source: BEEF, txids: [TransactionID], known: Set<TransactionID> = [],
+        limits: BEEFLimits = PlannerState.beefLimits
+    ) throws -> BEEF {
         var entries: [TransactionID: BEEFTransaction] = [:]
         for entry in source.transactions {
             entries[try entry.transactionID(limits: limits.transactionLimits)] = entry

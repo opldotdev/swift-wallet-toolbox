@@ -240,6 +240,11 @@ public actor ActionBatchController {
                 // counted, and asking for the whole amount would double-count it.
                 let added = try await extend(workspace, auth, target: more, outputs: requestedOutputs, explicit: [])
                 if added.count == 0 || added.satoshis == 0 {
+                    // Coins left unspent because their history could not be proven are the
+                    // reason, not a lack of coins, so say so.
+                    if !workspace.state.fundableReservations().unprovable.isEmpty {
+                        throw ActionBatchError.fundingHistoryIncomplete(moreSatoshisNeeded: more)
+                    }
                     throw ActionBatchError.insufficientFunds(moreSatoshisNeeded: more)
                 }
                 requestedOutputs = min(requestedOutputs * 2, Int(Int32.max))
@@ -417,7 +422,9 @@ public actor ActionBatchController {
         }
         workspace.state.add(reserved: extension_.reservedOutputs, explicit: extension_.explicitOutputs)
         if let bytes = extension_.inputBeef, !bytes.isEmpty {
-            try workspace.state.merge(BEEF(bytes: bytes, limits: PlannerState.beefLimits))
+            try workspace.state.merge(
+                BEEF(bytes: bytes, limits: PlannerState.beefLimits, transactionOrder: .any)
+            )
         }
         workspace.expiresAt = extension_.expiresAt
         return (

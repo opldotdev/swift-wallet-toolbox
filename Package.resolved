@@ -33,7 +33,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/opldotdev/swift-sdk.git",
       "state" : {
-        "revision" : "9839bf525996cd045600e7b85da8a7940818389c"
+        "revision" : "fcfb0daeb30d6d69ed4a1ae4a619afef07a22f6c"
       }
     },
     {
