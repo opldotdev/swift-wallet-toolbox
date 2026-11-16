@@ -9,6 +9,7 @@ import ToolboxActions
 import ToolboxBRC29
 import ToolboxPermissions
 import ToolboxStorage
+import ToolboxCore
 
 /// Per-wallet, ephemeral create/sign state. No private key is retained here.
 /// Removal precedes signing, so concurrent/replayed sign requests cannot both run.
@@ -134,9 +135,16 @@ extension RemoteWallet {
                 sendWithResults: signed.sendWithResults
             )
         } catch {
-            _ = try? await storage.abortAction(auth, WalletAbortActionRequest(
-                reference: WalletBase64Data(base64: funded.reference)
-            ))
+            // Best effort: the caller gets the failure that stopped the action. A release that
+            // also fails leaves the inputs locked until storage expires them, so it is logged.
+            do {
+                _ = try await storage.abortAction(auth, WalletAbortActionRequest(
+                    reference: WalletBase64Data(base64: funded.reference)
+                ))
+            } catch let abortError {
+                ToolboxLog.error("ToolboxWallet", "createAction failed (\(ErrorDetail.describe(error))) "
+                    + "and abortAction did not release its inputs: \(ErrorDetail.describe(abortError))")
+            }
             throw error
         }
     }
@@ -147,7 +155,14 @@ extension RemoteWallet {
             return try await finishAction(entry, spends: request.spends, options: request.options)
         } catch {
             // Do not reinsert after an ambiguous process response. A retry must never sign again.
-            _ = try? await storage.abortAction(auth, WalletAbortActionRequest(reference: request.reference))
+            // The abort is best effort; the caller gets the signing failure, and a failed release
+            // is logged.
+            do {
+                _ = try await storage.abortAction(auth, WalletAbortActionRequest(reference: request.reference))
+            } catch let abortError {
+                ToolboxLog.error("ToolboxWallet", "signAction failed (\(ErrorDetail.describe(error))) "
+                    + "and abortAction did not release its inputs: \(ErrorDetail.describe(abortError))")
+            }
             throw error
         }
     }

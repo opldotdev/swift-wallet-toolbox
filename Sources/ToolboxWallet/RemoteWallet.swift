@@ -12,6 +12,7 @@ import ToolboxBRC29
 import ToolboxStorage
 import ToolboxStorageClient
 import ToolboxServices
+import ToolboxCore
 
 /// A wallet backed by remote storage.
 ///
@@ -284,7 +285,10 @@ public struct RemoteWallet: Sendable {
                     note: description
                 )
             } catch {
+                // Delivery goes ahead without the optional sender signature; the reason is logged.
                 metadata = nil
+                ToolboxLog.error("ToolboxWallet", "paymail delivery of \(txid): the sender signature "
+                    + "could not be made: \(ErrorDetail.describe(error))")
             }
             do {
                 try await resolver.deliver(
@@ -297,6 +301,8 @@ public struct RemoteWallet: Sendable {
                     )
                 )
             } catch {
+                ToolboxLog.error("ToolboxWallet", "paymail delivery of \(txid) failed after the "
+                    + "broadcast: \(ErrorDetail.describe(error))")
                 throw WalletError.paymailDeliveryFailed(txid: txid)
             }
             return result.sent
@@ -377,6 +383,8 @@ public struct RemoteWallet: Sendable {
                 // The derivation is what failed, and nothing outside this call holds the
                 // reference, so the caller gets that error even when the abort is not confirmed.
                 // Storage fails the abandoned unsigned action on its own (TS `TaskFailAbandoned`).
+                ToolboxLog.error("ToolboxWallet", "the paid output was not found exactly once and "
+                    + "the release failed: \(ErrorDetail.describe(error))")
             }
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
@@ -429,9 +437,14 @@ public struct RemoteWallet: Sendable {
         do {
             released = try await Task { try await self.abort(reference: reference) }.value
         } catch {
+            ToolboxLog.error("ToolboxWallet", "abort did not release funded action \(reference): "
+                + ErrorDetail.describe(error))
             throw BRC29PaymentError.notReleased(reference: reference)
         }
-        guard released else { throw BRC29PaymentError.notReleased(reference: reference) }
+        guard released else {
+            ToolboxLog.error("ToolboxWallet", "storage did not confirm releasing funded action \(reference)")
+            throw BRC29PaymentError.notReleased(reference: reference)
+        }
     }
 
     /// Throws ``WalletError/broadcastFailed(txid:)`` when storage reports a send as failed, as the
@@ -493,7 +506,13 @@ public struct RemoteWallet: Sendable {
                 // caller needs, so the abort is best effort, in its own task so a cancelled
                 // caller still releases the inputs.
                 let reference = funded.reference
-                _ = try? await Task { try await self.abort(reference: reference) }.value
+                do {
+                    _ = try await Task { try await self.abort(reference: reference) }.value
+                } catch let abortError {
+                    ToolboxLog.error("ToolboxWallet", "building the payment's BEEF failed "
+                        + "(\(ErrorDetail.describe(error))) and abort did not release its inputs: "
+                        + "\(ErrorDetail.describe(abortError))")
+                }
                 throw error
             }
         }
@@ -669,12 +688,17 @@ public struct RemoteWallet: Sendable {
         } catch {
             let primaryError = error
             await Task.detached { [storage, auth] in
-                guard let reference = try? WalletBase64Data(base64: funded.reference) else {
-                    return
+                // Best effort: the caller gets the primary error; a failed release is logged.
+                do {
+                    let reference = try WalletBase64Data(base64: funded.reference)
+                    _ = try await storage.abortAction(
+                        auth, WalletAbortActionRequest(reference: reference)
+                    )
+                } catch {
+                    ToolboxLog.error("ToolboxWallet", "the permission-token action failed "
+                        + "(\(ErrorDetail.describe(primaryError))) and abortAction did not release "
+                        + "its inputs: \(ErrorDetail.describe(error))")
                 }
-                _ = try? await storage.abortAction(
-                    auth, WalletAbortActionRequest(reference: reference)
-                )
             }.value
             throw primaryError
         }
@@ -702,6 +726,8 @@ public struct RemoteWallet: Sendable {
             do {
                 graph = try BEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)
             } catch {
+                ToolboxLog.error("ToolboxWallet", "the funded permission-token BEEF could not be "
+                    + "read: \(ErrorDetail.describe(error))")
                 throw PermissionTokenMutationError.untrustworthyFundedBEEF
             }
         } else {
@@ -772,6 +798,8 @@ public struct RemoteWallet: Sendable {
                 limits: StorageLimits.beef
             )
         } catch {
+            ToolboxLog.error("ToolboxWallet", "the funded permission-token BEEF did not prove its "
+                + "inputs: \(ErrorDetail.describe(error))")
             throw PermissionTokenMutationError.untrustworthyFundedBEEF
         }
         return graph

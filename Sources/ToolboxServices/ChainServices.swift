@@ -144,9 +144,18 @@ public struct ChainBlockHeader: Equatable, Sendable {
     }
 }
 
-public enum ChainBlockHeaderError: Error, Equatable, Sendable {
+public enum ChainBlockHeaderError: Error, Equatable, Sendable, LocalizedError {
     case invalidHash(String)
     case hashMismatch(declared: String, computed: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidHash:
+            "A chain service sent a block hash that could not be read."
+        case .hashMismatch:
+            "A chain service sent a block header that does not match its hash."
+        }
+    }
 }
 
 public struct TransactionStatusReport: Equatable, Sendable {
@@ -177,11 +186,22 @@ public struct ScriptHistoryEntry: Equatable, Sendable {
     }
 }
 
-public enum ServiceError: Error, Equatable, Sendable {
+public enum ServiceError: Error, Equatable, Sendable, LocalizedError {
     case notImplemented(String)
     /// Every provider in the chain failed. Carries each failure by provider name, because one
     /// message would hide which provider is actually broken.
     case allProvidersFailed([(provider: String, reason: String)])
+
+    public var errorDescription: String? {
+        switch self {
+        case .notImplemented(let operation):
+            "This chain service does not support \(operation)."
+        case .allProvidersFailed(let failures) where failures.isEmpty:
+            "No chain service is set up to answer this."
+        case .allProvidersFailed(let failures):
+            "No chain service could answer (\(failures.map { $0.provider }.joined(separator: ", "))). Try again later."
+        }
+    }
 
     public static func == (lhs: ServiceError, rhs: ServiceError) -> Bool {
         switch (lhs, rhs) {

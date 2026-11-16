@@ -1,5 +1,6 @@
 import Foundation
 import BSVWallet
+import ToolboxCore
 
 /// A host-defined permission scheme identifier.
 ///
@@ -195,7 +196,12 @@ public actor PermissionModuleRegistry {
 
         let originator: CanonicalOriginator
         do { originator = try CanonicalOriginator(rawOriginator) }
-        catch { throw PermissionModuleRegistryError.permissionDenied }
+        catch {
+            // Denied, as any failure here must be; the reason is logged.
+            PermissionLog.error("permission module \(scheme): the originator is not valid, so the "
+                + "request is denied: \(ErrorDetail.describe(error))")
+            throw PermissionModuleRegistryError.permissionDenied
+        }
 
         let invocationID = UUID()
         let moduleRequest: PermissionModuleRequest
@@ -209,6 +215,8 @@ public actor PermissionModuleRegistry {
                 codec: codec
             )
         } catch {
+            PermissionLog.error("permission module \(scheme): the request could not be prepared, so "
+                + "it is denied: \(ErrorDetail.describe(error))")
             throw PermissionModuleRegistryError.permissionDenied
         }
 
@@ -220,6 +228,9 @@ public actor PermissionModuleRegistry {
             } catch is CancellationError {
                 await gate.resolve(Task.isCancelled ? .cancelled : .denied)
             } catch {
+                // A module that fails denies the request; the module's error is logged.
+                PermissionLog.error("permission module \(scheme) failed, so the request is denied: "
+                    + ErrorDetail.describe(error))
                 await gate.resolve(.denied)
             }
         }

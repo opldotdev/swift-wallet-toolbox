@@ -5,6 +5,7 @@ import ToolboxBRC29
 import BSVScript
 import BSVTransaction
 import BSVWallet
+import ToolboxCore
 import ToolboxStorage
 
 /// Turns a funded action into a transaction ready to sign.
@@ -138,6 +139,8 @@ public enum ActionAssembler {
                 bytes: bytes, maximumByteCount: Int(limits.maximumScriptByteCount)
             )
         } catch {
+            ToolboxLog.error("ToolboxActions", "a \(bytes.count)-byte script was refused: "
+                + ErrorDetail.describe(error))
             throw ActionError.unusableInput("a script exceeds the transaction limits")
         }
     }

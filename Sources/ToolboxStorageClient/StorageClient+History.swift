@@ -58,19 +58,26 @@ extension StorageClient {
     }
 
     private static func decodeActionRow(_ row: JSONValue) -> WalletAction? {
+        // A row that cannot be read is left out of the history; the log says which and why.
         let txidText = row["txid"]?.stringValue ?? ""
-        guard let transactionID = try? TransactionID(displayHex: txidText) else { return nil }
+        guard let transactionID = try? TransactionID(displayHex: txidText) else {
+            Self.log("listActions left out a row whose txid is not a transaction ID: \(txidText)")
+            return nil
+        }
         guard let statusText = row["status"]?.stringValue,
-              let status = decodeActionStatus(statusText) else { return nil }
+              let status = decodeActionStatus(statusText) else {
+            Self.log("listActions left out \(txidText): unknown status \(row["status"]?.stringValue ?? "none")")
+            return nil
+        }
         let satoshis = row["satoshis"]?.intValue ?? 0
         let isOutgoing = row["isOutgoing"]?.boolValue ?? false
         let description = row["description"]?.stringValue ?? ""
         let version = row["version"]?.intValue.flatMap(UInt32.init(exactly:)) ?? 0
         let lockTime = row["lockTime"]?.intValue.flatMap(UInt32.init(exactly:)) ?? 0
-        let labels = try? stringArray(row["labels"], method: "listActions")
-        let inputs = try? decodeActionInputs(row["inputs"])
-        let outputs = try? decodeActionOutputs(row["outputs"])
-        return try? WalletAction(
+        let labels: [String]? = Self.logged(txidText, "labels") { try stringArray(row["labels"], method: "listActions") }
+        let inputs: [WalletActionInput]? = Self.logged(txidText, "inputs") { try decodeActionInputs(row["inputs"]) }
+        let outputs: [WalletActionOutput]? = Self.logged(txidText, "outputs") { try decodeActionOutputs(row["outputs"]) }
+        return Self.logged(txidText, "the action") { try WalletAction(
             transactionID: transactionID,
             satoshis: Int64(satoshis),
             status: status,
@@ -81,7 +88,18 @@ extension StorageClient {
             lockTime: lockTime,
             inputs: inputs,
             outputs: outputs
-        )
+        ) }
+    }
+
+    /// `body`'s value, or nil with the reason logged: a part of a history row that cannot be read
+    /// is left out rather than failing the whole listing.
+    private static func logged<T>(_ txid: String, _ part: String, _ body: () throws -> T?) -> T? {
+        do {
+            return try body()
+        } catch {
+            Self.log("listActions left out \(part) of \(txid): \(ErrorDetail.describe(error))")
+            return nil
+        }
     }
 
     /// Kept separate so unknown wire values fail closed instead of being flattened into a
@@ -113,6 +131,7 @@ extension StorageClient {
             } catch let error as StorageClientError {
                 throw error
             } catch {
+                Self.log("listActions: a row could not be read: \(ErrorDetail.describe(error))")
                 throw StorageClientError.unreadableResponse(method: "listActions")
             }
         }
@@ -143,6 +162,7 @@ extension StorageClient {
             } catch let error as StorageClientError {
                 throw error
             } catch {
+                Self.log("listActions: a row could not be read: \(ErrorDetail.describe(error))")
                 throw StorageClientError.unreadableResponse(method: "listActions")
             }
         }

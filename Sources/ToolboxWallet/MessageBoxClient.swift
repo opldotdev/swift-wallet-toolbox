@@ -11,6 +11,8 @@ public struct MessageBoxClient: Sendable {
     private let wallet: ProtoWallet
     private let transport: any AuthenticatedTransport
     private let basePath: String
+    /// The server's host, for the log.
+    private let serverHost: String
     /// Payment messages this client is accepting now. Copies of a client share it, as one TS
     /// `PeerPayClient` instance does.
     let activePayments = MessageBoxActivePayments()
@@ -20,6 +22,7 @@ public struct MessageBoxClient: Sendable {
         self.wallet = wallet
         self.transport = transport ?? AuthenticatedSession(baseURL: host, wallet: wallet)
         self.basePath = host.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        self.serverHost = host.host ?? host.absoluteString
     }
 
     /// Check permission before creating a transaction. Paid message delivery needs a
@@ -35,14 +38,17 @@ public struct MessageBoxClient: Sendable {
         ]
         let response = try await exchange(method: "GET", path: path("permissions/quote"),
             query: query.percentEncodedQuery.map { "?" + $0 }, headers: [:], body: nil)
-        let object = try parse(response)
+        let object = try parse(response, "GET permissions/quote")
         struct QuoteResponse: Decodable {
             struct Quote: Decodable { let recipientFee: Int; let deliveryFee: Int }
             let quote: Quote
         }
+        // A quote that does not decode is reported as an unreadable response, with the body logged.
         guard let quote = try? JSONDecoder().decode(QuoteResponse.self, from: Data(response.body)).quote,
               quote.recipientFee >= -1, quote.deliveryFee >= 0,
-              object["status"] as? String != "error" else { throw MessageBoxError.invalidResponse }
+              object["status"] as? String != "error" else {
+            throw logged(.invalidResponse, "GET permissions/quote", response, "no valid quote")
+        }
         let recipientFee = quote.recipientFee, deliveryFee = quote.deliveryFee
         guard recipientFee != -1 else { throw MessageBoxError.blocked }
         guard recipientFee == 0, deliveryFee == 0 else { throw MessageBoxError.deliveryFeeRequired }
@@ -88,8 +94,10 @@ public struct MessageBoxClient: Sendable {
         let request = try encoder.encode(["message": envelope])
         let response = try await exchange(method: "POST", path: path("sendMessage"),
             query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
-        let object = try parse(response)
-        guard object["status"] as? String == "success" else { throw MessageBoxError.rejected }
+        let object = try parse(response, "POST sendMessage")
+        guard object["status"] as? String == "success" else {
+            throw logged(.rejected, "POST sendMessage", response, "status is not success")
+        }
     }
 
     /// Lists one box on this server, following `hasMore` pages as the TS client does. A stored
@@ -148,8 +156,17 @@ public struct MessageBoxClient: Sendable {
               start >= 0, Int64(start) <= Self.maximumListOffset else { throw MessageBoxError.invalidMessage }
         var rows: [ListedRow] = []
         var skipped = 0
+        var firstSkipped: String?
         var received = 0
         var offset = start
+        // Skipped rows stay on the server and come back on every listing, so a listing logs them
+        // once, as a count with the first one.
+        defer {
+            if let firstSkipped {
+                log("POST listMessages on \(serverHost): skipped \(skipped) unreadable row(s) in "
+                    + "\(messageBox); the first \(firstSkipped)")
+            }
+        }
         for _ in 0..<maxPages {
             let remaining = limit.map { $0 - received }
             var fields: [String: Any] = [
@@ -159,19 +176,29 @@ public struct MessageBoxClient: Sendable {
             let request = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
             let response = try await exchange(method: "POST", path: path("listMessages"),
                 query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
-            let object = try parse(response)
-            guard let page = object["messages"] as? [Any] else { throw MessageBoxError.invalidResponse }
+            let object = try parse(response, "POST listMessages")
+            guard let page = object["messages"] as? [Any] else {
+                throw logged(.invalidResponse, "POST listMessages", response, "no messages array")
+            }
             let taken = remaining.map { Array(page.prefix($0)) } ?? page
             received += taken.count
-            for item in taken {
+            for (index, item) in taken.enumerated() {
+                // A row that cannot be read fails the listing, and the log names it; or it is
+                // counted in `skipped`, and the one line logged for the listing names the first.
+                // The init's only error is `invalidResponse`: the row's ID, sender or body could
+                // not be read.
                 if let row = item as? [String: Any], let sender = row["sender"] as? String,
                    let message = try? MessageBoxMessage(row: row) {
                     rows.append(ListedRow(message: message, rawSender: sender))
-                } else if skipMalformed {
-                    skipped += 1
-                } else {
+                    continue
+                }
+                let place = "at offset \(offset + index)\(Self.rowID(item))"
+                guard skipMalformed else {
+                    log("POST listMessages on \(serverHost): an unreadable row in \(messageBox) \(place)")
                     throw MessageBoxError.invalidResponse
                 }
+                skipped += 1
+                if firstSkipped == nil { firstSkipped = place }
             }
             let hasMore = object["hasMore"] as? Bool == true
             let cut = taken.count < page.count
@@ -186,6 +213,12 @@ public struct MessageBoxClient: Sendable {
             }
         }
         return (rows, true, offset, skipped)
+    }
+
+    /// A listed row's message ID for the log, when it has one, kept short.
+    private static func rowID(_ item: Any) -> String {
+        guard let row = item as? [String: Any], let id = row["messageId"] else { return "" }
+        return " (messageId \(ErrorDetail.oneLine("\(id)", limit: 80)))"
     }
 
     /// `Number.MAX_SAFE_INTEGER`, the largest offset TS sends.
@@ -205,7 +238,7 @@ public struct MessageBoxClient: Sendable {
         let request = try JSONSerialization.data(withJSONObject: ["messageIds": unique], options: [.sortedKeys])
         let response = try await exchange(method: "POST", path: path("acknowledgeMessage"),
             query: nil, headers: ["Content-Type": "application/json"], body: Array(request))
-        _ = try parse(response)
+        _ = try parse(response, "POST acknowledgeMessage")
     }
 
     /// The plaintext of a listed message: decrypted when the body is `{"encryptedMessage": …}`,
@@ -236,12 +269,13 @@ public struct MessageBoxClient: Sendable {
         do {
             response = try await transport.send(method: "POST", path: path(trimmed),
                 query: nil, headers: ["Content-Type": contentType], body: body)
-        } catch AuthTransportError.unauthenticatedReply(let status, _) {
+        } catch AuthTransportError.unauthenticatedReply(let status, _, _) {
             // A refusal from in front of the server's auth is still that status to these callers.
+            // The transport has logged the call and its body.
             throw MessageBoxError.httpStatus(status)
         }
         guard (200..<300).contains(response.statusCode) else {
-            throw MessageBoxError.httpStatus(response.statusCode)
+            throw logged(.httpStatus(response.statusCode), "POST \(trimmed)", response, "error status")
         }
         return response.body
     }
@@ -255,7 +289,8 @@ public struct MessageBoxClient: Sendable {
     ) async throws -> AuthenticatedResponse {
         do {
             return try await transport.send(method: method, path: path, query: query, headers: headers, body: body)
-        } catch AuthTransportError.unauthenticatedReply(let status, let body) {
+        } catch AuthTransportError.unauthenticatedReply(let status, let body, _) {
+            // The transport has logged the call and its body.
             throw Self.refusal(status: status, body: body)
         }
     }
@@ -265,6 +300,7 @@ public struct MessageBoxClient: Sendable {
     /// `{"code": …}` (message-box-server and the 1Sat host) and kept only when it is a short
     /// identifier, since an unsigned body is shown, never trusted.
     static func refusal(status: Int, body: [UInt8]) -> MessageBoxError {
+        // A body that is not JSON names no code: the bare status is the answer.
         let object = try? JSONSerialization.jsonObject(with: Data(body)) as? [String: Any]
         guard let code = object?["code"] as? String, !code.isEmpty, code.utf8.count <= 64,
               code.unicodeScalars.allSatisfy({
@@ -310,15 +346,38 @@ public struct MessageBoxClient: Sendable {
         return Int(double)
     }
 
-    private func parse(_ response: AuthenticatedResponse) throws -> [String: Any] {
+    private func parse(_ response: AuthenticatedResponse, _ call: String) throws -> [String: Any] {
         guard (200..<300).contains(response.statusCode) else {
-            throw Self.refusal(status: response.statusCode, body: response.body)
+            throw logged(
+                Self.refusal(status: response.statusCode, body: response.body), call, response, "error status"
+            )
         }
-        guard let object = try JSONSerialization.jsonObject(with: Data(response.body)) as? [String: Any] else {
-            throw MessageBoxError.invalidResponse
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: Data(response.body))
+        } catch {
+            throw logged(.invalidResponse, call, response, "not JSON: \(ErrorDetail.describe(error))")
         }
-        guard object["status"] as? String != "error" else { throw MessageBoxError.rejected }
+        guard let object = parsed as? [String: Any] else {
+            throw logged(.invalidResponse, call, response, "not a JSON object")
+        }
+        guard object["status"] as? String != "error" else {
+            throw logged(.rejected, call, response, "status is error")
+        }
         return object
+    }
+
+    /// Logs a failed call with its host, status and body, and returns the error to throw.
+    private func logged(
+        _ error: MessageBoxError, _ call: String, _ response: AuthenticatedResponse, _ why: String
+    ) -> MessageBoxError {
+        log("\(call) on \(serverHost) answered HTTP \(response.statusCode) (\(why)): "
+            + "\(ErrorDetail.describe(error)); body: \(ErrorDetail.bodyPreview(response.body))")
+        return error
+    }
+
+    private func log(_ message: String) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", message)
     }
 }
 

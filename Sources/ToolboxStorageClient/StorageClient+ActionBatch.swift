@@ -254,6 +254,7 @@ extension StorageClient: ActionBatchStorage {
         do {
             return try byteArray(value)
         } catch {
+            Self.log("\(method): a byte array could not be read: \(ErrorDetail.describe(error))")
             throw StorageClientError.unreadableResponse(method: method)
         }
     }

@@ -4,6 +4,7 @@ import BSVScript
 import BSVTransaction
 import BSVWallet
 import ToolboxBRC29
+import ToolboxCore
 import ToolboxStorage
 
 /// Signs the inputs a funded action spends.
@@ -107,7 +108,9 @@ public enum ActionSigner {
             } catch {
                 // The SDK refuses when the derived key does not hash to the script it is unlocking.
                 // That means the derivation and the output disagree, which is worth saying plainly
-                // rather than reporting as a signature failure.
+                // rather than reporting as a signature failure. The SDK's own error is logged.
+                ToolboxLog.error("ToolboxActions", "signing input \(index) failed: "
+                    + ErrorDetail.describe(error))
                 throw ActionError.unusableInput(
                     "input \(index) is not locked to the key its derivation produces"
                 )
@@ -201,6 +204,8 @@ public enum ActionSigner {
                         lockPosition: .beforeCompatibility
                     )
                 } catch {
+                    ToolboxLog.error("ToolboxActions", "permission token \(outpoint) did not decode: "
+                        + ErrorDetail.describe(error))
                     throw ActionError.unusableInput(
                         "permission token \(outpoint) is not a BRC-48 PushDrop output"
                     )

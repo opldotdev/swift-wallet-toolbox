@@ -1,3 +1,5 @@
+import Foundation
+
 /// Resource and KDF bounds applied before a BRC-39 importer allocates KDF memory or decrypts data.
 public struct BRC39Limits: Equatable, Sendable {
     public let maximumFileByteCount: Int
@@ -145,4 +147,24 @@ public enum BRC39Error: Error, Equatable, Sendable {
     case memoryTooLarge
     case parallelismTooLarge
     case invalidCiphertext
+}
+
+extension BRC39Error: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .fileTooLarge(let maximum):
+            "This backup file is larger than the \(maximum)-byte limit."
+        case .tooShort, .badMagic:
+            "This is not an encrypted wallet backup file."
+        case .unsupportedFormatVersion, .unsupportedProtectorType, .unsupportedInnerFormat, .unsupportedKDF:
+            "This backup was made by a newer or different wallet and can't be opened here."
+        case .invalidCiphertext:
+            "This backup file is damaged: its encrypted part is incomplete."
+        case .invalidFlags, .nonzeroReservedBytes, .invalidSaltLength, .invalidNonceLength,
+             .invalidIterations, .invalidMemory, .invalidParallelism, .invalidDerivedKeyLength:
+            "This backup file's header is damaged, so it can't be opened."
+        case .iterationsTooLarge, .memoryTooLarge, .parallelismTooLarge:
+            "This backup asks for more work to unlock than this device allows, so it can't be opened."
+        }
+    }
 }

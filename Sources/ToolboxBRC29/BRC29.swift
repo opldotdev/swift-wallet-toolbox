@@ -41,3 +41,13 @@ public enum BRC29Error: Error, Equatable, Sendable {
     /// rebuilt. Reported rather than guessed: guessing here spends the wrong output or none.
     case incompleteDerivation
 }
+
+extension BRC29Error: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notImplemented(let operation): "This wallet does not support \(operation) yet."
+        case .incompleteDerivation:
+            "A saved coin is missing half of its key derivation, so the wallet can't spend it."
+        }
+    }
+}

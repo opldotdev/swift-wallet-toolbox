@@ -1,4 +1,5 @@
 import BSVWallet
+import ToolboxCore
 
 /// The BRC-100 operations whose state is owned entirely by storage.
 extension RemoteWallet {
@@ -8,37 +9,52 @@ extension RemoteWallet {
         _ request: WalletListActionsRequest
     ) async throws -> WalletListActionsResult {
         let result = try await storage.listActions(auth, request)
-        let actions: [WalletAction] = result.actions.compactMap { action in
+        // A row the BRC-100 types refuse is left out of the listing, and the reason is logged.
+        let actions: [WalletAction] = result.actions.compactMap { action -> WalletAction? in
             let outputs = action.outputs.map { rows in
-                rows.compactMap { output in
-                    try? WalletActionOutput(
-                        satoshis: output.satoshis,
-                        lockingScript: output.lockingScript,
-                        spendable: output.spendable,
-                        customInstructions: nil,
-                        tags: output.tags,
-                        outputIndex: output.outputIndex,
-                        outputDescription: output.outputDescription,
-                        basket: output.basket
-                    )
+                rows.compactMap { output -> WalletActionOutput? in
+                    do {
+                        return try WalletActionOutput(
+                            satoshis: output.satoshis,
+                            lockingScript: output.lockingScript,
+                            spendable: output.spendable,
+                            customInstructions: nil,
+                            tags: output.tags,
+                            outputIndex: output.outputIndex,
+                            outputDescription: output.outputDescription,
+                            basket: output.basket
+                        )
+                    } catch {
+                        Self.logDroppedRow("an output of action \(action.transactionID)", error)
+                        return nil
+                    }
                 }
             }
-            return try? WalletAction(
-                transactionID: action.transactionID,
-                satoshis: action.satoshis,
-                status: action.status,
-                isOutgoing: action.isOutgoing,
-                description: action.description,
-                labels: action.labels,
-                version: action.version,
-                lockTime: action.lockTime,
-                inputs: action.inputs,
-                outputs: outputs
-            )
+            do {
+                return try WalletAction(
+                    transactionID: action.transactionID,
+                    satoshis: action.satoshis,
+                    status: action.status,
+                    isOutgoing: action.isOutgoing,
+                    description: action.description,
+                    labels: action.labels,
+                    version: action.version,
+                    lockTime: action.lockTime,
+                    inputs: action.inputs,
+                    outputs: outputs
+                )
+            } catch {
+                Self.logDroppedRow("action \(action.transactionID)", error)
+                return nil
+            }
         }
         do {
             return try WalletListActionsResult(totalActions: result.totalActions, actions: actions)
         } catch {
+            ToolboxLog.error("ToolboxWallet", "listActions: the result was refused with inputs and "
+                + "outputs, so they are left out: \(ErrorDetail.describe(error))")
+            // Each row was accepted above with more fields; one refused with fewer is a row the
+            // result could not hold either way, and the failure above is already logged.
             let stripped = actions.compactMap { action in
                 try? WalletAction(
                     transactionID: action.transactionID,
@@ -53,6 +69,10 @@ extension RemoteWallet {
             }
             return try WalletListActionsResult(totalActions: result.totalActions, actions: stripped)
         }
+    }
+
+    private static func logDroppedRow(_ what: String, _ error: any Error) {
+        ToolboxLog.error("ToolboxWallet", "listActions left out \(what): \(ErrorDetail.describe(error))")
     }
 
     /// Abandons an unfinished action and returns storage's actual decision. A signed `noSend`

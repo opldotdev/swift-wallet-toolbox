@@ -15,3 +15,11 @@ public protocol MonitorTask: Sendable {
 public enum MonitorError: Error, Equatable, Sendable {
     case notImplemented(String)
 }
+
+extension MonitorError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notImplemented(let task): "Background task \(task) is not available yet."
+        }
+    }
+}

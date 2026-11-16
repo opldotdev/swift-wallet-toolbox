@@ -40,7 +40,7 @@ let package = Package(
         // moves when we mean it to, which is also when we re-run conformance.
         .package(
             url: "https://github.com/opldotdev/swift-sdk.git",
-            revision: "fcfb0daeb30d6d69ed4a1ae4a619afef07a22f6c"
+            revision: "89e40eed1d9d8fc1039ac1b5229915b2f7655c31"
         )
     ],
     targets: [
@@ -157,6 +157,7 @@ let package = Package(
         .target(
             name: "ToolboxPermissions",
             dependencies: [
+                "ToolboxCore",
                 .product(name: "BSVCore", package: "swift-sdk"),
                 .product(name: "BSVCrypto", package: "swift-sdk"),
                 .product(name: "BSVKeys", package: "swift-sdk"),

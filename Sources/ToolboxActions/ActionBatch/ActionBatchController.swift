@@ -186,13 +186,13 @@ public actor ActionBatchController {
         } catch let error as WireError {
             throw error
         } catch {
-            _ = try? await storage.abortActionBatch(auth, batchId: batchId)
+            await abortQuietly(auth, batchId: batchId, after: error)
             throw error
         }
         do {
             state = try PlannerState(begin: begin, firstActionBEEF: request.inputBEEF)
         } catch {
-            _ = try? await storage.abortActionBatch(auth, batchId: begin.batchId)
+            await abortQuietly(auth, batchId: begin.batchId, after: error)
             throw error
         }
         let workspace = ActionBatchWorkspace(auth: auth, capabilities: capabilities, state: state)
@@ -207,7 +207,10 @@ public actor ActionBatchController {
         do {
             read = try await storage.actionBatchCapabilities()
         } catch {
+            // Storage that cannot say falls back to unbatched actions; the reason is logged.
             read = nil
+            ToolboxLog.error("ToolboxActions", "action batch capabilities could not be read, so "
+                + "actions are not batched: \(ErrorDetail.describe(error))")
         }
         // Format-1 manifests are not built here, so only storage that takes format 2 is batched.
         let usable = read.flatMap { $0.version == 1 && $0.manifestVersion == 2 ? $0 : nil }
@@ -378,12 +381,29 @@ public actor ActionBatchController {
         }
     }
 
+    /// Best effort abort after `error`, which the caller throws; a failed release is logged.
+    private func abortQuietly(_ auth: AuthID, batchId: String, after error: Error) async {
+        do {
+            _ = try await storage.abortActionBatch(auth, batchId: batchId)
+        } catch let abortError {
+            ToolboxLog.error("ToolboxActions", "beginning action batch \(batchId) failed "
+                + "(\(ErrorDetail.describe(error))) and abortActionBatch did not release it: "
+                + ErrorDetail.describe(abortError))
+        }
+    }
+
     /// Aborts in storage, best effort, and forgets the batch. `true` when storage released it.
     @discardableResult
     private func retire(_ workspace: ActionBatchWorkspace, _ auth: AuthID? = nil) async -> Bool {
         var released = false
         if !workspace.committed {
-            released = (try? await storage.abortActionBatch(auth ?? workspace.auth, batchId: workspace.batchId)) ?? false
+            do {
+                released = try await storage.abortActionBatch(auth ?? workspace.auth, batchId: workspace.batchId)
+            } catch {
+                // Best effort, reported to the caller as `false`; the reason is logged.
+                ToolboxLog.error("ToolboxActions", "abortActionBatch \(workspace.batchId) failed: "
+                    + ErrorDetail.describe(error))
+            }
         }
         if self.workspace === workspace { self.workspace = nil }
         return released

@@ -1,4 +1,5 @@
 import Foundation
+import ToolboxCore
 
 /// An ordered list of providers answering the same question.
 ///
@@ -41,6 +42,8 @@ public struct ServiceQueue<Answer: Sendable>: Sendable {
                 return try await provider.answer()
             } catch {
                 failures.append((provider: provider.name, reason: String(describing: error)))
+                ToolboxLog.error("ToolboxServices", "provider \(provider.name) failed: "
+                    + ErrorDetail.describe(error))
             }
         }
         throw ServiceError.allProvidersFailed(failures)

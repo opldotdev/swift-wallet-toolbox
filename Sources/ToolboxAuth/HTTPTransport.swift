@@ -1,4 +1,5 @@
 import Foundation
+import ToolboxCore
 
 #if canImport(FoundationNetworking)
     import FoundationNetworking
@@ -81,8 +82,9 @@ public struct URLSessionHTTPTransport: HTTPTransport {
 #else
         let (data, response) = try await session.data(for: urlRequest)
 #endif
+        let call = "\(request.method) \(ErrorDetail.hostPath(request.url))"
         guard let http = response as? HTTPURLResponse else {
-            throw AuthTransportError.transportFailed("the response was not HTTP")
+            throw Self.logged(.transportFailed("\(call): the response was not HTTP"))
         }
 
 #if canImport(Darwin)
@@ -92,17 +94,17 @@ public struct URLSessionHTTPTransport: HTTPTransport {
             for try await byte in stream {
                 bytes.append(byte)
                 if bytes.count > maximumResponseBytes {
-                    throw AuthTransportError.transportFailed(
-                        "the response exceeded \(maximumResponseBytes) bytes"
-                    )
+                    throw Self.logged(.transportFailed(
+                        "\(call): the response exceeded \(maximumResponseBytes) bytes"
+                    ))
                 }
             }
         }
 #else
         guard data.count <= maximumResponseBytes else {
-            throw AuthTransportError.transportFailed(
-                "the response exceeded \(maximumResponseBytes) bytes"
-            )
+            throw Self.logged(.transportFailed(
+                "\(call): the response exceeded \(maximumResponseBytes) bytes"
+            ))
         }
         let bytes = Array(data)
 #endif
@@ -114,5 +116,10 @@ public struct URLSessionHTTPTransport: HTTPTransport {
             }
         }
         return HTTPResponse(statusCode: http.statusCode, headers: headers, body: bytes)
+    }
+
+    private static func logged(_ error: AuthTransportError) -> AuthTransportError {
+        ToolboxLog.error("ToolboxAuth", ErrorDetail.describe(error))
+        return error
     }
 }

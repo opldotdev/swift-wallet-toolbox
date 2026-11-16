@@ -149,6 +149,37 @@ public enum MessageBoxPaymentError: Error, LocalizedError, Equatable, Sendable {
     }
 }
 
+extension MessageBoxPaymentError.RecipientPaymentFailure: CustomDebugStringConvertible {
+    /// The carried error as the log holds it, so a URL error's query stays out of the log.
+    public var debugDescription: String {
+        switch self {
+        case .unreadable: "unreadable"
+        case .refused: "refused"
+        case .unavailable(let error): "unavailable(\(ErrorDetail.describe(error)))"
+        }
+    }
+}
+
+/// Payment messages a listing could not open. They stay in the inbox and come back on every
+/// listing, so a listing logs them once, as a count with the first one's ID, sender and reason.
+struct UnopenedPaymentMessages {
+    private(set) var count = 0
+    private(set) var first: String?
+
+    mutating func add(_ row: MessageBoxClient.ListedRow, _ error: any Error) {
+        count += 1
+        if first == nil {
+            first = "\(row.message.messageId) from \(row.rawSender): \(ErrorDetail.describe(error))"
+        }
+    }
+
+    func log() {
+        guard let first else { return }
+        ToolboxLog.error("ToolboxWallet.MessageBox", "\(count) payment message(s) could not be "
+            + "opened; the first, \(first)")
+    }
+}
+
 private extension Equatable {
     /// `other` is this type and equal to `self`. Lets two `any Error` values be compared.
     func isEqualToError(_ other: Any) -> Bool {
@@ -224,11 +255,13 @@ extension MessageBoxClient {
             skipMalformed: true)
         var seen = Set<String>()
         var payments: [MessageBoxIncomingPayment] = []
+        var unopened = UnopenedPaymentMessages()
+        defer { unopened.log() }
         for row in listed.rows {
             guard seen.insert(row.message.messageId).inserted else { continue }
             try Task.checkCancellation()
             try await beforeOpening?()
-            if let payment = await incomingPayment(row) { payments.append(payment) }
+            if let payment = await incomingPayment(row, unopened: &unopened) { payments.append(payment) }
         }
         return MessageBoxPaymentListing(payments: payments, truncated: listed.truncated, nextOffset: listed.nextOffset,
             skipped: listed.skipped)
@@ -295,7 +328,10 @@ extension MessageBoxClient {
                 try await beforeAcknowledge?()
                 try await acknowledge(messageIds: [incoming.messageId])
             } catch {
+                // Reported as `acknowledged: false`: the funds are in; the reason goes to the log.
                 acknowledged = false
+                ToolboxLog.error("ToolboxWallet.MessageBox", "payment message \(incoming.messageId) "
+                    + "was internalized but not acknowledged: \(ErrorDetail.describe(error))")
             }
             await activePayments.end(messageId)
             return MessageBoxAcceptedPayment(payment: incoming, recipientPaymentInternalized: recipientPaymentInternalized,
@@ -315,8 +351,10 @@ extension MessageBoxClient {
             messageId: messageId, skipMalformed: true)
         guard !listed.truncated else { throw MessageBoxPaymentError.notInInbox }
         var matches: [(MessageBoxIncomingPayment, MessageBoxMessage)] = []
+        var unopened = UnopenedPaymentMessages()
+        defer { unopened.log() }
         for row in listed.rows where row.message.messageId == messageId {
-            if let payment = await incomingPayment(row) { matches.append((payment, row.message)) }
+            if let payment = await incomingPayment(row, unopened: &unopened) { matches.append((payment, row.message)) }
         }
         guard matches.count == 1 else { throw MessageBoxPaymentError.notInInbox }
         return matches[0]
@@ -496,6 +534,7 @@ extension MessageBoxClient {
         } catch let error as MessageBoxPaymentError {
             throw error
         } catch {
+            Self.log("an envelope payment could not be read: \(ErrorDetail.describe(error))")
             throw MessageBoxPaymentError.recipientPaymentFailed(.unreadable)
         }
     }
@@ -503,7 +542,12 @@ extension MessageBoxClient {
     /// A transaction that could not be read: `refused` when it only goes past a `StorageLimits`
     /// bound (size, counts, script length), `unreadable` otherwise.
     static func recipientPaymentReadFailure(_ error: any Error) -> MessageBoxPaymentError {
-        .recipientPaymentFailed(exceedsLimits(error) ? .refused : .unreadable)
+        Self.log("an envelope payment's transaction could not be read: \(ErrorDetail.describe(error))")
+        return .recipientPaymentFailed(exceedsLimits(error) ? .refused : .unreadable)
+    }
+
+    private static func log(_ message: String) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", message)
     }
 
     private static func exceedsLimits(_ error: any Error) -> Bool {
@@ -548,9 +592,13 @@ extension MessageBoxClient {
             result = try await wallet.internalizeAction(request)
         } catch {
             if isCancellation(error) { throw CancellationError() }
+            Self.log("the wallet did not internalize an envelope payment: \(ErrorDetail.describe(error))")
             throw MessageBoxPaymentError.recipientPaymentFailed(isUndecided(error) ? .unavailable(error) : .refused)
         }
-        guard result.accepted else { throw MessageBoxPaymentError.recipientPaymentFailed(.refused) }
+        guard result.accepted else {
+            Self.log("the wallet answered accepted: false for an envelope payment")
+            throw MessageBoxPaymentError.recipientPaymentFailed(.refused)
+        }
     }
 
     /// A wallet call failed before anything was decided about the payment: a cancellation, or
@@ -603,8 +651,18 @@ extension MessageBoxClient {
         error is URLError || error._domain == NSURLErrorDomain
     }
 
-    private func incomingPayment(_ row: ListedRow) async -> MessageBoxIncomingPayment? {
-        guard let plaintext = try? await open(row.message) else { return nil }
+    private func incomingPayment(
+        _ row: ListedRow, unopened: inout UnopenedPaymentMessages
+    ) async -> MessageBoxIncomingPayment? {
+        let plaintext: String
+        do {
+            plaintext = try await open(row.message)
+        } catch {
+            // A message this wallet cannot open is not listed as a payment; the listing's log
+            // line counts it.
+            unopened.add(row, error)
+            return nil
+        }
         return MessageBoxIncomingPayment.decode(messageId: row.message.messageId, sender: row.rawSender, plaintext: plaintext)
     }
 
@@ -651,6 +709,7 @@ extension MessageBoxClient {
                 throw MessageBoxPaymentError.settlementFailed
             }
         } catch MessageBoxPaymentError.settlementFailed {
+            logSettlementFailure(payment, MessageBoxPaymentError.settlementFailed)
             throw MessageBoxPaymentError.settlementFailed
         } catch let error where isCancellation(error) {
             throw CancellationError()
@@ -658,10 +717,18 @@ extension MessageBoxClient {
             // Storage that is not the user's active storage refused the write before it looked at
             // the payment. That is no verdict on the token, and the person can fix it.
             if case .notActive = error { throw error }
+            logSettlementFailure(payment, error)
             throw MessageBoxPaymentError.settlementFailed
         } catch {
+            logSettlementFailure(payment, error)
             throw MessageBoxPaymentError.settlementFailed
         }
+    }
+
+    /// TS reports every settlement failure as the one error; the cause it replaced goes to the log.
+    private static func logSettlementFailure(_ payment: MessageBoxIncomingPayment, _ error: any Error) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", "settling payment message \(payment.messageId) "
+            + "from \(payment.sender) failed: \(ErrorDetail.describe(error))")
     }
 }
 

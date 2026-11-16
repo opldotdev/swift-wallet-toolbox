@@ -20,21 +20,40 @@ public struct WhatsOnChainExchangeRate: Sendable {
 
         let (status, body) = try await http.get(url)
         guard (200..<300).contains(status) else {
+            Self.log(url, status, body, "error status")
             throw ExchangeRateError.httpFailure(statusCode: status)
         }
 
+        // A body that does not decode is reported as unreadable, with the body logged.
         guard body.count <= Self.maximumResponseBytes,
               let value = try? JSONDecoder().decode(JSONValue.self, from: Data(body)),
               let rate = value["rate"]?.doubleValue,
               rate.isFinite, rate > 0 else {
+            Self.log(url, status, body, "no positive rate")
             throw ExchangeRateError.unreadableResponse
         }
         return rate
     }
 }
 
+extension WhatsOnChainExchangeRate {
+    static func log(_ url: URL, _ status: Int, _ body: [UInt8], _ why: String) {
+        ToolboxLog.error("ToolboxServices", "exchange rate: GET \(ErrorDetail.hostPath(url)) answered "
+            + "HTTP \(status) (\(why)); body: \(ErrorDetail.bodyPreview(body))")
+    }
+}
+
 /// Exchange-rate failures stay typed so callers can distinguish bad data from provider downtime.
-public enum ExchangeRateError: Error, Equatable, Sendable {
+public enum ExchangeRateError: Error, Equatable, Sendable, LocalizedError {
     case unreadableResponse
     case httpFailure(statusCode: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unreadableResponse:
+            "WhatsOnChain sent an exchange rate this wallet could not read."
+        case .httpFailure(let status):
+            "WhatsOnChain could not provide the exchange rate (HTTP \(status)). Try again later."
+        }
+    }
 }

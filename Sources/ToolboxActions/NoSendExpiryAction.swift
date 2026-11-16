@@ -6,6 +6,7 @@ import BSVTransaction
 import BSVWallet
 import ToolboxBRC29
 import ToolboxStorage
+import ToolboxCore
 
 /// Creates a BRC-177 protected `noSend` action, the way the reference client's
 /// `createNoSendExpiryAction` does.
@@ -306,9 +307,19 @@ public enum NoSendExpiryAction {
         }
     }
 
+    /// Best effort: callers are already throwing the failure that stopped them. A release that
+    /// fails is logged, since it leaves the inputs locked until storage expires them.
     static func abort(_ reference: String, storage: any NoSendExpiryStorage, auth: AuthID) async {
-        guard let bytes = Data(base64Encoded: reference),
-              let encoded = try? WalletBase64Data(Array(bytes)) else { return }
-        _ = try? await storage.abortAction(auth, WalletAbortActionRequest(reference: encoded))
+        do {
+            guard let bytes = Data(base64Encoded: reference) else {
+                ToolboxLog.error("ToolboxActions", "no-send expiry abort: the reference is not base64")
+                return
+            }
+            let encoded = try WalletBase64Data(Array(bytes))
+            _ = try await storage.abortAction(auth, WalletAbortActionRequest(reference: encoded))
+        } catch {
+            ToolboxLog.error("ToolboxActions",
+                "no-send expiry abortAction did not release its inputs: \(ErrorDetail.describe(error))")
+        }
     }
 }

@@ -174,3 +174,12 @@ public enum StorageError: Error, Equatable, Sendable {
     case notImplemented(String)
     case notAvailable
 }
+
+extension StorageError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notImplemented(let operation): "This wallet storage does not support \(operation)."
+        case .notAvailable: "The wallet storage is not available yet. Try again."
+        }
+    }
+}

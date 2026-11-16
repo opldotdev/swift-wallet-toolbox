@@ -1,5 +1,6 @@
 import BSVKeys
 import Foundation
+import ToolboxCore
 
 #if canImport(FoundationNetworking)
     import FoundationNetworking
@@ -44,6 +45,27 @@ public enum UTXOSourceError: Error, Equatable, Sendable {
     /// spendable. Never recoverable by retrying.
     case missingScript(txid: String, vout: UInt32)
     case httpFailure(provider: String, statusCode: Int)
+    /// The address is not one this provider can list outputs for (not a P2PKH address).
+    case invalidAddress(String)
+}
+
+extension UTXOSourceError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .unreadableResponse(let provider):
+            "\(provider) sent a list of coins this wallet could not read."
+        case .missingScript(let txid, let vout):
+            "The coin \(txid):\(vout) has no locking script, so it cannot be spent."
+        case .httpFailure(let provider, let status) where status == 0:
+            "\(provider) did not send an HTTP answer. Try again later."
+        case .httpFailure(let provider, let status) where status >= 500 || status == 429:
+            "\(provider) could not list the coins (HTTP \(status)). Try again later."
+        case .httpFailure(let provider, let status):
+            "\(provider) refused to list the coins (HTTP \(status))."
+        case .invalidAddress:
+            "That is not an address coins can be listed for."
+        }
+    }
 }
 
 /// A bare HTTP GET, injectable so a provider can be tested without a network.
@@ -69,6 +91,7 @@ public struct URLSessionHTTPGet: HTTPGet {
         let (data, response) = try await session.data(from: url)
 #endif
         guard let http = response as? HTTPURLResponse else {
+            ToolboxLog.error("ToolboxServices", "GET \(ErrorDetail.hostPath(url)): the response was not HTTP")
             throw UTXOSourceError.httpFailure(provider: url.host ?? "http", statusCode: 0)
         }
 #if canImport(Darwin)
@@ -76,6 +99,8 @@ public struct URLSessionHTTPGet: HTTPGet {
         for try await byte in stream {
             bytes.append(byte)
             if bytes.count > maximumResponseBytes {
+                ToolboxLog.error("ToolboxServices", "GET \(ErrorDetail.hostPath(url)) answered HTTP "
+                    + "\(http.statusCode) with more than \(maximumResponseBytes) bytes")
                 throw UTXOSourceError.httpFailure(
                     provider: url.host ?? "http", statusCode: http.statusCode
                 )
@@ -83,6 +108,8 @@ public struct URLSessionHTTPGet: HTTPGet {
         }
 #else
         guard data.count <= maximumResponseBytes else {
+            ToolboxLog.error("ToolboxServices", "GET \(ErrorDetail.hostPath(url)) answered HTTP "
+                + "\(http.statusCode) with more than \(maximumResponseBytes) bytes")
             throw UTXOSourceError.httpFailure(
                 provider: url.host ?? "http", statusCode: http.statusCode
             )

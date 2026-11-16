@@ -7,6 +7,7 @@ import BSVScript
 import BSVTransaction
 import BSVWallet
 import ToolboxStorage
+import ToolboxCore
 
 /// One of an identity's `ls_messagebox` advertisements, as `@bsv/message-box-client`
 /// `queryAdvertisements` returns an `AdvertisementToken`: the advertised host, the token's
@@ -157,9 +158,20 @@ public struct MessageBoxAdvertiser: Sendable {
                                           returning: [OverlayHost: Steak].self) { group in
             for host in hosts {
                 group.addTask {
-                    guard let steak = try? await facilitator.submit(tagged, to: host),
-                          !steak.instructions.isEmpty else { return (host, nil) }
-                    return (host, steak)
+                    // One host failing is counted in `failedHosts`; its reason goes to the log.
+                    do {
+                        let steak = try await facilitator.submit(tagged, to: host)
+                        guard !steak.instructions.isEmpty else {
+                            ToolboxLog.error("ToolboxWallet.MessageBox",
+                                "advertisement: overlay host \(host) admitted nothing")
+                            return (host, nil)
+                        }
+                        return (host, steak)
+                    } catch {
+                        ToolboxLog.error("ToolboxWallet.MessageBox",
+                            "advertisement: overlay host \(host) refused the submit: \(ErrorDetail.describe(error))")
+                        return (host, nil)
+                    }
                 }
             }
             var answers: [OverlayHost: Steak] = [:]
@@ -383,8 +395,17 @@ public struct MessageBoxAdvertiser: Sendable {
                 spends: spends, options: WalletSignActionOptions(acceptDelayedBroadcast: false)))
         } catch {
             let reference = signable.reference
-            // Not in this task, which may be the cancelled one.
-            await Task { _ = try? await wallet.abortAction(WalletAbortActionRequest(reference: reference)) }.value
+            // Not in this task, which may be the cancelled one. Best effort: the caller gets the
+            // signing failure, and a failed release is logged.
+            await Task {
+                do {
+                    _ = try await wallet.abortAction(WalletAbortActionRequest(reference: reference))
+                } catch let abortError {
+                    ToolboxLog.error("ToolboxWallet.MessageBox", "advertisement signing failed "
+                        + "(\(ErrorDetail.describe(error))) and abortAction did not release its inputs: "
+                        + "\(ErrorDetail.describe(abortError))")
+                }
+            }.value
             throw error
         }
         guard let transaction = signed.transaction else { throw MessageBoxAdvertisementError.noTransaction }

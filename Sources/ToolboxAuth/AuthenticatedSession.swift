@@ -1,6 +1,7 @@
 import Foundation
 import BSVAuth
 import BSVKeys
+import ToolboxCore
 
 /// One authenticated conversation with one peer.
 ///
@@ -72,12 +73,22 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                 // could apply a non-idempotent call twice; the outcome is unknown to the caller.
                 // AuthFetch resends here; this does not. The next send re-handshakes.
                 await forgetSession()
+                Self.log(
+                    "\(Self.describe(requestContext(method: method, path: path))): the peer signed a "
+                        + "reply for a session this side no longer holds; not resent, outcome unknown"
+                )
                 throw AuthTransportError.sessionExpired
             } catch AuthTransportError.sessionExpired {
                 // AuthFetch retries `Session not found for nonce` and unsigned 401. Both reach
                 // here only from before the peer ran the request. The send lock stays held so a sibling cannot receive against the
                 // session we are about to drop.
-                guard remaining > 0 else { throw AuthTransportError.sessionExpired }
+                guard remaining > 0 else {
+                    Self.log(
+                        "\(Self.describe(requestContext(method: method, path: path))): the session "
+                            + "expired again after \(Self.sessionRecoveryRetries) re-handshakes"
+                    )
+                    throw AuthTransportError.sessionExpired
+                }
                 remaining -= 1
                 await forgetSession()
             }
@@ -115,18 +126,45 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         }
 
         let frame = try BRC104HTTPFrameCodec.encodeRequest(message)
-        let response = try await transport.send(
-            HTTPRequest(
-                method: frame.method,
-                url: url(forPath: frame.path, query: frame.query),
-                headers: Dictionary(
-                    frame.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
-                ),
-                body: frame.body
+        let context = requestContext(method: method, path: path)
+        let response: HTTPResponse
+        do {
+            response = try await transport.send(
+                HTTPRequest(
+                    method: frame.method,
+                    url: url(forPath: frame.path, query: frame.query),
+                    headers: Dictionary(
+                        frame.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
+                    ),
+                    body: frame.body
+                )
             )
-        )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            Self.log("\(Self.describe(context)) did not get a reply: \(ErrorDetail.describe(error))")
+            throw error
+        }
 
-        return try await unwrap(response, expecting: requestID)
+        return try await unwrap(response, expecting: requestID, for: context)
+    }
+
+    /// The call as the log and ``AuthTransportError/unauthenticatedReply(status:body:request:)``
+    /// name it. The query is left out: it can carry a token.
+    private nonisolated func requestContext(method: String, path: String) -> AuthRequestContext {
+        AuthRequestContext(
+            method: method,
+            host: baseURL.host.map { host in baseURL.port.map { "\(host):\($0)" } ?? host } ?? "?",
+            path: path.hasPrefix("/") ? path : "/" + path
+        )
+    }
+
+    private static func describe(_ context: AuthRequestContext) -> String {
+        "\(context.method) \(ErrorDetail.hostPath(host: context.host, path: context.path))"
+    }
+
+    private static func log(_ message: String) {
+        ToolboxLog.error("ToolboxAuth", message)
     }
 
     private func forgetSession() async {
@@ -186,8 +224,11 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     private func performHandshake() async throws -> AuthSessionID {
         let (session, actions) = try await authenticator.beginAuthentication(with: expectedPeer)
         guard case .send(let request) = actions.first else {
-            throw AuthTransportError.handshakeFailed("the authenticator opened no request")
+            throw Self.logged(.handshakeFailed("the authenticator opened no request"))
         }
+        let handshakeCall = Self.describe(
+            requestContext(method: "POST", path: BRC104HTTPHeaderName.handshakePath)
+        )
 
         do {
             let response = try await transport.send(
@@ -198,15 +239,22 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                     body: try AuthMessageCodec.encode(request)
                 )
             )
+            // Handshake bodies are logged by length only: they are auth frames.
             guard (200..<300).contains(response.statusCode) else {
-                throw AuthTransportError.handshakeFailed("the peer answered \(response.statusCode)")
+                throw Self.logged(.handshakeFailed(
+                    "\(handshakeCall) answered HTTP \(response.statusCode) "
+                        + "(\(response.body.count) bytes)"
+                ))
             }
 
             let reply: AuthMessage
             do {
                 reply = try AuthMessageCodec.decode(response.body)
             } catch {
-                throw AuthTransportError.handshakeFailed("the peer's reply could not be read")
+                throw Self.logged(.handshakeFailed(
+                    "\(handshakeCall) answered HTTP \(response.statusCode) with a reply that could "
+                        + "not be read (\(response.body.count) bytes): \(ErrorDetail.describe(error))"
+                ))
             }
             // Verifying the reply is the authenticator's job, and it throws when the signature does
             // not cover our nonce. Reaching the next line means the peer holds the key it claims.
@@ -217,10 +265,15 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             }
 
             guard await authenticator.session(session) != nil else {
-                throw AuthTransportError.handshakeFailed("the peer's reply did not open a session")
+                throw Self.logged(.handshakeFailed(
+                    "\(handshakeCall): the peer's reply did not open a session"
+                ))
             }
             return session
         } catch {
+            if !(error is AuthTransportError), !(error is CancellationError) {
+                Self.log("\(handshakeCall) failed: \(ErrorDetail.describe(error))")
+            }
             await authenticator.close(session)
             throw error
         }
@@ -234,7 +287,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// returns an unsigned body, or a body for a different request, has failed — and returning it
     /// anyway would defeat the point of every step above.
     private func unwrap(
-        _ response: HTTPResponse, expecting requestID: [UInt8]
+        _ response: HTTPResponse, expecting requestID: [UInt8], for context: AuthRequestContext
     ) async throws -> AuthenticatedResponse {
         // A 401 with no auth frame is the peer saying the session is gone before the
         // application method ran. AuthFetch retries that case. A 200 with no auth frame
@@ -247,10 +300,11 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         // leave the caller naming the wrong cause.
         if !(200..<300).contains(response.statusCode),
            response.header(BRC104HTTPHeaderName.version) == nil {
-            throw AuthTransportError.unauthenticatedReply(
+            throw Self.logged(.unauthenticatedReply(
                 status: response.statusCode,
-                body: Array(response.body.prefix(Self.unauthenticatedBodyPreviewBytes))
-            )
+                body: Array(response.body.prefix(Self.unauthenticatedBodyPreviewBytes)),
+                request: context
+            ))
         }
 
         let frame = try BRC104HTTPResponseFrame(
@@ -265,9 +319,10 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         } catch {
             // The underlying reason travels with it. "Not authenticated" alone cannot be acted
             // on; knowing which header or field failed can.
-            throw AuthTransportError.responseNotAuthenticated(
-                "the reply carried no valid auth frame: \(error)"
-            )
+            throw Self.logged(.responseNotAuthenticated(
+                "\(Self.describe(context)) answered HTTP \(response.statusCode) with no valid auth "
+                    + "frame: \(ErrorDetail.describe(error))"
+            ))
         }
 
         let actions: [AuthPeerAction]
@@ -281,11 +336,22 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             if case .deliver = $0 { return true }
             return false
         }) else {
-            throw AuthTransportError.responseNotAuthenticated("the reply delivered no payload")
+            throw Self.logged(.responseNotAuthenticated(
+                "\(Self.describe(context)): the reply delivered no payload"
+            ))
         }
 
-        let inner = try BRC104Codec.decodeResponse(delivered.payload)
-        try BRC104Codec.requireCorrelation(requestID: requestID, response: inner)
+        let inner: BRC104Response
+        do {
+            inner = try BRC104Codec.decodeResponse(delivered.payload)
+            try BRC104Codec.requireCorrelation(requestID: requestID, response: inner)
+        } catch {
+            Self.log(
+                "\(Self.describe(context)): the signed reply could not be read as the response to "
+                    + "this request: \(ErrorDetail.describe(error))"
+            )
+            throw error
+        }
 
         return AuthenticatedResponse(
             statusCode: inner.status,
@@ -365,6 +431,12 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// secure on every platform this package supports.
     private func randomRequestID() -> [UInt8] {
         (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+    }
+
+    /// Logs an error at the place it is raised and returns it to be thrown.
+    private static func logged(_ error: AuthTransportError) -> AuthTransportError {
+        log(ErrorDetail.describe(error))
+        return error
     }
 
     /// A signed reply arrived for a session this side no longer holds. The peer has run the
