@@ -308,7 +308,7 @@ public enum ActionBatchWire {
     /// `name` is the parameter the error names, as the SDK's `validateBasket`, `validateLabel` and
     /// `validateTag` name theirs: `basket`, `label` or `tag`.
     public static func identifier(_ value: String, name: String) throws -> String {
-        let normalized = value.trimmingCharacters(in: javaScriptWhitespace).lowercased()
+        let normalized = javaScriptLowercased(value.trimmingCharacters(in: javaScriptWhitespace))
         let bytes = normalized.utf8.count
         if bytes < identifierBytes.lowerBound {
             throw WireError.invalidParameter(name: name, message: "at least \(identifierBytes.lowerBound) length.")
@@ -326,14 +326,59 @@ public enum ActionBatchWire {
     /// `validateIdentifier`'s byte bounds.
     public static let identifierBytes = 1...300
 
-    /// What `String.prototype.trim` removes: Unicode white space and line terminators, which is
-    /// Foundation's set less NEXT LINE (U+0085) and plus ZERO WIDTH NO-BREAK SPACE (U+FEFF).
+    /// What `String.prototype.trim` removes, from the ECMAScript lists: WhiteSpace (TAB, VT, FF,
+    /// ZWNBSP and the `Zs` space separators) and LineTerminator (LF, CR, LS, PS). Built from those
+    /// lists rather than from Foundation's sets, which also hold NEXT LINE (U+0085) and, on Apple
+    /// platforms, ZERO WIDTH SPACE (U+200B); JavaScript's trim keeps both.
     static let javaScriptWhitespace: CharacterSet = {
-        var set = CharacterSet.whitespacesAndNewlines
-        set.remove(Unicode.Scalar(0x85)!)
-        set.insert(Unicode.Scalar(0xFEFF)!)
+        let scalars: [ClosedRange<UInt32>] = [
+            0x0009...0x0009, 0x000B...0x000C, 0xFEFF...0xFEFF,
+            // Zs
+            0x0020...0x0020, 0x00A0...0x00A0, 0x1680...0x1680, 0x2000...0x200A,
+            0x202F...0x202F, 0x205F...0x205F, 0x3000...0x3000,
+            // LineTerminator
+            0x000A...0x000A, 0x000D...0x000D, 0x2028...0x2029,
+        ]
+        var set = CharacterSet()
+        for range in scalars {
+            set.insert(charactersIn: Unicode.Scalar(range.lowerBound)!...Unicode.Scalar(range.upperBound)!)
+        }
         return set
     }()
+
+    /// `String.prototype.toLowerCase`: each scalar's full lowercase mapping, as Swift's
+    /// `lowercased()` gives, except GREEK CAPITAL LETTER SIGMA, which JavaScript lowers to FINAL
+    /// SIGMA (U+03C2) under the Unicode `Final_Sigma` condition (SpecialCasing.txt) and Swift
+    /// always lowers to U+03C3. So `"ΟΔΟΣ"` is `"οδος"` in both, not `"οδοσ"`.
+    static func javaScriptLowercased(_ value: String) -> String {
+        let scalars = Array(value.unicodeScalars)
+        guard scalars.contains(where: { $0.value == 0x03A3 }) else { return value.lowercased() }
+        var lowered = String.UnicodeScalarView()
+        for (index, scalar) in scalars.enumerated() {
+            if scalar.value == 0x03A3, isFinalSigma(at: index, in: scalars) {
+                lowered.append(Unicode.Scalar(0x03C2)!)
+            } else {
+                lowered.append(contentsOf: scalar.properties.lowercaseMapping.unicodeScalars)
+            }
+        }
+        return String(lowered)
+    }
+
+    /// `Final_Sigma`: a cased letter before, and none after, skipping case-ignorable scalars on
+    /// both sides. A scalar that is both cased and case-ignorable is skipped, as ICU (which V8
+    /// lowercases with) skips it.
+    private static func isFinalSigma(at index: Int, in scalars: [Unicode.Scalar]) -> Bool {
+        func casedLetter(in indices: some Sequence<Int>) -> Bool {
+            for i in indices {
+                let properties = scalars[i].properties
+                if properties.isCaseIgnorable { continue }
+                return properties.isCased
+            }
+            return false
+        }
+        return casedLetter(in: stride(from: index - 1, through: 0, by: -1))
+            && !casedLetter(in: (index + 1)..<scalars.count)
+    }
 
     /// `{txid, vout}`, as `parseWalletOutpoint` produces it.
     public static func outpoint(_ outpoint: Outpoint) -> OrderedJSON {

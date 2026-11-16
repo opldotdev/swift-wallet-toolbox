@@ -241,10 +241,28 @@ final class ValidatedArgsWireTests: XCTestCase {
     func test_identifiersAreTrimmedLoweredAndBoundedAsTheValidatorBoundsThem() throws {
         XCTAssertEqual(try ActionBatchWire.identifier(" Ordinals\n", name: "basket"), "ordinals")
         XCTAssertEqual(try ActionBatchWire.identifier("\u{FEFF}Tag A\u{FEFF}", name: "tag"), "tag a")
-        // NEXT LINE is not white space to JavaScript's trim, so it stays.
+        // NEXT LINE, ZERO WIDTH SPACE and MONGOLIAN VOWEL SEPARATOR are not white space to
+        // JavaScript's trim, so they stay; the other separators and line terminators go.
         XCTAssertEqual(try ActionBatchWire.identifier("\u{85}x", name: "tag"), "\u{85}x")
+        XCTAssertEqual(try ActionBatchWire.identifier("\u{200B}x\u{200B}", name: "tag"), "\u{200B}x\u{200B}")
+        XCTAssertEqual(try ActionBatchWire.identifier("\u{180E}x", name: "tag"), "\u{180E}x")
+        XCTAssertEqual(try ActionBatchWire.identifier("\u{1C}x", name: "tag"), "\u{1C}x")
+        XCTAssertEqual(
+            try ActionBatchWire.identifier("\u{A0}\u{3000}\u{B}\u{C}x\u{2028}\u{2029}\u{202F}", name: "tag"), "x"
+        )
         XCTAssertEqual(try ActionBatchWire.identifier(String(repeating: "A", count: 300), name: "label"),
                        String(repeating: "a", count: 300))
+
+        // Node 22's `toLowerCase`: capital sigma lowers to final sigma at the end of a word,
+        // looking past case-ignorable scalars (U+0301, U+0345, "."), and to small sigma otherwise.
+        let sigma: [(String, String)] = [
+            ("ΟΔΟΣ", "οδος"), ("ΑΣ ΒΣ", "ας βς"), ("Σ", "σ"), ("ΑΣ\u{301}", "ας\u{301}"),
+            ("ΑΣ\u{301}Β", "ασ\u{301}β"), ("ΑΣ.", "ας."), ("Α.Σ", "α.ς"), ("ΑΣ\u{345}", "ας\u{345}"),
+            ("ΣΑ", "σα"), ("İ", "i\u{307}"),
+        ]
+        for (raw, lowered) in sigma {
+            XCTAssertEqual(try ActionBatchWire.identifier(raw, name: "label"), lowered, raw)
+        }
 
         XCTAssertThrowsError(try ActionBatchWire.identifier(" \t\n ", name: "label")) {
             XCTAssertEqual($0 as? WireError, .invalidParameter(name: "label", message: "at least 1 length."))
