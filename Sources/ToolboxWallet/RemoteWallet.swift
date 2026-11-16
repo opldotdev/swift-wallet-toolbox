@@ -201,13 +201,25 @@ public struct RemoteWallet: Sendable {
     /// and signs; the signed transaction goes back as Atomic BEEF for storage to record and send.
     /// A failure at any step leaves the reserved inputs to be released by `abort`, never a
     /// half-sent payment.
+    ///
+    /// `beforeBroadcast` runs with the signed payment's txid after signing and before storage sees
+    /// it. Once it has run, a failure may come after the broadcast, so the caller must treat the
+    /// payment as possibly sent under that txid and must not offer to pay again. If the hook
+    /// throws, nothing is broadcast and the funded action is aborted: its error is rethrown once
+    /// storage confirms the abort, and ``BRC29PaymentError/notReleased(reference:)`` is thrown
+    /// instead when storage does not.
+    ///
+    /// Storage reporting the send as failed throws ``WalletError/broadcastFailed(txid:)``.
     @discardableResult
     public func pay(
         _ outputs: [WalletCreateActionOutput],
         description: String,
-        labels: [String] = []
+        labels: [String] = [],
+        beforeBroadcast: (@Sendable (SignedPayment) async throws -> Void)? = nil
     ) async throws -> SentPayment {
-        try await sign(outputs, description: description, labels: labels).sent
+        try await sign(
+            outputs, description: description, labels: labels, beforeBroadcast: beforeBroadcast
+        ).sent
     }
 
     /// Pays a recipient — a native address or a paymail — for an amount.
@@ -225,6 +237,9 @@ public struct RemoteWallet: Sendable {
     /// `sender` is the BRC-28/70 metadata handle. Hosts such as HandCash show `$paymail` when it
     /// is omitted. Pass a paymail when the account has one; otherwise a display name or this
     /// wallet's identity pubkey. The pubkey and txid signature are always sent.
+    ///
+    /// `beforeBroadcast` is as for ``pay(_:description:labels:beforeBroadcast:)``; for a paymail
+    /// it runs after the BEEF for the host is built.
     @discardableResult
     public func pay(
         to recipient: String,
@@ -232,7 +247,8 @@ public struct RemoteWallet: Sendable {
         description: String,
         labels: [String] = [],
         sender: String? = nil,
-        paymail resolver: Paymail = Paymail()
+        paymail resolver: Paymail = Paymail(),
+        beforeBroadcast: (@Sendable (SignedPayment) async throws -> Void)? = nil
     ) async throws -> SentPayment {
         if Paymail.isPaymail(recipient) {
             let destination = try await resolver.paymentDestination(
@@ -248,10 +264,10 @@ public struct RemoteWallet: Sendable {
             // The host is told about the payment with its BEEF, so the BEEF is built before the
             // broadcast; a funded graph that cannot prove the payment stops it with its inputs
             // released, rather than leaving money on chain that the host was never told about.
-            let result = try await sign(outputs, description: description, labels: labels, requiresBEEF: true)
-            if result.sent.results.contains(where: { $0.status == .failed }) {
-                throw WalletError.broadcastFailed(txid: result.sent.transactionID.displayHex)
-            }
+            let result = try await sign(
+                outputs, description: description, labels: labels, requiresBEEF: true,
+                beforeBroadcast: beforeBroadcast
+            )
             let txid = result.sent.transactionID.displayHex
             let pubkeyHex = Hex.encode(identityKey.publicKey.compressedBytes)
             let senderHandle = Paymail.senderIdentity(
@@ -293,7 +309,9 @@ public struct RemoteWallet: Sendable {
         let output = try WalletCreateActionOutput(
             lockingScript: script.bytes, satoshis: satoshis, outputDescription: description
         )
-        return try await pay([output], description: description, labels: labels)
+        return try await pay(
+            [output], description: description, labels: labels, beforeBroadcast: beforeBroadcast
+        )
     }
 
     /// Pays a counterparty's identity key with a BRC-29 payment, returning everything the recipient
@@ -313,6 +331,8 @@ public struct RemoteWallet: Sendable {
     /// is broadcast and the funded action is aborted: its error is rethrown once storage confirms
     /// the abort, and ``BRC29PaymentError/notReleased(reference:)`` is thrown instead when storage
     /// does not, since the hook was handed the reference and may hold a record of it.
+    ///
+    /// Storage reporting the send as failed throws ``WalletError/broadcastFailed(txid:)``.
     public func payToCounterparty(
         recipient recipientIdentityKey: PublicKey,
         satoshis: UInt64,
@@ -383,6 +403,7 @@ public struct RemoteWallet: Sendable {
         }
         try Task.checkCancellation()
         let processed = try await storage.processAction(auth, try signed.processRequest())
+        try Self.requireNotFailed(processed.sendWithResults, transactionID: signed.transactionID)
         return CounterpartyPayment(
             transactionID: signed.transactionID,
             outputIndex: index,
@@ -406,17 +427,41 @@ public struct RemoteWallet: Sendable {
         guard released else { throw BRC29PaymentError.notReleased(reference: reference) }
     }
 
+    /// Throws ``WalletError/broadcastFailed(txid:)`` when storage reports a send as failed, as the
+    /// reference's `throwIfAnyUnsuccessfulCreateActions` throws `WERR_REVIEW_ACTIONS` with the txid.
+    private static func requireNotFailed(
+        _ results: [SendWithResult], transactionID: TransactionID
+    ) throws {
+        if results.contains(where: { $0.status == .failed }) {
+            throw WalletError.broadcastFailed(txid: transactionID.displayHex)
+        }
+    }
+
+    /// The index of the one requested output in the signed transaction, located by its locking
+    /// script because storage may add change and reorder. Nil when more than one output was
+    /// requested or the script does not appear exactly once.
+    private static func paidOutputIndex(
+        _ outputs: [WalletCreateActionOutput], in transaction: Transaction
+    ) -> Int? {
+        guard outputs.count == 1, let script = outputs.first?.lockingScript else { return nil }
+        let matches = transaction.outputs.indices.filter {
+            transaction.outputs[$0].lockingScript.bytes == script
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
     /// Funds, signs and broadcasts the outputs, returning the signed action, its BRC-62 BEEF when
     /// `requiresBEEF` (for a paymail delivery), and the receipt.
     ///
     /// With `requiresBEEF`, the BEEF is built before `processAction`; when the funded graph cannot
     /// prove the transaction, the funded action is aborted and the `BEEFError` thrown, so nothing
-    /// is broadcast.
+    /// is broadcast. `beforeBroadcast` runs last before `processAction`.
     private func sign(
         _ outputs: [WalletCreateActionOutput],
         description: String,
         labels: [String],
-        requiresBEEF: Bool = false
+        requiresBEEF: Bool = false,
+        beforeBroadcast: (@Sendable (SignedPayment) async throws -> Void)? = nil
     ) async throws -> (signed: SignedAction, beef: [UInt8]?, sent: SentPayment) {
         let request = try WalletCreateActionRequest(
             description: description, outputs: outputs, labels: labels
@@ -445,7 +490,20 @@ public struct RemoteWallet: Sendable {
                 throw error
             }
         }
+        if let beforeBroadcast {
+            do {
+                try await beforeBroadcast(SignedPayment(
+                    transactionID: signed.transactionID,
+                    reference: funded.reference,
+                    outputIndex: Self.paidOutputIndex(outputs, in: signed.transaction)
+                ))
+            } catch {
+                try await release(funded.reference)
+                throw error
+            }
+        }
         let result = try await storage.processAction(auth, try signed.processRequest())
+        try Self.requireNotFailed(result.sendWithResults, transactionID: signed.transactionID)
 
         return (
             signed,
@@ -801,6 +859,26 @@ public enum BRC29PaymentError: Error, Equatable, Sendable {
     /// The payment was not broadcast, but storage did not confirm the abort of its funded action,
     /// so its inputs may still be reserved. Abort `reference` again to release them.
     case notReleased(reference: String)
+}
+
+/// A payment that is signed and about to go to storage for broadcast.
+///
+/// Handed to the `beforeBroadcast` hook of ``RemoteWallet/pay(_:description:labels:beforeBroadcast:)``
+/// and ``RemoteWallet/pay(to:satoshis:description:labels:sender:paymail:beforeBroadcast:)``. From
+/// the hook on, the payment may be broadcast under `transactionID`.
+public struct SignedPayment: Sendable, Equatable {
+    public let transactionID: TransactionID
+    /// The storage reference of the funded action, which ``RemoteWallet/abort(reference:)`` takes.
+    public let reference: String
+    /// The index of the paid output, when one output was requested and its locking script appears
+    /// exactly once in the signed transaction; nil otherwise.
+    public let outputIndex: Int?
+
+    public init(transactionID: TransactionID, reference: String, outputIndex: Int?) {
+        self.transactionID = transactionID
+        self.reference = reference
+        self.outputIndex = outputIndex
+    }
 }
 
 /// The outcome of a payment that reached storage.
