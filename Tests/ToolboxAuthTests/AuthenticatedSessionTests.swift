@@ -40,8 +40,11 @@ final class AuthenticatedSessionTests: XCTestCase {
         private(set) var maxGeneralDepth = 0
 
         init(key: PrivateKey, responseBody: [UInt8] = Array("{\"ok\":true}".utf8),
-             responseStatus: Int = 200) {
-            self.authenticator = PeerAuthenticator(wallet: ProtoWallet(rootKey: key))
+             responseStatus: Int = 200,
+             certificatesToRequest: AuthRequestedCertificateSet? = nil) {
+            self.authenticator = PeerAuthenticator(
+                wallet: ProtoWallet(rootKey: key), certificatesToRequest: certificatesToRequest
+            )
             self.responseBody = responseBody
             self.responseStatus = responseStatus
         }
@@ -216,6 +219,59 @@ final class AuthenticatedSessionTests: XCTestCase {
         }
         let paths = await peer.pathsSeen
         XCTAssertEqual(paths, [])
+    }
+
+    /// A peer with a certificate policy puts it in its handshake reply, as `Peer.ts:867-876` does.
+    /// AuthFetch answers from the wallet's certificates and sends nothing when none fit; this
+    /// session holds none, so the handshake must still open and the request go through.
+    func test_aPeerThatAsksForCertificatesStillAuthenticates() async throws {
+        let keys = try keyPair()
+        let certifier = try PrivateKey(Array(repeating: 0x33, count: 32)).publicKey
+        let policy = try AuthRequestedCertificateSet(
+            certifiers: [certifier],
+            certificateTypes: [
+                try CertificateTypeID(Array(repeating: 0x01, count: 32)): [
+                    try CertificateFieldName("name")
+                ]
+            ]
+        )
+        let peer = TestPeer(key: keys.server, certificatesToRequest: policy)
+        let session = session(with: peer, client: keys.client)
+
+        let response = try await session.send(method: "POST", path: "/", body: [0x01])
+
+        XCTAssertEqual(response.statusCode, 200)
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 1)
+    }
+
+    /// A request over the authenticated payload limit is refused once, not treated as a lost
+    /// session: a new handshake cannot make it smaller, and AuthFetch does not retry it either.
+    func test_anOversizedRequestIsRefusedWithoutRehandshaking() async throws {
+        let keys = try keyPair()
+        let peer = TestPeer(key: keys.server)
+        let session = session(with: peer, client: keys.client)
+
+        do {
+            _ = try await session.send(
+                method: "POST", path: "/",
+                body: Array(repeating: 0x61, count: AuthLimits.defaultPayloadBytes + 1)
+            )
+            XCTFail("an oversized request was sent")
+        } catch {
+            XCTAssertEqual(error as? BRC104Error, .resourceLimit)
+        }
+        let paths = await peer.pathsSeen
+        XCTAssertEqual(paths, [BRC104HTTPHeaderName.handshakePath])
+
+        let response = try await session.send(method: "POST", path: "/", body: [0x01])
+        XCTAssertEqual(response.statusCode, 200)
+        let handshakes = await peer.pathsSeen.filter {
+            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
+        }
+        XCTAssertEqual(handshakes.count, 1, "the open session must survive the refusal")
     }
 
     /// The handshake is the expensive part and must happen once, not per request.

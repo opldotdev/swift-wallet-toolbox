@@ -122,6 +122,17 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         } catch is CancellationError {
             throw CancellationError()
         } catch let error where isRecoverablePreSendSessionError(error) {
+            // `makeGeneralMessage` throws `resourceLimit` both for a payload over the limit and
+            // for a session that spent its message budget; only the second closes the session.
+            // A new handshake cannot shrink the request, and AuthFetch does not retry a payload
+            // refusal either, so the caller gets it.
+            if error as? AuthError == .resourceLimit, await authenticator.session(session) != nil {
+                Self.log(
+                    "\(Self.describe(requestContext(method: method, path: path))): the request "
+                        + "(\(payload.count) bytes signed) is over the authenticated payload limit"
+                )
+                throw error
+            }
             throw AuthTransportError.sessionExpired
         }
 
@@ -258,10 +269,25 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             }
             // Verifying the reply is the authenticator's job, and it throws when the signature does
             // not cover our nonce. Reaching the next line means the peer holds the key it claims.
+            let handshakeActions: [AuthPeerAction]
             do {
-                _ = try await authenticator.receive(reply)
+                handshakeActions = try await authenticator.receive(reply)
             } catch AuthError.sessionNotFound {
                 throw AuthTransportError.sessionExpired
+            }
+            // A peer with a certificate policy sends it in its reply. AuthFetch answers it from
+            // the wallet's certificates and sends nothing when it holds none that fit
+            // (`AuthFetch.ts:496-511`). This session signs with an `AuthenticationWallet`, which
+            // holds no certificates, so it sends nothing too; a peer that then refuses the
+            // request is reported from its reply, and the log names why.
+            if handshakeActions.contains(where: {
+                if case .certificateRequest = $0 { return true }
+                return false
+            }) {
+                Self.log(
+                    "\(handshakeCall): the peer asked for certificates; this session has none to "
+                        + "send"
+                )
             }
 
             guard await authenticator.session(session) != nil else {
