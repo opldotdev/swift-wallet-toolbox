@@ -21,6 +21,15 @@ public enum OrderedJSON: Equatable, Sendable {
     case string(String)
     case array([OrderedJSON])
     case object([Member])
+    /// Bytes: a `Uint8Array` in the reference client.
+    ///
+    /// Written as a JSON array of numbers, the shape storage has always taken, unless the text is
+    /// written for a binary request (`serialized(binary: true)`), where it is the reference
+    /// `binaryJsonReplacer`'s `{"$bsvBinary":"base64","data":...}`. That form matters for large
+    /// values: storage's authentication layer refuses a request with more than 100,000 JSON
+    /// values or an array longer than that, so a transaction over ~100 KB written as numbers is
+    /// answered with an unsigned 400 before storage sees it.
+    case binary([UInt8])
 
     public struct Member: Equatable, Sendable {
         public let key: String
@@ -53,9 +62,10 @@ public extension OrderedJSON {
         .array(values.map { .string($0) })
     }
 
-    /// Bytes the way the storage protocol carries them: a JSON array of numbers.
+    /// Bytes the way the storage protocol carries them: a JSON array of numbers, or base64 in a
+    /// binary request. See `binary`.
     static func bytes(_ values: [UInt8]) -> OrderedJSON {
-        .array(values.map { .integer(Int64($0)) })
+        .binary(values)
     }
 
     var members: [Member]? {
@@ -63,9 +73,13 @@ public extension OrderedJSON {
         return nil
     }
 
+    /// The elements of an array, and of bytes as the array of numbers they are written as.
     var arrayValue: [OrderedJSON]? {
-        if case .array(let values) = self { return values }
-        return nil
+        switch self {
+        case .array(let values): values
+        case .binary(let bytes): bytes.map { .integer(Int64($0)) }
+        default: nil
+        }
     }
 
     var stringValue: String? {
@@ -163,6 +177,7 @@ public extension OrderedJSON {
         case .array(let values): .array(values.map(\.jsonValue))
         case .object(let members):
             .object(Dictionary(members.map { ($0.key, $0.value.jsonValue) }) { first, _ in first })
+        case .binary(let bytes): .array(bytes.map { .number(Double($0)) })
         }
     }
 }
@@ -171,18 +186,50 @@ public extension OrderedJSON {
 
 public extension OrderedJSON {
     /// The `JSON.stringify` text of this value.
-    func serialized() -> String {
+    ///
+    /// `binary` writes it as the reference client writes a binary request body,
+    /// `JSON.stringify(value, binaryJsonReplacer)` (`BinaryJson.ts`): bytes as
+    /// `{"$bsvBinary":"base64","data":...}`, and an object that would read back as one of the
+    /// encoding's own markers escaped as `{"$bsvBinary":"escaped","entries":[[key, value], ...]}`,
+    /// so storage's `decodeBinaryJsonValue` gives back exactly the value meant. Without it, bytes
+    /// are a plain array of numbers.
+    func serialized(binary: Bool = false) -> String {
         var output = ""
-        write(into: &output)
+        write(into: &output, binary: binary)
         return output
     }
 
-    /// The UTF-8 bytes of `serialized()`, which is what the manifest digest hashes.
-    func utf8Bytes() -> [UInt8] {
-        Array(serialized().utf8)
+    /// The UTF-8 bytes of `serialized(binary:)`. The manifest digest hashes the plain form.
+    func utf8Bytes(binary: Bool = false) -> [UInt8] {
+        Array(serialized(binary: binary).utf8)
     }
 
-    private func write(into output: inout String) {
+    /// The marker key of the binary encoding.
+    static let binaryTag = "$bsvBinary"
+
+    /// Whether `binaryJsonReplacer` escapes this object rather than writing it as itself: it has
+    /// the shape of a tagged byte value, of an escaped object, or of Node's `Buffer` JSON.
+    static func isBinaryMarkerShaped(_ members: [Member]) -> Bool {
+        guard members.count == 2 else { return false }
+        func value(_ key: String) -> OrderedJSON? {
+            members.first(where: { $0.key == key })?.value
+        }
+        if case .string("base64") = value(binaryTag), case .string = value("data") { return true }
+        if case .string("escaped") = value(binaryTag), case .array(let entries) = value("entries"),
+           entries.allSatisfy({ entry in
+               guard case .array(let pair) = entry, pair.count == 2, case .string = pair[0] else {
+                   return false
+               }
+               return true
+           }) {
+            return true
+        }
+        // `Array.isArray(data)`: a `Uint8Array` is not an array there, so `.binary` data is not.
+        if case .string("Buffer") = value("type"), case .array = value("data") { return true }
+        return false
+    }
+
+    private func write(into output: inout String, binary: Bool) {
         switch self {
         case .null:
             output += "null"
@@ -198,18 +245,35 @@ public extension OrderedJSON {
             output += "["
             for (index, value) in values.enumerated() {
                 if index > 0 { output += "," }
-                value.write(into: &output)
+                value.write(into: &output, binary: binary)
             }
             output += "]"
+        case .object(let members) where binary && Self.isBinaryMarkerShaped(members):
+            // The replacer's own wrapper is written as it is, not checked again: it has the
+            // escaped shape itself.
+            output += "{"
+            Self.writeString(Self.binaryTag, into: &output)
+            output += ":\"escaped\",\"entries\":"
+            OrderedJSON.array(members.map { .array([.string($0.key), $0.value]) })
+                .write(into: &output, binary: binary)
+            output += "}"
         case .object(let members):
             output += "{"
             for (index, member) in members.enumerated() {
                 if index > 0 { output += "," }
                 Self.writeString(member.key, into: &output)
                 output += ":"
-                member.value.write(into: &output)
+                member.value.write(into: &output, binary: binary)
             }
             output += "}"
+        case .binary(let bytes) where binary:
+            output += "{"
+            Self.writeString(Self.binaryTag, into: &output)
+            output += ":\"base64\",\"data\":"
+            Self.writeString(Data(bytes).base64EncodedString(), into: &output)
+            output += "}"
+        case .binary(let bytes):
+            OrderedJSON.array(bytes.map { .integer(Int64($0)) }).write(into: &output, binary: false)
         }
     }
 
