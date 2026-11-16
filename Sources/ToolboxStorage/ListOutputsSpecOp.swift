@@ -8,6 +8,15 @@ import Foundation
 /// `src/storage/methods/ListOutputsSpecOp.ts`.
 public enum ListOutputsSpecOp {
 
+    /// The BRC-112 basket prefix: `listOutputs` of `balance <basket>` asks for `<basket>`'s balance,
+    /// sent to storage as that basket with the ``walletBalance`` tag (TS `Wallet.ts`
+    /// `validateListOutputsArgs`). Paired with swift-sdk `walletIsBalanceBasket`.
+    public static let balanceBasketPrefix = "balance "
+
+    /// The BRC-99 module basket prefix, `p <module> <basket>`. BRC-112 refuses
+    /// `balance p <module> <basket>`; a module offers `p <module> balance <basket>` instead.
+    public static let moduleBasketPrefix = "p "
+
     /// Returns the wallet's current change balance in `totalOutputs`. `outputs` is always empty.
     public static let walletBalance =
         "893b7646de0e1c9f741bd6e9169b76a8847ae34adef7bef1e6a285371206d2e8"
