@@ -100,4 +100,40 @@ final class OrderedJSONTests: XCTestCase {
             ["0", "1", "4294967294", "+1", "4294967295", "a", "b"]
         )
     }
+
+    // MARK: - Binary requests
+
+    /// `stringifyJsonRpc(value, true)` and `stringifyJsonRpc(value, false)` of `BinaryJson.ts`
+    /// (`@bsv/wallet-toolbox` 2.15.3) for the same tree, with `Uint8Array` where this has `.binary`.
+    func test_binaryRequestsWriteBytesAsTheReferenceReplacerDoes() {
+        let value = OrderedJSON.record([
+            "a": .bytes([1, 2, 255]),
+            "b": .record(["$bsvBinary": .string("base64"), "data": .string("AA==")]),
+            "c": .record(["type": .string("Buffer"), "data": .array([.integer(1)])]),
+            "d": .record([
+                "$bsvBinary": .string("escaped"),
+                "entries": .array([.array([.string("k"), .bytes([9])])]),
+            ]),
+            "e": .array([.bytes([])]),
+            "f": .record(["$bsvBinary": .string("other"), "data": .string("x")]),
+            "g": .record(["$bsvBinary": .string("base64"), "data": .string("AA=="), "extra": .integer(1)]),
+        ])
+        XCTAssertEqual(
+            value.serialized(binary: true),
+            #"{"a":{"$bsvBinary":"base64","data":"AQL/"},"b":{"$bsvBinary":"escaped","entries":[["$bsvBinary","base64"],["data","AA=="]]},"c":{"$bsvBinary":"escaped","entries":[["type","Buffer"],["data",[1]]]},"d":{"$bsvBinary":"escaped","entries":[["$bsvBinary","escaped"],["entries",[["k",{"$bsvBinary":"base64","data":"CQ=="}]]]]},"e":[{"$bsvBinary":"base64","data":""}],"f":{"$bsvBinary":"other","data":"x"},"g":{"$bsvBinary":"base64","data":"AA==","extra":1}}"#
+        )
+        XCTAssertEqual(
+            value.serialized(),
+            #"{"a":[1,2,255],"b":{"$bsvBinary":"base64","data":"AA=="},"c":{"type":"Buffer","data":[1]},"d":{"$bsvBinary":"escaped","entries":[["k",[9]]]},"e":[[]],"f":{"$bsvBinary":"other","data":"x"},"g":{"$bsvBinary":"base64","data":"AA==","extra":1}}"#
+        )
+    }
+
+    /// Bytes read back as the array of numbers they are written as, so digests and readers that
+    /// walk a manifest see what storage hashes.
+    func test_bytesReadAsTheirNumberArray() {
+        let bytes = OrderedJSON.bytes([0, 7, 255])
+        XCTAssertEqual(bytes.arrayValue, [.integer(0), .integer(7), .integer(255)])
+        XCTAssertEqual(bytes.jsonValue, .array([.number(0), .number(7), .number(255)]))
+        XCTAssertEqual(bytes.utf8Bytes(), Array("[0,7,255]".utf8))
+    }
 }

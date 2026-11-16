@@ -28,6 +28,16 @@ public actor StorageClient {
     private var settingsTask: Task<StorageSettings, Error>?
     /// The user's record as last read, which says whether this store is the active one.
     private var user: StorageUser?
+    /// Whether requests carry bytes as base64 (`X-BSV-Binary-Request-Encoding: base64`), which
+    /// storage said it reads by echoing `X-BSV-Binary-Encoding` on the settings read.
+    ///
+    /// Bytes written as a JSON array of numbers cost one JSON value each, and storage's
+    /// authentication layer (`@bsv/auth-express-middleware`) refuses any request with more than
+    /// 100,000 values, or an array longer than that, with an unsigned `400 ERR_AUTH_MALFORMED`.
+    /// A transaction over ~100 KB, such as an inscription carrying a photo, then never reaches
+    /// storage. The reference client sends bytes as base64 for the same reason (`binaryRequests:
+    /// true` in every 1Sat wallet) once a response has carried that header.
+    private var binaryRequests = false
 
     public init(endpoint: URL, transport: any AuthenticatedTransport) {
         self.endpoint = endpoint
@@ -81,6 +91,20 @@ public actor StorageClient {
     /// the action-batch manifest's digest is recomputed by storage from the key order it receives.
     /// Parameters passed here are written with `JSON.stringify`'s rules and in their own order.
     public func call(_ method: String, rawParams params: [OrderedJSON]) async throws -> JSONValue {
+        try await call(method, rawParams: params, negotiatingBinary: false)
+    }
+
+    /// The header naming a binary request body, and the one asking for (and confirming) binary.
+    static let binaryRequestHeader = "X-BSV-Binary-Request-Encoding"
+    static let binaryHeader = "X-BSV-Binary-Encoding"
+
+    /// `negotiatingBinary` asks storage, with `X-BSV-Binary-Encoding: base64`, whether it reads
+    /// binary requests; its echo of that header turns `binaryRequests` on. Only the settings read
+    /// asks, because storage then writes the response's own bytes as base64 too, and a settings
+    /// record has none.
+    private func call(
+        _ method: String, rawParams params: [OrderedJSON], negotiatingBinary: Bool
+    ) async throws -> JSONValue {
         if Self.writerMethods.contains(method) {
             try await requireActive(params.first)
         }
@@ -93,17 +117,32 @@ public actor StorageClient {
             .init("params", .array(params)),
             .init("id", .integer(Int64(id))),
         ])
-        return try await send(method, id: id, body: request.utf8Bytes())
+        let binary = binaryRequests
+        var headers = ["Content-Type": "application/json"]
+        if binary { headers[Self.binaryRequestHeader] = "base64" }
+        if negotiatingBinary { headers[Self.binaryHeader] = "base64" }
+        return try await send(
+            method, id: id, body: request.utf8Bytes(binary: binary), headers: headers,
+            negotiatingBinary: negotiatingBinary
+        )
     }
 
-    private func send(_ method: String, id: Int, body: [UInt8]) async throws -> JSONValue {
+    private func send(
+        _ method: String, id: Int, body: [UInt8], headers: [String: String],
+        negotiatingBinary: Bool
+    ) async throws -> JSONValue {
         let response = try await transport.send(
             method: "POST",
             path: endpoint.path.isEmpty ? "/" : endpoint.path,
             query: nil,
-            headers: ["Content-Type": "application/json"],
+            headers: headers,
             body: body
         )
+        if negotiatingBinary {
+            binaryRequests = response.headers.contains {
+                $0.key.lowercased() == Self.binaryHeader.lowercased() && $0.value == "base64"
+            }
+        }
 
         let envelope: JSONValue
         do {
@@ -220,7 +259,10 @@ public actor StorageClient {
     }
 
     private func readSettings(_ auth: AuthID) async throws -> StorageSettings {
-        let result = try await call("makeAvailable", [.object(auth.jsonObject)])
+        let result = try await call(
+            "makeAvailable", rawParams: [OrderedJSON(.object(auth.jsonObject))],
+            negotiatingBinary: true
+        )
         guard let identityKey = result["storageIdentityKey"]?.stringValue,
               let name = result["storageName"]?.stringValue,
               let chainName = result["chain"]?.stringValue,
