@@ -361,8 +361,10 @@ public actor MessageBoxOutbox {
         ToolboxLog.error("ToolboxWallet.MessageBox", message)
     }
 
+    /// `error`'s user text for ``MessageBoxOutboxError/notDelivered(txid:reason:)``, with the
+    /// query cut from any URL in it, as ``ErrorDetail/withoutQueries(_:)`` cuts it for the log.
     private static func reason(_ error: any Error) -> String {
-        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        ErrorDetail.withoutQueries((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
     }
 
     private func file(_ sender: String, _ recipient: String) throws -> URL {

@@ -169,7 +169,8 @@ struct UnopenedPaymentMessages {
     mutating func add(_ row: MessageBoxClient.ListedRow, _ error: any Error) {
         count += 1
         if first == nil {
-            first = "\(row.message.messageId) from \(row.rawSender): \(ErrorDetail.describe(error))"
+            first = "\(ErrorDetail.oneLine(row.message.messageId, limit: 80)) from "
+                + "\(ErrorDetail.oneLine(row.rawSender, limit: 80)): \(ErrorDetail.describe(error))"
         }
     }
 
