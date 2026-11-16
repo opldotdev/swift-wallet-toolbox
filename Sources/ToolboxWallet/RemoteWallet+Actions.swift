@@ -200,8 +200,12 @@ extension RemoteWallet {
         for (index, key) in keys {
             try transaction.signPayToPublicKeyHashInput(at: index, with: key, limits: StorageLimits.transaction)
         }
+        // The transaction is broadcast now, so it is checked under the rules of a block past
+        // Chronicle activation (mainnet height 943,816), as TS `verifyUnlockScripts` asks its
+        // script backend to with `blockHeight: 943816`. Without `.chronicle` a caller's
+        // `SIGHASH_CHRONICLE` spend, which the node takes, would be refused here.
         let configuration = try ScriptExecutionConfiguration(
-            era: .afterGenesis, flags: [.enableForkID], resourceLimits: .standard
+            era: .afterGenesis, flags: [.enableForkID, .chronicle], resourceLimits: .standard
         )
         for (index, input) in transaction.inputs.enumerated() {
             guard let source = input.sourceOutput else { throw WalletActionLifecycleError.invalidFunding }

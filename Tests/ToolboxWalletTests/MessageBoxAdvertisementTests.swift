@@ -158,23 +158,28 @@ private final class ShipOverlay: OverlayLookupResolving, @unchecked Sendable {
     private let recorded = Locked<[String]>([])
     var queries: [String] { recorded.read { $0 } }
 
-    init(hosts: [String]) throws {
+    /// `legacyHosts` get the pre-4.x form, locked to and signed by the identity key itself, which
+    /// TS `decodeAndVerifyOverlayAdvertisement` refuses as not linked to its identity.
+    init(hosts: [String], legacyHosts: [String] = []) throws {
         let operator_ = try PrivateKey(Array(repeating: 0, count: 31) + [9])
-        // As a TS wallet signs and locks it: the operator identity's BRC-42 child for counterparty
-        // "anyone", invoice `2-service host interconnect-1` (`OverlayAdminTokenTemplate.ts`).
+        // A canonical SHIP advertisement, as TS `OverlayAdminTokenTemplate` writes it: locked to
+        // the operator identity's BRC-42 child for `[2, 'service host interconnect']`, key ID `1`,
+        // counterparty `anyone`, and signed by that child.
         let anyone = try PrivateKey(Array(repeating: 0, count: 31) + [1]).publicKey
-        let linked = try operator_.derivedChild(with: anyone, invoiceNumber: "2-service host interconnect-1")
-        func token(_ host: String, topic: String) throws -> OutputListItem {
+        let lockingKey = try operator_.derivedChild(with: anyone, invoiceNumber: "2-service host interconnect-1")
+        func token(_ host: String, topic: String, legacy: Bool = false) throws -> OutputListItem {
+            let signer = legacy ? operator_ : lockingKey
             let fields = [Array("SHIP".utf8), operator_.publicKey.compressedBytes, Array(host.utf8), Array(topic.utf8)]
-            let signature = try linked.sign(digest: BSVHashing.sha256(fields.flatMap { $0 }))
+            let signature = try signer.sign(digest: BSVHashing.sha256(fields.flatMap { $0 }))
             let lock = try PushDrop.lockingScript(fields: fields + [signature.derBytes],
-                publicKey: linked.publicKey, lockPosition: .beforeCompatibility)
+                publicKey: signer.publicKey, lockPosition: .beforeCompatibility)
             let transaction = Transaction(version: 1, inputs: [],
                 outputs: [TransactionOutput(satoshis: 1, lockingScript: lock)], lockTime: 0)
             let beef = try BEEF(merklePaths: [], transactions: [.raw(transaction)], limits: StorageLimits.beef)
             return try OutputListItem(beef: beef.serialized(limits: StorageLimits.beef), outputIndex: 0)
         }
         outputs = try hosts.map { try token($0, topic: "tm_messagebox") }
+            + legacyHosts.map { try token($0, topic: "tm_messagebox", legacy: true) }
             + [try token("https://elsewhere.example", topic: "tm_other")]
     }
 
@@ -439,6 +444,30 @@ final class MessageBoxAdvertisementTests: XCTestCase, @unchecked Sendable {
                 facilitator: SubmitFacilitator(answers: [:]))
             XCTFail("expected noInterestedHosts")
         } catch MessageBoxAdvertisementError.noInterestedHosts {}
+    }
+
+    /// As TS `SHIPBroadcaster.findInterestedHosts`: a SHIP advertisement whose locking key is not
+    /// linked to its identity is skipped, so its host is never sent the transaction.
+    func test_submitIgnoresAnUnlinkedShipAdvertisement() async throws {
+        let atomic = try AdvertisingWallet.atomic(Transaction(version: 1, inputs: [],
+            outputs: [TransactionOutput(satoshis: 1, lockingScript: script(Vector.oneSatLock))], lockTime: 0),
+            sources: nil)
+        let legacyOnly = try SubmitFacilitator(answers: ["https://legacy.example": .admitted])
+        do {
+            _ = try await MessageBoxAdvertiser.submit(atomic,
+                resolver: ShipOverlay(hosts: [], legacyHosts: ["https://legacy.example"]), facilitator: legacyOnly)
+            XCTFail("expected noInterestedHosts")
+        } catch MessageBoxAdvertisementError.noInterestedHosts {}
+        let submittedToLegacy = await legacyOnly.submitted
+        XCTAssertTrue(submittedToLegacy.isEmpty)
+
+        let mixed = try SubmitFacilitator(answers: ["https://a.example": .admitted, "https://legacy.example": .admitted])
+        let result = try await MessageBoxAdvertiser.submit(atomic,
+            resolver: ShipOverlay(hosts: ["https://a.example"], legacyHosts: ["https://legacy.example"]),
+            facilitator: mixed)
+        XCTAssertEqual(result.acceptedHosts.map(\.rawValue), ["https://a.example"])
+        let submitted = await mixed.submitted
+        XCTAssertEqual(submitted, ["https://a.example"])
     }
 
     func test_networkPresetsBuild() {

@@ -58,6 +58,8 @@ extension StorageClient {
             throw StorageClientError.unreadableResponse(method: "listOutputs")
         }
 
+        // An output count, or for the wallet-balance special operation the balance in satoshis
+        // (TS `listOutputsKnex` sums satoshis into it), so it may exceed `UInt32.max`.
         guard let totalOutputs = UInt64(exactly: total) else {
             throw StorageClientError.unreadableResponse(method: "listOutputs")
         }

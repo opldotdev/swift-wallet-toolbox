@@ -150,17 +150,24 @@ final class OutputDecodingTests: XCTestCase {
         )
     }
 
-    func test_aTotalPastUInt32IsReadAsTheTSWalletDoes() throws {
+    /// The wallet-balance special operation puts the balance in satoshis in `totalOutputs` (TS
+    /// `listOutputsKnex` sums them), and 43 BSV is already past `UInt32.max`.
+    func test_aBalanceTotalPastUInt32Decodes() throws {
         let decoded = try StorageClient.decodeOutputs(
             try result(#"{"totalOutputs": 4294967296, "outputs": []}"#)
         )
         XCTAssertEqual(decoded.totalOutputs, 4_294_967_296)
     }
 
-    func test_aTotalLargerThanTheABIIsRefusedWithoutTrapping() throws {
+    func test_aTotalThatIsNoWholeNumberIsRefusedWithoutTrapping() throws {
         XCTAssertThrowsError(
             try StorageClient.decodeOutputs(
-                try result(#"{"totalOutputs": 18446744073709551616, "outputs": []}"#)
+                try result(#"{"totalOutputs": 1e30, "outputs": []}"#)
+            )
+        )
+        XCTAssertThrowsError(
+            try StorageClient.decodeOutputs(
+                try result(#"{"totalOutputs": 1.5, "outputs": []}"#)
             )
         )
     }

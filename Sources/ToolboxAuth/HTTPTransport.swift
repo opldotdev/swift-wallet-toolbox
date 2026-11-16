@@ -58,9 +58,9 @@ public struct URLSessionHTTPTransport: HTTPTransport {
 
     /// - Parameter maximumResponseBytes: the response body is refused once it exceeds this. A
     ///   hostile or broken server can otherwise stream gigabytes, and the decoder's own limit
-    ///   only applies after the whole thing has been buffered. 16 MiB is the reference
-    ///   `SimplifiedFetchTransport`'s `DEFAULT_SIMPLIFIED_FETCH_MAX_RESPONSE_BYTES`, so a reply
-    ///   the TypeScript client reads is one this one reads too.
+    ///   only applies after the whole thing has been buffered. The default is 16 MiB, TS
+    ///   `AuthFetch`'s (`DEFAULT_SIMPLIFIED_FETCH_MAX_RESPONSE_BYTES`), which the SDK's BRC-103
+    ///   signing and wallet crypto now also accept.
     public init(session: URLSession = .shared, maximumResponseBytes: Int = 16 << 20) {
         self.session = session
         self.maximumResponseBytes = maximumResponseBytes
