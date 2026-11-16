@@ -1,5 +1,6 @@
 import BSVWallet
 import ToolboxCore
+import ToolboxStorage
 
 /// The BRC-100 operations whose state is owned entirely by storage.
 extension RemoteWallet {
@@ -87,11 +88,63 @@ extension RemoteWallet {
 
     /// Lists the outputs in the requested application basket without applying any 1Sat-specific
     /// basket aliases or naming conventions.
+    ///
+    /// A BRC-112 balance request, basket `balance <basket>`, asks storage for the balance of
+    /// `<basket>` instead: `totalOutputs` is the sum of its satoshis and `outputs` is empty. Only
+    /// this method reads the prefix; the wallet's own `balance(basket:)` and permission-token
+    /// reads call storage directly with baskets that never carry it.
     public func listOutputs(
         _ request: WalletListOutputsRequest
     ) async throws -> WalletListOutputsResult {
-        try await storage.listOutputs(auth, request)
+        try await storage.listOutputs(auth, try Self.balanceBasketRequest(request))
     }
+
+    /// TS `Wallet.ts` `validateListOutputsArgs` (BRC-112).
+    ///
+    /// The basket is read as the SDK validates it, trimmed and lowercased, within 1...300 bytes.
+    /// `balance <basket>` becomes `<basket>` with the wallet-balance special-operation tag appended
+    /// after the caller's tags, which storage answers with the sum of that basket's satoshis.
+    /// `balance p <module> <basket>` is refused: a BRC-99 module that offers a balance does so as
+    /// `p <module> balance <basket>`, which the module handles. A basket without the prefix goes to
+    /// storage as the caller wrote it, and storage normalizes it as it does any basket.
+    ///
+    /// Stricter than TS on purpose: the remainder after `balance ` is normalized again before the
+    /// `p ` check, because storage trims the basket it receives. TS leaves the remainder as cut and
+    /// its storage looks the name up literally, so `balance  default` (two spaces) is the default
+    /// basket's balance here but 0 in TS, and `balance  p color abc` is refused here but 0 in TS.
+    /// Checking the untrimmed remainder would let that spelling reach storage as `p color abc`.
+    static func balanceBasketRequest(_ request: WalletListOutputsRequest) throws -> WalletListOutputsRequest {
+        let basket = try ActionBatchWire.identifier(request.basket, name: "basket")
+        guard basket.hasPrefix(ListOutputsSpecOp.balanceBasketPrefix) else { return request }
+        let target = try ActionBatchWire.identifier(
+            String(basket.dropFirst(ListOutputsSpecOp.balanceBasketPrefix.count)), name: "basket"
+        )
+        if target.hasPrefix(ListOutputsSpecOp.moduleBasketPrefix) {
+            throw WireError.invalidParameter(name: "basket", message: balanceOfModuleBasketRefusal)
+        }
+        // TS appends the tag after validation and never counts again, so a caller's legal maximum
+        // of tags plus the balance tag must still build.
+        let standard = WalletABILimits.standard
+        let limits = try WalletABILimits(
+            maximumTextUTF8ByteCount: standard.maximumTextUTF8ByteCount,
+            maximumCollectionCount: standard.maximumCollectionCount,
+            maximumTagCount: standard.maximumTagCount + 1,
+            maximumLabelCount: standard.maximumLabelCount,
+            maximumBytePayloadCount: standard.maximumBytePayloadCount,
+            maximumAggregatePayloadByteCount: standard.maximumAggregatePayloadByteCount
+        )
+        return try WalletListOutputsRequest(
+            basket: target, tags: request.tags + [ListOutputsSpecOp.walletBalance],
+            tagQueryMode: request.tagQueryMode, include: request.include,
+            includeCustomInstructions: request.includeCustomInstructions, includeTags: request.includeTags,
+            includeLabels: request.includeLabels, pagination: request.pagination,
+            seekPermission: request.seekPermission, limits: limits
+        )
+    }
+
+    /// TS `Wallet.ts:1657-1661`, word for word.
+    static let balanceOfModuleBasketRefusal = "not a BRC-99 module basket: BRC-112 rejects "
+        + "`balance p <module> <basket>`; use `p <module> balance <basket>` if the module offers it."
 
     /// Stops tracking an output in a basket without spending it.
     public func relinquishOutput(

@@ -295,6 +295,159 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         XCTAssertEqual(arguments?["basket"]?.stringValue, "application basket")
     }
 
+    /// BRC-112, as TS `Wallet.validateListOutputsArgs` (`test/Wallet/list/listOutputs.brc112.test.ts`):
+    /// `balance default` asks storage for the default basket with the wallet-balance tag, and the
+    /// answer is the satoshi sum with no outputs. The sum can pass `UInt32.max`.
+    func test_aBalanceBasketAsksStorageForTheBasketsBalance() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":5000000000,"outputs":[]}}"#])
+
+        let result = try await wallet.listOutputs(try WalletListOutputsRequest(basket: "balance default"))
+
+        XCTAssertEqual(result.totalOutputs, 5_000_000_000)
+        XCTAssertEqual(result.outputs, [])
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["basket"]?.stringValue, "default")
+        XCTAssertEqual(arguments?["tags"]?.arrayValue?.compactMap(\.stringValue), [ListOutputsSpecOp.walletBalance])
+    }
+
+    /// The prefix is read after the SDK's trim and lowercase, and the caller's tags come first.
+    func test_aBalanceBasketIsReadAsTheSDKNormalizesItAndKeepsTheCallersTags() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":7,"outputs":[]}}"#])
+
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(
+            basket: "  Balance Tickets ", tags: ["kind:test"], tagQueryMode: .all
+        ))
+
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["basket"]?.stringValue, "tickets")
+        XCTAssertEqual(arguments?["tags"]?.arrayValue?.compactMap(\.stringValue),
+                       ["kind:test", ListOutputsSpecOp.walletBalance])
+        XCTAssertEqual(arguments?["tagQueryMode"]?.stringValue, "all")
+    }
+
+    /// `balance p <module> <basket>` is refused before storage is asked, with the TS wording.
+    /// Whitespace after `balance ` does not get round it: storage trims the basket it receives,
+    /// so the remainder is trimmed before the check (stricter than TS, which answers 0).
+    func test_aBalanceOfAModuleBasketIsRefused() async throws {
+        let (wallet, transport) = try wallet()
+        let baskets = [
+            "balance p color abc", "balance p color balance abc", "balance p btms",
+            "balance  p color abc", "balance \tp color abc", "balance \u{00A0}p color abc", "Balance P Color ABC",
+        ]
+        for basket in baskets {
+            do {
+                _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: basket))
+                XCTFail("\(basket) was accepted")
+            } catch let WireError.invalidParameter(name, message) {
+                XCTAssertEqual(name, "basket")
+                XCTAssertEqual(message, "not a BRC-99 module basket: BRC-112 rejects `balance p <module> <basket>`; "
+                    + "use `p <module> balance <basket>` if the module offers it.")
+            }
+        }
+        let sent = try await transport.envelopes()
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    /// Extra whitespace after the prefix is trimmed, as storage would trim it: `balance  default`
+    /// is the default basket's balance (TS looks up the literal ` default` and answers 0).
+    func test_whitespaceAfterTheBalancePrefixIsTrimmed() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":3,"outputs":[]}}"#])
+
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: "balance  default"))
+
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["basket"]?.stringValue, "default")
+        XCTAssertEqual(arguments?["tags"]?.arrayValue?.compactMap(\.stringValue), [ListOutputsSpecOp.walletBalance])
+    }
+
+    /// Every other member of the request reaches storage as the caller set it.
+    func test_aBalanceRequestKeepsTheCallersOtherArguments() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":0,"outputs":[]}}"#])
+
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(
+            basket: "balance tickets", include: .entireTransactions, includeCustomInstructions: true,
+            includeTags: true, includeLabels: true, pagination: try WalletPagination(limit: 25, offset: 50),
+            seekPermission: false
+        ))
+
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["includeTransactions"]?.boolValue, true)
+        XCTAssertEqual(arguments?["includeLockingScripts"]?.boolValue, false)
+        XCTAssertEqual(arguments?["includeCustomInstructions"]?.boolValue, true)
+        XCTAssertEqual(arguments?["includeTags"]?.boolValue, true)
+        XCTAssertEqual(arguments?["includeLabels"]?.boolValue, true)
+        XCTAssertEqual(arguments?["limit"]?.intValue, 25)
+        XCTAssertEqual(arguments?["offset"]?.intValue, 50)
+        XCTAssertEqual(arguments?["seekPermission"]?.boolValue, false)
+        XCTAssertEqual(arguments?["tagQueryMode"]?.stringValue, "any")
+    }
+
+    /// A caller may send the most tags a request allows; the balance tag is added on top, as TS
+    /// appends it after validation.
+    func test_aBalanceRequestWithTheMostTagsStillBuilds() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":0,"outputs":[]}}"#])
+        let tags = (0..<WalletABILimits.standard.maximumTagCount).map { "t\($0)" }
+
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: "balance tickets", tags: tags))
+
+        let sent = try await transport.envelopes()[0]["params"]?.arrayValue?[1]["tags"]?.arrayValue?
+            .compactMap(\.stringValue)
+        XCTAssertEqual(sent, tags + [ListOutputsSpecOp.walletBalance])
+    }
+
+    /// The 300-byte bound is on the whole `balance <basket>` string, as TS validates the basket
+    /// before cutting the prefix.
+    func test_theBasketBoundCoversTheWholeBalanceBasket() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":0,"outputs":[]}}"#])
+        let longest = "balance " + String(repeating: "a", count: 292)
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: longest))
+        let sentBasket = try await transport.envelopes()[0]["params"]?.arrayValue?[1]["basket"]?.stringValue
+        XCTAssertEqual(sentBasket, String(repeating: "a", count: 292))
+
+        do {
+            _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: longest + "a"))
+            XCTFail("a 301-byte basket was accepted")
+        } catch let WireError.invalidParameter(name, message) {
+            XCTAssertEqual(name, "basket")
+            XCTAssertEqual(message, "no more than 300 length.")
+        }
+        let sentCount = try await transport.envelopes().count
+        XCTAssertEqual(sentCount, 1)
+    }
+
+    /// The balance tag goes last even when the caller already sent it or another special-operation
+    /// tag; storage acts on the first special-operation tag it finds (TS `resolveTagSpecOp`).
+    func test_theBalanceTagIsAppendedAfterTheCallersSpecialOperationTags() async throws {
+        let (wallet, transport) = try wallet(answers: [
+            #"{"result":{"totalOutputs":0,"outputs":[]}}"#, #"{"result":{"totalOutputs":0,"outputs":[]}}"#,
+        ])
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(
+            basket: "balance tickets", tags: [ListOutputsSpecOp.walletBalance]))
+        _ = try await wallet.listOutputs(try WalletListOutputsRequest(
+            basket: "balance tickets", tags: [ListOutputsSpecOp.basketPrefixOutputs, "color"]))
+
+        let sent = try await transport.envelopes().map {
+            $0["params"]?.arrayValue?[1]["tags"]?.arrayValue?.compactMap(\.stringValue)
+        }
+        XCTAssertEqual(sent[0], [ListOutputsSpecOp.walletBalance, ListOutputsSpecOp.walletBalance])
+        XCTAssertEqual(sent[1], [ListOutputsSpecOp.basketPrefixOutputs, "color", ListOutputsSpecOp.walletBalance])
+    }
+
+    /// Only a basket that starts with `balance ` is a balance request. A module's own
+    /// `p <module> balance <basket>` and look-alikes go to storage without the balance tag, and
+    /// storage normalizes them as it does any basket.
+    func test_otherBasketsAreNotBalanceRequests() async throws {
+        let baskets = ["p color balance abc", "balancer", "balance", "my balance default", " Tickets ", "Balancer"]
+        let (wallet, transport) = try wallet(answers: baskets.map { _ in #"{"result":{"totalOutputs":0,"outputs":[]}}"# })
+        for basket in baskets {
+            _ = try await wallet.listOutputs(try WalletListOutputsRequest(basket: basket))
+        }
+        let sent = try await transport.envelopes().map { $0["params"]?.arrayValue?[1] }
+        XCTAssertEqual(sent.map { $0?["basket"]?.stringValue },
+                       ["p color balance abc", "balancer", "balance", "my balance default", "tickets", "balancer"])
+        XCTAssertTrue(sent.allSatisfy { $0?["tags"]?.arrayValue?.isEmpty == true })
+    }
+
     func test_relinquishOutputMapsSuccessfulStorageUpdateToBRC100Result() async throws {
         let (wallet, transport) = try wallet(answers: [#"{"result":1}"#])
         let output = try Outpoint(
