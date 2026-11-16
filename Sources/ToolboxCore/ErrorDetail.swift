@@ -107,7 +107,9 @@ package enum ErrorDetail {
     /// make itself goes through here.
     ///
     /// Most errors are `String(reflecting:)`, which for the toolbox's own types is their
-    /// `debugDescription`. A Foundation error (`NSError`, `URLError`) reflects its whole
+    /// `debugDescription`, with the query cut from every URL in it (``withoutQueries(_:)``): an
+    /// error that wraps a URL error (as a case's value or a stored property) reflects the URL
+    /// error's `userInfo` too. A Foundation error (`NSError`, `URLError`) reflects its whole
     /// `userInfo`, and a URL error's holds the failing URL with its query, which can carry a
     /// token. One in the URL domain, or one carrying a failing URL or an underlying error, is
     /// logged as its domain, code, description and the URL's host and path, and the error under
@@ -117,7 +119,7 @@ package enum ErrorDetail {
               foundation.domain == NSURLErrorDomain
                 || foundation.info[failingURLKey] != nil || foundation.info[failingURLStringKey] != nil
                 || foundation.info[NSUnderlyingErrorKey] != nil else {
-            return String(reflecting: error)
+            return withoutQueries(String(reflecting: error))
         }
         return describe(foundation, depth: 0)
     }
@@ -159,7 +161,7 @@ package enum ErrorDetail {
                 inner = depth < underlyingDepthLimit
                     ? describe(foundation, depth: depth + 1) : "\(foundation.domain) \(foundation.code)"
             } else {
-                inner = String(reflecting: underlying)
+                inner = withoutQueries(String(reflecting: underlying))
             }
             text += "; underlying: \(inner)"
         }

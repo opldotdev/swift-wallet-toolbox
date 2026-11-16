@@ -91,6 +91,35 @@ final class ErrorDetailTests: XCTestCase {
         XCTAssertEqual(ErrorDetail.describe(plain), String(reflecting: plain))
     }
 
+    func test_anErrorWrappingAURLErrorIsLoggedWithoutItsQuery() throws {
+        struct Wrapper: Error { let underlying: any Error }
+        enum Wrapped: Error { case failed(any Error) }
+        let url = try XCTUnwrap(URL(string: "https://wallet.example/api/x?auth_token=SECRET"))
+        let urlError = URLError(.timedOut, userInfo: [
+            "NSErrorFailingURLKey": url,
+            "NSErrorFailingURLStringKey": url.absoluteString,
+            NSLocalizedDescriptionKey: "The request to \(url.absoluteString) timed out.",
+        ])
+        let ns = NSError(domain: "dev.opl.test", code: 3, userInfo: [
+            NSLocalizedDescriptionKey: "GET \(url.absoluteString) failed",
+        ])
+        for error in [Wrapper(underlying: urlError), Wrapped.failed(urlError), Wrapper(underlying: ns)] as [any Error] {
+            let logged = ErrorDetail.describe(error)
+            XCTAssertFalse(logged.contains("SECRET"), logged)
+            XCTAssertFalse(logged.contains("auth_token"), logged)
+        }
+    }
+
+    func test_anUnderlyingSwiftErrorIsLoggedWithoutItsQuery() {
+        struct Inner: Error, CustomDebugStringConvertible {
+            var debugDescription: String { "Inner: GET https://wallet.example/inner?auth_token=SECRET" }
+        }
+        let outer = NSError(domain: NSURLErrorDomain, code: -1001, userInfo: [NSUnderlyingErrorKey: Inner()])
+        let logged = ErrorDetail.describe(outer)
+        XCTAssertFalse(logged.contains("SECRET"), logged)
+        XCTAssertTrue(logged.contains("underlying: Inner: GET https://wallet.example/inner"), logged)
+    }
+
     func test_withoutQueriesCutsOnlyURLs() {
         XCTAssertEqual(
             ErrorDetail.withoutQueries("GET https://h.example/p?token=x failed? yes https://h.example/q#f h.example/r?a=b"),

@@ -2,6 +2,7 @@ import Foundation
 import BSVAuth
 import BSVKeys
 import BSVWallet
+import ToolboxCore
 import ToolboxStorage
 
 extension RemoteWallet {
@@ -57,7 +58,7 @@ extension RemoteWallet {
             _ = try await CertificateEngine.acquire(master, using: protoWallet)
         } catch {
             throw WalletError.invalidCertificate(
-                "valid encrypted and signed certificate and keyring from revealer. \(error)"
+                "valid encrypted and signed certificate and keyring from revealer. \(ErrorDetail.describe(error))"
             )
         }
 
