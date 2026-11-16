@@ -590,6 +590,33 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(isActive)
     }
 
+    /// Storage reserved coins but not their history, and has nothing more to add. The error says
+    /// why the coins went unused instead of reporting a plain shortfall.
+    func test_onlyUnprovableReservationsReportIncompleteHistory() async throws {
+        let auth = try auth
+        let absent = try TransactionID(wireBytes: [UInt8](repeating: 0xee, count: 32))
+        let storage = FakeBatchStorage(capabilities: capabilities()) {
+            try self.begin($0, funding: [try self.utxo(spending: Outpoint(transactionID: absent, outputIndex: 0))])
+        }
+        let batch = controller(storage)
+
+        do {
+            _ = try await batch.plan(auth, try anchorRequest())
+            XCTFail("an unprovable coin funded the anchor")
+        } catch let error as ActionBatchError {
+            guard case .fundingHistoryIncomplete(let more) = error else {
+                return XCTFail("expected fundingHistoryIncomplete, got \(error)")
+            }
+            XCTAssertGreaterThan(more, 0)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Some of this wallet's coins can't be spent right now because their transaction history is incomplete, and the rest don't cover this action."
+            )
+        }
+        let calls = await storage.calls
+        XCTAssertEqual(calls, ["getCapabilities", "beginActionBatch", "extendActionBatch", "abortActionBatch"])
+    }
+
     func test_theLeaseIsRenewedPastEightyPercent() async throws {
         let auth = try auth
         let clock = TestClock(start)

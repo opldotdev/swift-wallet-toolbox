@@ -7,6 +7,7 @@ import BSVWallet
 import ToolboxAuth
 import ToolboxBRC29
 import ToolboxCore
+import ToolboxPaymail
 import ToolboxStorage
 import ToolboxStorageClient
 import XCTest
@@ -113,12 +114,51 @@ final class RemoteWalletActionTests: XCTestCase {
         XCTAssertEqual(methods, ["createAction", "abortAction"])
     }
 
+    /// A paymail host is told about the payment with its BEEF. When the funded graph cannot prove
+    /// the payment, it is stopped before the broadcast and its inputs released, so no money moves
+    /// that the host would never hear about.
+    func testAPaymailPaymentWhoseBEEFCannotBeBuiltIsReleasedBeforeBroadcast() async throws {
+        let fixture = try Fixture(omitsFunding: true, isPayment: true)
+        let host = PaymailHost()
+        do {
+            _ = try await fixture.wallet.pay(
+                to: "alice@example.com", satoshis: 42, description: "Paymail payment",
+                paymail: Paymail(http: host)
+            )
+            XCTFail("paid without BEEF")
+        } catch {
+            guard case BEEFError.missingAncestor = error else {
+                return XCTFail("expected missingAncestor, got \(error)")
+            }
+        }
+        let methods = await fixture.transport.methods
+        XCTAssertEqual(methods, ["createAction", "abortAction"])
+        let delivered = await host.delivered
+        XCTAssertTrue(delivered.isEmpty)
+    }
+
+    func testAPaymailPaymentDeliversTheBEEFBuiltBeforeBroadcast() async throws {
+        let fixture = try Fixture(isPayment: true)
+        let host = PaymailHost()
+        _ = try await fixture.wallet.pay(
+            to: "alice@example.com", satoshis: 42, description: "Paymail payment",
+            paymail: Paymail(http: host)
+        )
+        let methods = await fixture.transport.methods
+        XCTAssertEqual(methods, ["createAction", "processAction"])
+        let delivered = await host.delivered
+        XCTAssertEqual(delivered, [PaymailHost.beefURL])
+    }
+
     private struct Fixture {
         let wallet: RemoteWallet
         let transport: ActionTransport
         let foreign: Transaction?
 
-        init(foreign: Bool = false, wrongAmount: Bool = false) throws {
+        init(
+            foreign: Bool = false, wrongAmount: Bool = false, omitsFunding: Bool = false,
+            isPayment: Bool = false
+        ) throws {
             let key = try PrivateKey([UInt8](repeating: 1, count: 32))
             let spending = try BRC29.receivingPrivateKey(recipient: key, sender: key.publicKey, prefix: "Pr==", suffix: "Su==")
             let funding = Transaction(outputs: [TransactionOutput(
@@ -127,7 +167,10 @@ final class RemoteWalletActionTests: XCTestCase {
             self.foreign = foreign ? Transaction(outputs: [TransactionOutput(
                 satoshis: 100, lockingScript: try Script(bytes: [0x51], maximumByteCount: 100)
             )]) : nil
-            transport = ActionTransport(funding: funding, foreign: self.foreign, wrongAmount: wrongAmount)
+            transport = ActionTransport(
+                funding: funding, foreign: self.foreign, wrongAmount: wrongAmount, omitsFunding: omitsFunding,
+                isPayment: isPayment
+            )
             wallet = RemoteWallet(
                 storage: StorageClient(endpoint: URL(string: "https://storage.example")!, transport: transport),
                 identityKey: key,
@@ -160,11 +203,19 @@ private actor ActionTransport: AuthenticatedTransport {
     let funding: Transaction
     let foreign: Transaction?
     let wrongAmount: Bool
+    /// Leaves the funding transaction out of the returned `inputBeef`, as storage that lost it would.
+    let omitsFunding: Bool
+    /// `RemoteWallet.pay` funds through storage directly rather than the BRC-100 `createAction`.
+    let isPayment: Bool
     var methods: [String] = []
     private var processed: JSONValue?
 
-    init(funding: Transaction, foreign: Transaction?, wrongAmount: Bool) {
+    init(
+        funding: Transaction, foreign: Transaction?, wrongAmount: Bool, omitsFunding: Bool = false,
+        isPayment: Bool = false
+    ) {
         self.funding = funding; self.foreign = foreign; self.wrongAmount = wrongAmount
+        self.omitsFunding = omitsFunding; self.isPayment = isPayment
     }
     func processArguments() -> JSONValue? { processed }
 
@@ -177,7 +228,7 @@ private actor ActionTransport: AuthenticatedTransport {
         let result: JSONValue
         switch name {
         case "createAction":
-            XCTAssertEqual(args["includeAllSourceTransactions"]?.boolValue, true)
+            if !isPayment { XCTAssertEqual(args["includeAllSourceTransactions"]?.boolValue, true) }
             let transactions = (foreign.map { [$0] } ?? []) + [funding]
             let inputs = try transactions.enumerated().map { index, tx -> JSONValue in
                 var row: [String: JSONValue] = [
@@ -198,7 +249,8 @@ private actor ActionTransport: AuthenticatedTransport {
                 value["vout"] = .number(Double(index)); value["providedBy"] = .string("you")
                 return .object(value)
             }
-            let graph = try BEEF(merklePaths: [], transactions: transactions.map { .raw($0) }, limits: StorageLimits.beef)
+            let graphTransactions = omitsFunding ? Array(transactions.dropLast()) : transactions
+            let graph = try BEEF(merklePaths: [], transactions: graphTransactions.map { .raw($0) }, limits: StorageLimits.beef)
             result = .object([
                 "reference": .string("dGVzdA=="), "version": .number(1), "lockTime": .number(0),
                 "inputs": .array(inputs.reversed()), "outputs": .array(outputs),
@@ -213,5 +265,43 @@ private actor ActionTransport: AuthenticatedTransport {
         return AuthenticatedResponse(statusCode: 200, headers: [:], body: Array(try JSONEncoder().encode(JSONValue.object([
             "jsonrpc": .string("2.0"), "id": rpc["id"]!, "result": result
         ]))))
+    }
+}
+
+/// A paymail host for `alice@example.com` with destination and receive-BEEF capabilities. It
+/// records the delivery URLs it was posted to.
+private actor PaymailHost: PaymailHTTP {
+    static let dnsURL = "https://dns.google.com/resolve?name=_bsvalias._tcp.example.com&type=SRV&cd=0"
+    static let capabilitiesURL = "https://example.com:443/.well-known/bsvalias"
+    static let destinationURL = "https://pay.example.com/alice/example.com/destination"
+    static let beefURL = "https://pay.example.com/alice/example.com/beef"
+
+    private(set) var delivered: [String] = []
+
+    func get(_ url: URL) async throws -> (status: Int, body: [UInt8]) {
+        switch url.absoluteString {
+        case Self.dnsURL:
+            return (200, Array(#"{"Status":3}"#.utf8))
+        case Self.capabilitiesURL:
+            return (200, Array("""
+                {"capabilities":{\
+                "2a40af698840":"https://pay.example.com/{alias}/{domain.tld}/destination",\
+                "5c55a7fdb7bb":"https://pay.example.com/{alias}/{domain.tld}/beef"}}
+                """.utf8))
+        default:
+            throw URLError(.badURL)
+        }
+    }
+
+    func post(_ url: URL, json: [UInt8]) async throws -> (status: Int, body: [UInt8]) {
+        switch url.absoluteString {
+        case Self.destinationURL:
+            return (200, Array(#"{"reference":"payment-reference","outputs":[{"script":"51","satoshis":42}]}"#.utf8))
+        case Self.beefURL:
+            delivered.append(url.absoluteString)
+            return (200, Array("{}".utf8))
+        default:
+            throw URLError(.badURL)
+        }
     }
 }

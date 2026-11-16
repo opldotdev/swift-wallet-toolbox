@@ -245,7 +245,10 @@ public struct RemoteWallet: Sendable {
                     outputDescription: description
                 )
             }
-            let result = try await sign(outputs, description: description, labels: labels)
+            // The host is told about the payment with its BEEF, so the BEEF is built before the
+            // broadcast; a funded graph that cannot prove the payment stops it with its inputs
+            // released, rather than leaving money on chain that the host was never told about.
+            let result = try await sign(outputs, description: description, labels: labels, requiresBEEF: true)
             if result.sent.results.contains(where: { $0.status == .failed }) {
                 throw WalletError.broadcastFailed(txid: result.sent.transactionID.displayHex)
             }
@@ -268,9 +271,8 @@ public struct RemoteWallet: Sendable {
                 metadata = nil
             }
             do {
-                let beef = (try? result.signed.beef()) ?? []
                 try await resolver.deliver(
-                    beef: beef,
+                    beef: result.beef ?? [],
                     to: recipient,
                     reference: destination.reference,
                     metadata: metadata,
@@ -404,13 +406,18 @@ public struct RemoteWallet: Sendable {
         guard released else { throw BRC29PaymentError.notReleased(reference: reference) }
     }
 
-    /// Funds, signs and broadcasts the outputs, returning both the signed action (for a paymail
-    /// BEEF delivery) and the receipt.
+    /// Funds, signs and broadcasts the outputs, returning the signed action, its BRC-62 BEEF when
+    /// `requiresBEEF` (for a paymail delivery), and the receipt.
+    ///
+    /// With `requiresBEEF`, the BEEF is built before `processAction`; when the funded graph cannot
+    /// prove the transaction, the funded action is aborted and the `BEEFError` thrown, so nothing
+    /// is broadcast.
     private func sign(
         _ outputs: [WalletCreateActionOutput],
         description: String,
-        labels: [String]
-    ) async throws -> (signed: SignedAction, sent: SentPayment) {
+        labels: [String],
+        requiresBEEF: Bool = false
+    ) async throws -> (signed: SignedAction, beef: [UInt8]?, sent: SentPayment) {
         let request = try WalletCreateActionRequest(
             description: description, outputs: outputs, labels: labels
         )
@@ -425,10 +432,24 @@ public struct RemoteWallet: Sendable {
         )
 
         let signed = try SignedAction(funded: funded, transaction: transaction)
+        var beef: [UInt8]?
+        if requiresBEEF {
+            do {
+                beef = try signed.beef()
+            } catch {
+                // Nothing outside this call holds the reference; the BEEF error is what the
+                // caller needs, so the abort is best effort, in its own task so a cancelled
+                // caller still releases the inputs.
+                let reference = funded.reference
+                _ = try? await Task { try await self.abort(reference: reference) }.value
+                throw error
+            }
+        }
         let result = try await storage.processAction(auth, try signed.processRequest())
 
         return (
             signed,
+            beef,
             SentPayment(
                 transactionID: signed.transactionID,
                 reference: funded.reference,

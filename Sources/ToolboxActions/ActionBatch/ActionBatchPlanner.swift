@@ -9,6 +9,9 @@ import ToolboxStorage
 public enum ActionBatchError: Error, Equatable, Sendable, LocalizedError {
     /// The reserved funding, plus whatever storage would add, does not cover the action.
     case insufficientFunds(moreSatoshisNeeded: UInt64)
+    /// As `insufficientFunds`, when storage reserved coins whose transaction history it did not
+    /// send in full, so they could not be spent, and has nothing more to add.
+    case fundingHistoryIncomplete(moreSatoshisNeeded: UInt64)
     /// An input or `fundFrom` outpoint cannot be used as given.
     case invalidInput(String)
     /// The batch is in a state where the call makes no sense.
@@ -19,6 +22,8 @@ public enum ActionBatchError: Error, Equatable, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .insufficientFunds(let more): "Action batch needs \(more) more satoshis."
+        case .fundingHistoryIncomplete:
+            "Some of this wallet's coins can't be spent right now because their transaction history is incomplete, and the rest don't cover this action."
         case .invalidInput(let reason): "Action batch input: \(reason)"
         case .invalidOperation(let reason): "Action batch: \(reason)"
         case .manifestTooLarge(let bytes, let limit):
@@ -278,19 +283,25 @@ struct PlannerState: Sendable {
             || transaction(outpoint.transactionID.displayHex) != nil
     }
 
-    /// Whether the shared graph holds everything needed to prove `txid`: the transaction itself
-    /// and, below each transaction without a merkle path, every parent it spends. A
-    /// transaction-ID-only record or a transaction with a merkle path ends a line.
-    ///
-    /// A reserved output that fails this cannot be funded from: the member's input graph would be
-    /// cut short, and its Atomic BEEF could not be built however often the action is retried.
-    func hasCompleteAncestry(_ txid: TransactionID) -> Bool {
+    /// The shared graph's records by transaction ID, built once per funding pass.
+    func graphIndex() -> [TransactionID: BEEFTransaction] {
         let limits = Self.beefLimits.transactionLimits
         var entries: [TransactionID: BEEFTransaction] = [:]
         for entry in sharedBeef.transactions {
-            guard let id = try? entry.transactionID(limits: limits) else { return false }
+            guard let id = try? entry.transactionID(limits: limits) else { continue }
             entries[id] = entry
         }
+        return entries
+    }
+
+    /// Whether the shared graph holds everything needed to prove `txid`: the transaction itself
+    /// and, below each transaction without a merkle path, every parent it spends. A
+    /// transaction-ID-only record or a transaction with a merkle path ends a line. `entries` is
+    /// `graphIndex()`.
+    ///
+    /// A reserved output that fails this cannot be funded from: the member's input graph would be
+    /// cut short, and its Atomic BEEF could not be built however often the action is retried.
+    func hasCompleteAncestry(_ txid: TransactionID, in entries: [TransactionID: BEEFTransaction]) -> Bool {
         var visited = Set<TransactionID>()
         var stack = [txid]
         while let next = stack.popLast() {
@@ -301,6 +312,27 @@ struct PlannerState: Sendable {
             stack.append(contentsOf: transaction.inputs.map(\.previousOutput.transactionID))
         }
         return true
+    }
+
+    /// The unconsumed reservations funding may use, and the ones it passes over because the
+    /// shared graph cannot prove them.
+    func fundableReservations() -> (provable: [PlannerOutput], unprovable: [PlannerOutput]) {
+        let entries = graphIndex()
+        var known: [String: Bool] = [:]
+        var provable: [PlannerOutput] = []
+        var unprovable: [PlannerOutput] = []
+        for output in reserved.values where !consumed.contains(output.outpoint) {
+            let complete: Bool
+            if let cached = known[output.txid] {
+                complete = cached
+            } else {
+                complete = (try? TransactionID(displayHex: output.txid))
+                    .map { hasCompleteAncestry($0, in: entries) } ?? false
+                known[output.txid] = complete
+            }
+            if complete { provable.append(output) } else { unprovable.append(output) }
+        }
+        return (provable, unprovable)
     }
 
     /// `stageTransactionOutputs`: a processed member's outputs become spendable by the next.
@@ -523,14 +555,7 @@ enum ActionBatchPlanner {
         // A reservation whose source cannot be proven from the shared graph is passed over, so
         // the next usable one funds the action instead; a later extension can still supply the
         // missing ancestry and make it eligible.
-        var provable: [String: Bool] = [:]
-        var candidates = state.reserved.values.filter { output in
-            guard !state.consumed.contains(output.outpoint) else { return false }
-            if let known = provable[output.txid] { return known }
-            let complete = (try? TransactionID(displayHex: output.txid)).map(state.hasCompleteAncestry) ?? false
-            provable[output.txid] = complete
-            return complete
-        }
+        var candidates = state.fundableReservations().provable
 
         while true {
             let inputSatoshis = fixedInputSatoshis + allocated.reduce(UInt64(0)) { $0 + $1.satoshis }
