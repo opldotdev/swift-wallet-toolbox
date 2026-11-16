@@ -127,6 +127,23 @@ final class ErrorDetailTests: XCTestCase {
         )
     }
 
+    func test_withoutQueriesEndsTheCutWhereTheURLEnds() {
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries(#"{"url":"https://h/p?x=1","txid":"abc"}"#),
+            #"{"url":"https://h/p","txid":"abc"}"#
+        )
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries(#"{"a":"https://h/p?x=1","b":"https://h/q?y=2","n":"why?"}"#),
+            #"{"a":"https://h/p","b":"https://h/q","n":"why?"}"#
+        )
+        XCTAssertEqual(ErrorDetail.withoutQueries("see https://h/p?ids=a,b&token=SECRET now"), "see https://h/p now")
+        XCTAssertEqual(ErrorDetail.withoutQueries("(https://h/p?x=1), next"), "(https://h/p), next")
+        XCTAssertEqual(
+            ErrorDetail.withoutQueries("UserInfo={NSErrorFailingURLKey=https://w.example/x?auth_token=SECRET}"),
+            "UserInfo={NSErrorFailingURLKey=https://w.example/x}"
+        )
+    }
+
     func test_wireErrorDebugDescriptionCarriesNameAndMessage() {
         XCTAssertEqual(
             String(reflecting: WireError.insufficientFunds("need 500 more")),

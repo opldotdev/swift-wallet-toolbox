@@ -168,13 +168,61 @@ package enum ErrorDetail {
         return text
     }
 
-    /// Text with the query and fragment cut from every URL in it: a word with `://`, or one whose
-    /// `?` is followed by a `name=value`.
+    /// Text with the query and fragment cut from every URL in it: a `?` or `#` in a word with
+    /// `://` before it, or one whose query holds a `name=value`.
+    ///
+    /// The cut ends where the URL does: at a quote, `<`, `>` or whitespace, or at `,`, `)`, `}` or
+    /// `]` when no `=` or `&` follows in the same word (so `?ids=a,b&token=x` is cut whole), and
+    /// the text after it is kept: `{"url":"https://h/p?x=1","txid":"…"}` keeps its txid.
     package static func withoutQueries(_ text: String) -> String {
-        text.split(separator: " ", omittingEmptySubsequences: false).map { (word: Substring) -> String in
-            guard let cut = word.firstIndex(where: { $0 == "?" || $0 == "#" }),
-                  word.contains("://") || word.suffix(from: cut).contains("=") else { return String(word) }
-            return String(word.prefix(upTo: cut))
-        }.joined(separator: " ")
+        text.split(separator: " ", omittingEmptySubsequences: false)
+            .map { (word: Substring) -> String in cutQueries(word) }
+            .joined(separator: " ")
+    }
+
+    /// `word` with each URL query and fragment in it removed.
+    private static func cutQueries(_ word: Substring) -> String {
+        var result = ""
+        var rest = word
+        while let cut = rest.firstIndex(where: { (character: Character) -> Bool in character == "?" || character == "#" }) {
+            let head = rest[rest.startIndex..<cut]
+            let end = queryEnd(rest[cut...])
+            let query = rest[cut..<end]
+            // The URL this query belongs to starts after the last character that ends one.
+            let urlStart = head.lastIndex(where: { (character: Character) -> Bool in endsURL(character) })
+                .map { head.index(after: $0) } ?? head.startIndex
+            result.append(contentsOf: head)
+            if !(head[urlStart...].contains("://") || query.contains(where: { (character: Character) -> Bool in character == "=" })) {
+                result.append(contentsOf: query)
+            }
+            rest = rest[end...]
+        }
+        result.append(contentsOf: rest)
+        return result
+    }
+
+    /// Where the query at the start of `tail` ends.
+    private static func queryEnd(_ tail: Substring) -> Substring.Index {
+        var index = tail.startIndex
+        while index < tail.endIndex {
+            let character = tail[index]
+            if character.isWhitespace || "\"'<>".contains(character) { return index }
+            if ",)}]".contains(character) {
+                let after = tail[tail.index(after: index)...]
+                let stop = after.firstIndex(where: { (next: Character) -> Bool in
+                    next.isWhitespace || "\"'<>".contains(next)
+                }) ?? after.endIndex
+                if !after[after.startIndex..<stop].contains(where: { (next: Character) -> Bool in next == "=" || next == "&" }) {
+                    return index
+                }
+            }
+            index = tail.index(after: index)
+        }
+        return tail.endIndex
+    }
+
+    /// A character that cannot be part of a URL in reflected or JSON text.
+    private static func endsURL(_ character: Character) -> Bool {
+        character.isWhitespace || "\"'<>,()[]{}".contains(character)
     }
 }
