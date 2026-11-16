@@ -160,11 +160,15 @@ private final class ShipOverlay: OverlayLookupResolving, @unchecked Sendable {
 
     init(hosts: [String]) throws {
         let operator_ = try PrivateKey(Array(repeating: 0, count: 31) + [9])
+        // As a TS wallet signs and locks it: the operator identity's BRC-42 child for counterparty
+        // "anyone", invoice `2-service host interconnect-1` (`OverlayAdminTokenTemplate.ts`).
+        let anyone = try PrivateKey(Array(repeating: 0, count: 31) + [1]).publicKey
+        let linked = try operator_.derivedChild(with: anyone, invoiceNumber: "2-service host interconnect-1")
         func token(_ host: String, topic: String) throws -> OutputListItem {
             let fields = [Array("SHIP".utf8), operator_.publicKey.compressedBytes, Array(host.utf8), Array(topic.utf8)]
-            let signature = try operator_.sign(digest: BSVHashing.sha256(fields.flatMap { $0 }))
+            let signature = try linked.sign(digest: BSVHashing.sha256(fields.flatMap { $0 }))
             let lock = try PushDrop.lockingScript(fields: fields + [signature.derBytes],
-                publicKey: operator_.publicKey, lockPosition: .beforeCompatibility)
+                publicKey: linked.publicKey, lockPosition: .beforeCompatibility)
             let transaction = Transaction(version: 1, inputs: [],
                 outputs: [TransactionOutput(satoshis: 1, lockingScript: lock)], lockTime: 0)
             let beef = try BEEF(merklePaths: [], transactions: [.raw(transaction)], limits: StorageLimits.beef)
