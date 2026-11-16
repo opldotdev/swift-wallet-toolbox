@@ -97,19 +97,28 @@ public actor StorageClient {
     }
 
     private func send(_ method: String, id: Int, body: [UInt8]) async throws -> JSONValue {
-        let response = try await transport.send(
-            method: "POST",
-            path: endpoint.path.isEmpty ? "/" : endpoint.path,
-            query: nil,
-            headers: ["Content-Type": "application/json"],
-            body: body
-        )
+        let response: AuthenticatedResponse
+        do {
+            response = try await transport.send(
+                method: "POST",
+                path: endpoint.path.isEmpty ? "/" : endpoint.path,
+                query: nil,
+                headers: ["Content-Type": "application/json"],
+                body: body
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Rethrown as it is; the log adds which storage call it was.
+            Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) failed: \(String(reflecting: error))")
+            throw error
+        }
 
         let envelope: JSONValue
         do {
             envelope = try JSONDecoder().decode(JSONValue.self, from: Data(response.body))
         } catch {
-            throw StorageClientError.unreadableResponse(method: method)
+            throw logged(.unreadableResponse(method: method), response, "not JSON: \(String(reflecting: error))")
         }
 
         // A well-formed JSON-RPC reply names its version and echoes the request's id. The
@@ -117,13 +126,16 @@ public actor StorageClient {
         // authentication check — but an authenticated yet malformed envelope is still not one to
         // read a result out of.
         guard envelope["jsonrpc"]?.stringValue == "2.0", envelope["id"]?.intValue == id else {
-            throw StorageClientError.unreadableResponse(method: method)
+            throw logged(.unreadableResponse(method: method), response, "not a JSON-RPC reply to id \(id)")
         }
 
         // The error member wins over the result member. A server that sent both is malformed, and
         // preferring the result would turn a reported failure into a silent success.
         if let failure = envelope["error"], failure != .null {
-            throw WireError.decode(jsonObject: failure)
+            let error = WireError.decode(jsonObject: failure)
+            Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) answered HTTP "
+                + "\(response.statusCode): \(String(reflecting: error))")
+            throw error
         }
         // A missing `result` is not the same as a null one. JSON-RPC allows a null result, and
         // treating an absent member as null would hide a truncated response.
@@ -131,13 +143,27 @@ public actor StorageClient {
             // An HTTP failure with no error member is worth reporting as itself rather than as a
             // parse problem.
             guard (200..<300).contains(response.statusCode) else {
-                throw StorageClientError.httpFailure(
-                    method: method, statusCode: response.statusCode
+                throw logged(
+                    .httpFailure(method: method, statusCode: response.statusCode), response, "no error member"
                 )
             }
-            throw StorageClientError.unreadableResponse(method: method)
+            throw logged(.unreadableResponse(method: method), response, "no result member")
         }
         return result
+    }
+
+    /// Logs a reply that could not be used, with the storage call, status and body, and returns
+    /// the error to throw.
+    private func logged(
+        _ error: StorageClientError, _ response: AuthenticatedResponse, _ why: String
+    ) -> StorageClientError {
+        Self.log("storage \(error.method) on \(ErrorDetail.hostPath(endpoint)) answered HTTP "
+            + "\(response.statusCode) (\(why)); body: \(ErrorDetail.bodyPreview(response.body))")
+        return error
+    }
+
+    static func log(_ message: String) {
+        ToolboxLog.error("ToolboxStorageClient", message)
     }
 
     // MARK: - Storage
@@ -238,12 +264,21 @@ public enum StorageClientError: Error, Equatable, Sendable, LocalizedError {
     case unreadableResponse(method: String)
     case httpFailure(method: String, statusCode: Int)
 
+    /// The storage call that failed.
+    public var method: String {
+        switch self {
+        case .unreadableResponse(let method), .httpFailure(let method, _): method
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .unreadableResponse(let method):
-            "Storage \(method) could not be read."
-        case .httpFailure(_, let statusCode):
-            "Storage returned HTTP \(statusCode)."
+            "The wallet storage server sent a reply to \(method) that could not be read."
+        case .httpFailure(let method, let statusCode) where statusCode >= 500 || statusCode == 429:
+            "The wallet storage server could not handle \(method) (HTTP \(statusCode)). Try again later."
+        case .httpFailure(let method, let statusCode):
+            "The wallet storage server refused \(method) (HTTP \(statusCode))."
         }
     }
 }

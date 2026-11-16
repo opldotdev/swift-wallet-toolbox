@@ -281,6 +281,9 @@ public actor PermissionTokenRepository {
                 } catch {
                     try Task.checkCancellation()
                     try requireActive(epoch)
+                    // A token that does not decode grants nothing and is skipped; the log says why.
+                    PermissionLog.error("permission token \(output.outpoint) in \(query.basket) was "
+                        + "skipped: \(String(reflecting: error))")
                     continue
                 }
 

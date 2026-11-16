@@ -145,3 +145,14 @@ final class BRC39Tests: XCTestCase {
         return copy
     }
 }
+
+/// A backup that cannot be opened says why in words a person can act on.
+final class BRC39ErrorDescriptionTests: XCTestCase {
+    func test_descriptions() {
+        XCTAssertEqual(BRC39Error.badMagic.localizedDescription, "This is not an encrypted wallet backup file.")
+        XCTAssertEqual(
+            BRC39Error.invalidCiphertext.localizedDescription,
+            "This backup file is damaged: its encrypted part is incomplete."
+        )
+    }
+}

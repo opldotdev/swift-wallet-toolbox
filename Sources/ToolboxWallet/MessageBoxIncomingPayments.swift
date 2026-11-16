@@ -295,7 +295,10 @@ extension MessageBoxClient {
                 try await beforeAcknowledge?()
                 try await acknowledge(messageIds: [incoming.messageId])
             } catch {
+                // Reported as `acknowledged: false`: the funds are in; the reason goes to the log.
                 acknowledged = false
+                ToolboxLog.error("ToolboxWallet.MessageBox", "payment message \(incoming.messageId) "
+                    + "was internalized but not acknowledged: \(String(reflecting: error))")
             }
             await activePayments.end(messageId)
             return MessageBoxAcceptedPayment(payment: incoming, recipientPaymentInternalized: recipientPaymentInternalized,
@@ -496,6 +499,7 @@ extension MessageBoxClient {
         } catch let error as MessageBoxPaymentError {
             throw error
         } catch {
+            Self.log("an envelope payment could not be read: \(String(reflecting: error))")
             throw MessageBoxPaymentError.recipientPaymentFailed(.unreadable)
         }
     }
@@ -503,7 +507,12 @@ extension MessageBoxClient {
     /// A transaction that could not be read: `refused` when it only goes past a `StorageLimits`
     /// bound (size, counts, script length), `unreadable` otherwise.
     static func recipientPaymentReadFailure(_ error: any Error) -> MessageBoxPaymentError {
-        .recipientPaymentFailed(exceedsLimits(error) ? .refused : .unreadable)
+        Self.log("an envelope payment's transaction could not be read: \(String(reflecting: error))")
+        return .recipientPaymentFailed(exceedsLimits(error) ? .refused : .unreadable)
+    }
+
+    private static func log(_ message: String) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", message)
     }
 
     private static func exceedsLimits(_ error: any Error) -> Bool {
@@ -548,9 +557,13 @@ extension MessageBoxClient {
             result = try await wallet.internalizeAction(request)
         } catch {
             if isCancellation(error) { throw CancellationError() }
+            Self.log("the wallet did not internalize an envelope payment: \(String(reflecting: error))")
             throw MessageBoxPaymentError.recipientPaymentFailed(isUndecided(error) ? .unavailable(error) : .refused)
         }
-        guard result.accepted else { throw MessageBoxPaymentError.recipientPaymentFailed(.refused) }
+        guard result.accepted else {
+            Self.log("the wallet answered accepted: false for an envelope payment")
+            throw MessageBoxPaymentError.recipientPaymentFailed(.refused)
+        }
     }
 
     /// A wallet call failed before anything was decided about the payment: a cancellation, or
@@ -604,7 +617,15 @@ extension MessageBoxClient {
     }
 
     private func incomingPayment(_ row: ListedRow) async -> MessageBoxIncomingPayment? {
-        guard let plaintext = try? await open(row.message) else { return nil }
+        let plaintext: String
+        do {
+            plaintext = try await open(row.message)
+        } catch {
+            // A message this wallet cannot open is not listed as a payment; the log says why.
+            ToolboxLog.error("ToolboxWallet.MessageBox", "payment message \(row.message.messageId) "
+                + "from \(row.rawSender) could not be opened: \(String(reflecting: error))")
+            return nil
+        }
         return MessageBoxIncomingPayment.decode(messageId: row.message.messageId, sender: row.rawSender, plaintext: plaintext)
     }
 
@@ -651,6 +672,7 @@ extension MessageBoxClient {
                 throw MessageBoxPaymentError.settlementFailed
             }
         } catch MessageBoxPaymentError.settlementFailed {
+            logSettlementFailure(payment, MessageBoxPaymentError.settlementFailed)
             throw MessageBoxPaymentError.settlementFailed
         } catch let error where isCancellation(error) {
             throw CancellationError()
@@ -658,10 +680,18 @@ extension MessageBoxClient {
             // Storage that is not the user's active storage refused the write before it looked at
             // the payment. That is no verdict on the token, and the person can fix it.
             if case .notActive = error { throw error }
+            logSettlementFailure(payment, error)
             throw MessageBoxPaymentError.settlementFailed
         } catch {
+            logSettlementFailure(payment, error)
             throw MessageBoxPaymentError.settlementFailed
         }
+    }
+
+    /// TS reports every settlement failure as the one error; the cause it replaced goes to the log.
+    private static func logSettlementFailure(_ payment: MessageBoxIncomingPayment, _ error: any Error) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", "settling payment message \(payment.messageId) "
+            + "from \(payment.sender) failed: \(String(reflecting: error))")
     }
 }
 

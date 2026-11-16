@@ -73,8 +73,8 @@ final class WhatsOnChainUTXOSourceTests: XCTestCase {
         do {
             _ = try await source.spendableOutputs(forAddress: "not-an-address")
             XCTFail("an address with no P2PKH script cannot yield spendable outputs")
-        } catch is UTXOSourceError {
-            // refused, correct
+        } catch let error as UTXOSourceError {
+            XCTAssertEqual(error, .invalidAddress("not-an-address"))
         }
     }
 

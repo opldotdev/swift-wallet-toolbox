@@ -144,7 +144,10 @@ public actor MessageBoxOutbox {
                         throw refusal
                     } catch {
                         // Undecided: the server may hold the message. Broadcast, and keep the
-                        // payment for Retry, which resends this same envelope.
+                        // payment for Retry, which resends this same envelope. Logged, since the
+                        // caller sees only that delivery is pending.
+                        Self.log("delivery of payment \(record.txid) was undecided; broadcasting and "
+                            + "keeping it for Retry: \(String(reflecting: error))")
                         return
                     }
                     // Nothing may throw from here: the wallet would abort an action the server
@@ -183,7 +186,7 @@ public actor MessageBoxOutbox {
                     try persist(pending)
                     throw MessageBoxOutboxError.broadcastRefused(pending.txid)
                 }
-                throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
+                throw Self.notDelivered(pending.txid, error)
             }
             throw error
         }
@@ -241,7 +244,7 @@ public actor MessageBoxOutbox {
         } catch let error as MessageBoxOutboxError where error == .broadcastRefused(pending.txid) {
             throw error
         } catch {
-            throw MessageBoxOutboxError.notDelivered(txid: pending.txid, reason: Self.reason(error))
+            throw Self.notDelivered(pending.txid, error)
         }
         try remove(sender, pending.recipient)
         return pending.txid
@@ -307,6 +310,9 @@ public actor MessageBoxOutbox {
         do {
             sent = try await wallet.messageBoxPaymentWasSent(pending)
         } catch {
+            // The abort's failure is the answer; the probe's own failure is logged.
+            Self.log("discarding payment \(pending.txid): the sent probe failed: "
+                + String(reflecting: error))
             throw failure
         }
         guard sent else {
@@ -345,6 +351,16 @@ public actor MessageBoxOutbox {
         (try? PublicKey(Hex.decode(hex, maximumDecodedByteCount: 33))) != nil
     }
 
+    /// The saved payment's delivery failed: logged in full, and reported by the error's own text.
+    private static func notDelivered(_ txid: String, _ error: any Error) -> MessageBoxOutboxError {
+        log("payment \(txid) is saved but was not delivered: \(String(reflecting: error))")
+        return .notDelivered(txid: txid, reason: reason(error))
+    }
+
+    private static func log(_ message: String) {
+        ToolboxLog.error("ToolboxWallet.MessageBox", message)
+    }
+
     private static func reason(_ error: any Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
@@ -370,6 +386,8 @@ public actor MessageBoxOutbox {
             let record = try decode(old, sender: sender)
             new = try file(sender, record.recipient)
         } catch {
+            Self.log("an old saved payment record could not be read and is set aside: "
+                + String(reflecting: error))
             return try quarantine(old)
         }
         if FileManager.default.fileExists(atPath: new.path) { return try quarantine(old) }
@@ -500,7 +518,10 @@ extension RemoteWallet: MessageBoxPayingWallet {
             if try await messageBoxPaymentWasSent(pending) { return }
         } catch is CancellationError {
             throw CancellationError()
-        } catch {}
+        } catch {
+            ToolboxLog.error("ToolboxWallet.MessageBox", "resuming payment \(pending.txid): the sent "
+                + "probe failed, so the transaction is processed again: \(String(reflecting: error))")
+        }
         try Task.checkCancellation()
         let envelope = try AtomicBEEF(bytes: pending.atomicBEEF, limits: StorageLimits.beef)
         guard envelope.subjectTransactionID.displayHex == pending.txid,

@@ -553,6 +553,17 @@ extension AuthenticatedSessionTests {
             XCTFail("an unsigned refusal must not be returned as a response")
         } catch let error as AuthTransportError {
             XCTAssertEqual(error, .unauthenticatedReply(status: 403, body: body))
+            guard case .unauthenticatedReply(_, _, let request) = error else {
+                return XCTFail("expected unauthenticatedReply, got \(error)")
+            }
+            XCTAssertEqual(request?.method, "POST")
+            XCTAssertEqual(request?.host, baseURL.host)
+            XCTAssertEqual(request?.path, "/sendMessage")
+            // The user text names the host and the server's code, and nothing of the body else.
+            let text = error.localizedDescription
+            XCTAssertTrue(text.contains(baseURL.host ?? "?"), text)
+            XCTAssertTrue(text.contains("ERR_ACCOUNT_REQUIRED"), text)
+            XCTAssertTrue(String(reflecting: error).contains("POST"), String(reflecting: error))
         }
     }
 
@@ -563,7 +574,7 @@ extension AuthenticatedSessionTests {
             _ = try await session.send(method: "POST", path: "/", body: [0x01])
             XCTFail("an unsigned refusal must not be returned as a response")
         } catch let error as AuthTransportError {
-            guard case .unauthenticatedReply(let status, let preview) = error else {
+            guard case .unauthenticatedReply(let status, let preview, _) = error else {
                 return XCTFail("expected unauthenticatedReply, got \(error)")
             }
             XCTAssertEqual(status, 502)

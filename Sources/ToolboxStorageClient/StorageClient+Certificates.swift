@@ -22,6 +22,7 @@ extension StorageClient {
             }
             return certificates
         } catch {
+            Self.log("listCertificates: the result could not be read: \(String(reflecting: error))")
             throw StorageClientError.unreadableResponse(method: "listCertificates")
         }
     }

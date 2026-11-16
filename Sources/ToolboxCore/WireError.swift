@@ -115,3 +115,17 @@ public enum WireError: Error, Equatable, Sendable, LocalizedError {
         }
     }
 }
+
+extension WireError: CustomDebugStringConvertible {
+    /// The wire name and the server's message, for the log.
+    public var debugDescription: String {
+        switch self {
+        case .invalidParameter(let name, let message), .missingParameter(let name, let message):
+            "WireError \(wireName) (parameter \(name)): \(message)"
+        case .actionBatchState(let state, let batchId, let message):
+            "WireError \(wireName) (state \(state), batch \(batchId ?? "none")): \(message)"
+        default:
+            "WireError \(wireName): \(message)"
+        }
+    }
+}

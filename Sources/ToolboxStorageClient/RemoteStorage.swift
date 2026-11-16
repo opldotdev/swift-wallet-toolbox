@@ -59,3 +59,12 @@ public enum RemoteStorageError: Error, Equatable, Sendable {
     /// The endpoint is not HTTPS and insecure transport was not allowed.
     case insecureEndpoint(String)
 }
+
+extension RemoteStorageError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .insecureEndpoint:
+            "The wallet storage server address must start with https://."
+        }
+    }
+}

@@ -114,4 +114,16 @@ final class MessageBoxRefusalTests: XCTestCase {
             XCTFail("a refused post must throw")
         } catch MessageBoxError.httpStatus(403) {}
     }
+
+    /// A 200 whose body is not JSON is the client's own invalidResponse, not a raw parser error.
+    func test_aReplyThatIsNotJSONIsAnInvalidResponse() async throws {
+        let client = try MessageBoxClient(host: host, wallet: wallet(),
+            transport: StatusTransport(status: 200, body: "<html>maintenance</html>"))
+        do {
+            try await client.deliver(envelope())
+            XCTFail("an unreadable reply must throw")
+        } catch let error as MessageBoxError {
+            XCTAssertEqual(error, .invalidResponse)
+        }
+    }
 }

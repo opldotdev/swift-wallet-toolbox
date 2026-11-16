@@ -36,7 +36,9 @@ public struct WhatsOnChainUTXOSource: UTXOSource {
                 parsed.publicKeyHash, maximumByteCount: 1 << 20
             ).bytes
         } catch {
-            throw UTXOSourceError.unreadableResponse(provider: "whatsonchain")
+            ToolboxLog.error("ToolboxServices", "whatsonchain: \(address) is not a P2PKH address: "
+                + String(reflecting: error))
+            throw UTXOSourceError.invalidAddress(address)
         }
 
         guard let url = URL(
@@ -47,10 +49,18 @@ public struct WhatsOnChainUTXOSource: UTXOSource {
 
         let (status, body) = try await http.get(url)
         guard (200..<300).contains(status) else {
+            ToolboxLog.error("ToolboxServices", "whatsonchain: GET \(ErrorDetail.hostPath(url)) answered "
+                + "HTTP \(status); body: \(ErrorDetail.bodyPreview(body))")
             throw UTXOSourceError.httpFailure(provider: "whatsonchain", statusCode: status)
         }
 
-        return try Self.decode(body, lockingScript: script)
+        do {
+            return try Self.decode(body, lockingScript: script)
+        } catch {
+            ToolboxLog.error("ToolboxServices", "whatsonchain: GET \(ErrorDetail.hostPath(url)) answered "
+                + "a list that could not be read; body: \(ErrorDetail.bodyPreview(body))")
+            throw error
+        }
     }
 
     /// Reads the `[{tx_hash, tx_pos, value}]` array. A row missing a field is a refusal, not a

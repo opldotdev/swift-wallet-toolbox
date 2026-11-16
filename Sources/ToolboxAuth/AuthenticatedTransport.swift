@@ -1,5 +1,6 @@
 import Foundation
 import BSVAuth
+import ToolboxCore
 
 /// An HTTP client where both ends have proved who they are.
 ///
@@ -37,6 +38,21 @@ public struct AuthenticatedResponse: Equatable, Sendable {
     }
 }
 
+/// Which call an error belongs to: enough to find it in a server's log, and nothing that could
+/// authenticate (no query, headers or body).
+public struct AuthRequestContext: Equatable, Sendable {
+    public let method: String
+    public let host: String
+    /// The request path, without its query.
+    public let path: String
+
+    public init(method: String, host: String, path: String) {
+        self.method = method
+        self.host = host
+        self.path = path
+    }
+}
+
 public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     case notImplemented(String)
     /// The peer never completed the handshake. Carries what it did instead.
@@ -46,9 +62,10 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     case responseNotAuthenticated(String)
     /// The peer refused the request with an error status and no auth frame at all, as a gate
     /// in front of its auth middleware does. Carries the status and the start of the body, as
-    /// TS `SimplifiedFetchTransport` reports them, so a caller can say what was refused. The body
-    /// is unauthenticated: read it to describe the failure, never to act on.
-    case unauthenticatedReply(status: Int, body: [UInt8])
+    /// TS `SimplifiedFetchTransport` reports them, so a caller can say what was refused, and the
+    /// call it refused (`request`, set by ``AuthenticatedSession``; not part of `==`). The body is
+    /// unauthenticated: read it to describe the failure, never to act on.
+    case unauthenticatedReply(status: Int, body: [UInt8], request: AuthRequestContext? = nil)
     /// A reply arrived for a request other than the one being awaited.
     case requestMismatch
     case transportFailed(String)
@@ -65,28 +82,88 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     /// signed. Raised before anything is sent.
     case invalidQuery(String)
 
+    /// The server's own short reason for an ``unauthenticatedReply(status:body:request:)``, when
+    /// its body gave one (a JSON `message`, `description` or `error`, or short plain text).
+    public var serverReason: String? {
+        guard case .unauthenticatedReply(_, let body, _) = self else { return nil }
+        return ErrorDetail.serverReason(body)
+    }
+
     public var errorDescription: String? {
         switch self {
         case .sessionExpired:
-            "Couldn't reconnect to storage. Try again."
+            "Couldn't reconnect to the server. Try again."
         case .responseNotAuthenticated:
-            "The storage server could not be verified."
-        case .unauthenticatedReply(let status, _) where status >= 500:
-            "The server could not handle the request (HTTP \(status))."
-        case .unauthenticatedReply(let status, _):
-            "The server refused the request (HTTP \(status))."
+            "The server's reply could not be verified."
+        case .unauthenticatedReply(let status, _, let request):
+            Self.refusalText(status: status, host: request?.host, reason: serverReason)
         case .handshakeFailed:
-            "Couldn't authenticate with storage. Try again."
+            "Couldn't authenticate with the server. Try again."
         case .requestMismatch:
-            "The storage server answered a different request."
+            "The server answered a different request."
         case .transportFailed:
-            "Couldn't reach storage. Try again."
+            "Couldn't reach the server. Try again."
         case .notImplemented:
-            "This storage operation is not available."
+            "This operation is not available."
         case .unexpectedPeer:
-            "Connected to an unexpected storage server."
+            "Connected to an unexpected server."
         case .invalidQuery:
             "The request could not be sent: its query is malformed."
+        }
+    }
+
+    /// `request` is context for the log and does not take part in `==`, so an error built from
+    /// a status and body alone still compares as before.
+    public static func == (lhs: AuthTransportError, rhs: AuthTransportError) -> Bool {
+        switch (lhs, rhs) {
+        case (.notImplemented(let a), .notImplemented(let b)),
+             (.handshakeFailed(let a), .handshakeFailed(let b)),
+             (.responseNotAuthenticated(let a), .responseNotAuthenticated(let b)),
+             (.transportFailed(let a), .transportFailed(let b)),
+             (.invalidQuery(let a), .invalidQuery(let b)):
+            return a == b
+        case (.unauthenticatedReply(let s1, let b1, _), .unauthenticatedReply(let s2, let b2, _)):
+            return s1 == s2 && b1 == b2
+        case (.requestMismatch, .requestMismatch), (.sessionExpired, .sessionExpired),
+             (.unexpectedPeer, .unexpectedPeer):
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func refusalText(status: Int, host: String?, reason: String?) -> String {
+        let server = host.map { "The server at \($0)" } ?? "The server"
+        let verb = status >= 500 ? "could not handle" : "refused"
+        if let reason {
+            return "\(server) \(verb) the request (HTTP \(status)): \(reason)"
+        }
+        return status >= 500
+            ? "\(server) \(verb) the request (HTTP \(status)). Try again later."
+            : "\(server) \(verb) the request (HTTP \(status))."
+    }
+}
+
+extension AuthTransportError: CustomDebugStringConvertible {
+    /// The full detail for the log: the call, its status and the start of the body.
+    public var debugDescription: String {
+        switch self {
+        case .unauthenticatedReply(let status, let body, let request):
+            let call = request.map {
+                "\($0.method) \(ErrorDetail.hostPath(host: $0.host, path: $0.path))"
+            } ?? "unknown request"
+            return "AuthTransportError.unauthenticatedReply: \(call) answered HTTP \(status) "
+                + "with no auth frame; body: \(ErrorDetail.bodyPreview(body))"
+        case .notImplemented(let detail): return "AuthTransportError.notImplemented: \(detail)"
+        case .handshakeFailed(let detail): return "AuthTransportError.handshakeFailed: \(detail)"
+        case .responseNotAuthenticated(let detail):
+            return "AuthTransportError.responseNotAuthenticated: \(detail)"
+        case .requestMismatch: return "AuthTransportError.requestMismatch"
+        case .transportFailed(let detail): return "AuthTransportError.transportFailed: \(detail)"
+        case .sessionExpired: return "AuthTransportError.sessionExpired"
+        case .unexpectedPeer: return "AuthTransportError.unexpectedPeer"
+        case .invalidQuery(let query):
+            return "AuthTransportError.invalidQuery: \(query.count) characters"
         }
     }
 }

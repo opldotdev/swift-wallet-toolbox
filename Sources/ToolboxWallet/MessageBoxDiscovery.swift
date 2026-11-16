@@ -6,6 +6,7 @@ import BSVNetwork
 import BSVScript
 import BSVTransaction
 import ToolboxStorage
+import ToolboxCore
 
 /// Matches MessageBoxClient.queryAdvertisements: resolve ls_messagebox, keep the first
 /// advertisement the recipient signed, and use the configured fallback when there is none.
@@ -58,7 +59,11 @@ public struct MessageBoxDiscovery: Sendable {
                 }
             }
         } catch is CancellationError { throw CancellationError() }
-        catch { /* The reference client falls back on an unavailable overlay. */ }
+        catch {
+            // The reference client falls back on an unavailable overlay; the reason is logged.
+            ToolboxLog.error("ToolboxWallet.MessageBox", "MessageBox host lookup failed, using the "
+                + "default host: \(String(reflecting: error))")
+        }
         try Task.checkCancellation()
         return fallback
     }

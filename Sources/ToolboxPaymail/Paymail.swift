@@ -61,18 +61,20 @@ public struct Paymail: Sendable {
         guard let template = profile ?? capabilities["pki"] else {
             throw PaymailError.capabilityUnsupported(domain: address.domain, capability: "recipient verification")
         }
-        let response = try await http.get(Self.capabilityURL(template: template, address: address))
+        let profileURL = try Self.capabilityURL(template: template, address: address)
+        let response = try await http.get(profileURL)
         guard (200..<300).contains(response.status) else {
-            throw PaymailError.httpFailure(statusCode: response.status)
+            throw Self.httpFailure("GET", profileURL, response)
         }
+        // A body that does not decode is reported as unreadable, with the body logged.
         guard response.body.count <= Self.maximumJSONBytes,
               let value = try? JSONDecoder().decode(JSONValue.self, from: Data(response.body)) else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", profileURL, response, "not JSON")
         }
         if profile != nil {
             guard let name = value["name"]?.stringValue,
                   !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw PaymailError.unreadableResponse
+                throw Self.unreadable("GET", profileURL, response, "no name")
             }
             let avatar = value["avatar"]?.stringValue
                 .flatMap { URL(string: $0.replacingOccurrences(of: "{?s}", with: "?s=180")) }
@@ -82,7 +84,7 @@ public struct Paymail: Sendable {
         guard let key = value["pubkey"]?.stringValue,
               key.count == 66, key.hasPrefix("02") || key.hasPrefix("03"),
               key.allSatisfy({ $0.isHexDigit }) else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", profileURL, response, "no valid pubkey")
         }
         return PaymailProfile(name: nil, avatar: nil)
     }
@@ -106,9 +108,13 @@ public struct Paymail: Sendable {
         let body = try JSONEncoder().encode(SatoshisRequest(satoshis: satoshis))
         let response = try await http.post(url, json: Array(body))
         guard (200..<300).contains(response.status) else {
-            throw PaymailError.httpFailure(statusCode: response.status)
+            throw Self.httpFailure("POST", url, response)
         }
-        return try Self.decodeDestination(response.body)
+        do {
+            return try Self.decodeDestination(response.body)
+        } catch {
+            throw Self.unreadable("POST", url, response, "no valid payment destination")
+        }
     }
 
     /// Delivers a payment to the recipient's paymail host.
@@ -141,6 +147,9 @@ public struct Paymail: Sendable {
                 )
                 return
             } catch {
+                // The raw-transaction route may still deliver; this failure is logged either way.
+                ToolboxLog.error("ToolboxPaymail", "BEEF delivery to \(address.domain) failed: "
+                    + String(reflecting: error))
                 beefError = error
             }
         }
@@ -167,8 +176,36 @@ public struct Paymail: Sendable {
     private func postDelivery(url: URL, body: Data) async throws {
         let response = try await http.post(url, json: Array(body))
         guard (200..<300).contains(response.status) else {
-            throw PaymailError.deliveryFailed(statusCode: response.status)
+            Self.log("POST", url, response, "delivery refused")
+            throw PaymailError.deliveryFailed(
+                statusCode: response.status, host: url.host,
+                reason: ErrorDetail.serverReason(response.body)
+            )
         }
+    }
+
+    /// Logs a failed call with its host, path, status and body.
+    private static func log(
+        _ method: String, _ url: URL, _ response: (status: Int, body: [UInt8]), _ why: String
+    ) {
+        ToolboxLog.error("ToolboxPaymail", "\(method) \(ErrorDetail.hostPath(url)) answered HTTP "
+            + "\(response.status) (\(why)); body: \(ErrorDetail.bodyPreview(response.body))")
+    }
+
+    private static func httpFailure(
+        _ method: String, _ url: URL, _ response: (status: Int, body: [UInt8])
+    ) -> PaymailError {
+        log(method, url, response, "error status")
+        return .httpFailure(
+            statusCode: response.status, host: url.host, reason: ErrorDetail.serverReason(response.body)
+        )
+    }
+
+    private static func unreadable(
+        _ method: String, _ url: URL, _ response: (status: Int, body: [UInt8]), _ why: String
+    ) -> PaymailError {
+        log(method, url, response, why)
+        return .unreadableResponse
     }
 
     private func capabilities(for address: Address) async throws -> [String: String] {
@@ -184,9 +221,14 @@ public struct Paymail: Sendable {
         )
         let response = try await http.get(url)
         guard (200..<300).contains(response.status) else {
-            throw PaymailError.httpFailure(statusCode: response.status)
+            throw Self.httpFailure("GET", url, response)
         }
-        let capabilities = try Self.decodeCapabilities(response.body)
+        let capabilities: [String: String]
+        do {
+            capabilities = try Self.decodeCapabilities(response.body)
+        } catch {
+            throw Self.unreadable("GET", url, response, "no capabilities")
+        }
         await cache.store(capabilities, for: address.domain)
         return capabilities
     }
@@ -206,12 +248,13 @@ public struct Paymail: Sendable {
 
         let response = try await http.get(url)
         guard (200..<300).contains(response.status) else {
-            throw PaymailError.httpFailure(statusCode: response.status)
+            throw Self.httpFailure("GET", url, response)
         }
+        // A body that does not decode is reported as unreadable, with the body logged.
         guard response.body.count <= Self.maximumJSONBytes,
               let value = try? JSONDecoder().decode(JSONValue.self, from: Data(response.body)),
               let status = value["Status"]?.intValue else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", url, response, "no DNS status")
         }
 
         let fallback = ServiceEndpoint(host: domain, port: 443)
@@ -222,18 +265,18 @@ public struct Paymail: Sendable {
             return fallback
         }
         guard let answers = answerValue.arrayValue else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", url, response, "Answer is not an array")
         }
         guard let first = answers.first else {
             return fallback
         }
         guard let data = first["data"]?.stringValue else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", url, response, "SRV answer has no data")
         }
 
         let fields = data.split(separator: " ")
         guard fields.count >= 4, let port = Int(fields[2]) else {
-            throw PaymailError.unreadableResponse
+            throw Self.unreadable("GET", url, response, "SRV data is not priority weight port target")
         }
         let target = Self.withoutTrailingDot(String(fields[3])).lowercased()
         let originalDomain = Self.withoutTrailingDot(domain).lowercased()
@@ -341,6 +384,8 @@ public struct Paymail: Sendable {
             .replacingOccurrences(of: "{domain.tld}", with: address.domain)
         guard let url = URL(string: rendered), url.scheme?.lowercased() == "https",
               url.host != nil, url.user == nil, url.password == nil else {
+            ToolboxLog.error("ToolboxPaymail", "\(address.domain) advertises a capability URL that is "
+                + "not a plain https URL: \(template)")
             throw PaymailError.unreadableResponse
         }
         return url
@@ -463,6 +508,8 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
         for try await byte in stream {
             body.append(byte)
             if body.count > maximumResponseBytes {
+                ToolboxLog.error("ToolboxPaymail", "\(response.url.map { ErrorDetail.hostPath($0) } ?? "?") "
+                    + "sent more than \(maximumResponseBytes) bytes")
                 throw PaymailError.unreadableResponse
             }
         }
@@ -474,6 +521,8 @@ public struct URLSessionPaymailHTTP: PaymailHTTP {
         response: URLResponse
     ) throws -> (status: Int, body: [UInt8]) {
         guard data.count <= maximumResponseBytes else {
+            ToolboxLog.error("ToolboxPaymail", "\(response.url.map { ErrorDetail.hostPath($0) } ?? "?") "
+                + "sent more than \(maximumResponseBytes) bytes")
             throw PaymailError.unreadableResponse
         }
         return ((response as? HTTPURLResponse)?.statusCode ?? 0, Array(data))
@@ -485,8 +534,10 @@ public enum PaymailError: Error, Equatable, Sendable, LocalizedError {
     case notAPaymail(String)
     case capabilityUnsupported(domain: String, capability: String)
     case unreadableResponse
-    case httpFailure(statusCode: Int)
-    case deliveryFailed(statusCode: Int)
+    /// `host` and the server's short `reason` say who failed and why; neither takes part in `==`.
+    case httpFailure(statusCode: Int, host: String? = nil, reason: String? = nil)
+    /// `host` and the server's short `reason` say who refused and why; neither takes part in `==`.
+    case deliveryFailed(statusCode: Int, host: String? = nil, reason: String? = nil)
 
     public var errorDescription: String? {
         switch self {
@@ -495,12 +546,32 @@ public enum PaymailError: Error, Equatable, Sendable, LocalizedError {
             "\(domain) does not advertise the required paymail service (\(capability))."
         case .unreadableResponse:
             "The paymail provider returned a response the wallet could not read."
-        case .httpFailure(let status) where status == 404:
+        case .httpFailure(let status, _, _) where status == 404:
             "The paymail provider could not find that recipient or service. Check the address."
-        case .httpFailure(let status):
-            "The paymail provider could not complete the lookup (HTTP \(status)). Try again."
-        case .deliveryFailed(let status):
-            "The paymail provider did not accept the transaction delivery (HTTP \(status))."
+        case .httpFailure(let status, let host, let reason):
+            "\(Self.provider(host)) could not complete the lookup (HTTP \(status))\(Self.because(reason)). Try again."
+        case .deliveryFailed(let status, let host, let reason):
+            "\(Self.provider(host)) did not accept the transaction delivery (HTTP \(status))\(Self.because(reason))."
+        }
+    }
+
+    private static func provider(_ host: String?) -> String {
+        host.map { "The paymail provider (\($0))" } ?? "The paymail provider"
+    }
+
+    private static func because(_ reason: String?) -> String {
+        reason.map { ": \($0.hasSuffix(".") ? String($0.dropLast()) : $0)" } ?? ""
+    }
+
+    public static func == (lhs: PaymailError, rhs: PaymailError) -> Bool {
+        switch (lhs, rhs) {
+        case (.notAPaymail(let a), .notAPaymail(let b)): a == b
+        case (.capabilityUnsupported(let d1, let c1), .capabilityUnsupported(let d2, let c2)):
+            d1 == d2 && c1 == c2
+        case (.unreadableResponse, .unreadableResponse): true
+        case (.httpFailure(let a, _, _), .httpFailure(let b, _, _)): a == b
+        case (.deliveryFailed(let a, _, _), .deliveryFailed(let b, _, _)): a == b
+        default: false
         }
     }
 }
