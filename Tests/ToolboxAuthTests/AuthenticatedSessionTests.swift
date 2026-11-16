@@ -31,8 +31,9 @@ final class AuthenticatedSessionTests: XCTestCase {
         /// Count of application replies to send as an unsigned 401, matching a peer
         /// that has dropped the session before applying the method.
         var unauthorizedRemaining = 0
-        /// Count of application replies whose `yourNonce` does not match the open session.
-        /// AuthFetch retries `Session not found for nonce`; this is that reply.
+        /// Count of application replies whose `yourNonce` does not match the open session. The
+        /// peer has run the request; AuthFetch resends on the `Session not found for nonce` this
+        /// raises, and the session must not.
         var unknownSessionNonceRemaining = 0
         private var generalDepth = 0
         private(set) var maxGeneralDepth = 0
@@ -384,24 +385,36 @@ final class AuthenticatedSessionTests: XCTestCase {
         XCTAssertEqual(application, ["/one", "/two"])
     }
 
-    func test_aReplyForAnUnknownSessionNonceRehandshakesOnce() async throws {
+    func test_aSignedReplyForAnUnknownSessionNonceIsNotResent() async throws {
         let keys = try keyPair()
         let peer = TestPeer(key: keys.server)
         let session = session(with: peer, client: keys.client)
         _ = try await session.send(method: "POST", path: "/one", body: [0x01])
         await peer.setUnknownSessionNonceRemaining(1)
 
-        let response = try await session.send(method: "POST", path: "/two", body: [0x02])
+        do {
+            _ = try await session.send(method: "POST", path: "/two", body: [0x02])
+            XCTFail("a signed reply for a lost session must surface, not be retried")
+        } catch {
+            XCTAssertEqual(error as? AuthTransportError, .sessionExpired)
+        }
+        let afterFailure = await peer.pathsSeen
+        XCTAssertEqual(
+            afterFailure.filter { !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath) },
+            ["/one", "/two"], "the peer ran /two once and must not be asked to run it again"
+        )
+        XCTAssertEqual(afterFailure.filter { $0.hasSuffix(BRC104HTTPHeaderName.handshakePath) }.count, 1)
+
+        // The lost session is dropped, so the next request re-handshakes and goes through.
+        let response = try await session.send(method: "POST", path: "/three", body: [0x03])
 
         XCTAssertEqual(response.statusCode, 200)
-        let handshakes = await peer.pathsSeen.filter {
-            $0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
-        }
-        XCTAssertEqual(handshakes.count, 2)
-        let application = await peer.pathsSeen.filter {
-            !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath)
-        }
-        XCTAssertEqual(application, ["/one", "/two", "/two"])
+        let paths = await peer.pathsSeen
+        XCTAssertEqual(paths.filter { $0.hasSuffix(BRC104HTTPHeaderName.handshakePath) }.count, 2)
+        XCTAssertEqual(
+            paths.filter { !$0.hasSuffix(BRC104HTTPHeaderName.handshakePath) },
+            ["/one", "/two", "/three"]
+        )
     }
 
     func test_concurrentSendsDoNotOverlapTheHTTPRoundTrip() async throws {
