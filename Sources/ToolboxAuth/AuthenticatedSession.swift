@@ -67,9 +67,15 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                 return try await attemptSend(
                     method: method, path: path, query: query, headers: headers, body: body
                 )
+            } catch is SignedReplySessionLost {
+                // The peer signed a reply to this request, so it ran the request. Sending it again
+                // could apply a non-idempotent call twice; the outcome is unknown to the caller.
+                // AuthFetch resends here; this does not. The next send re-handshakes.
+                await forgetSession()
+                throw AuthTransportError.sessionExpired
             } catch AuthTransportError.sessionExpired {
-                // AuthFetch retries `Session not found for nonce` and unsigned 401.
-                // The send lock stays held so a sibling cannot receive against the
+                // AuthFetch retries `Session not found for nonce` and unsigned 401. Both reach
+                // here only from before the peer ran the request. The send lock stays held so a sibling cannot receive against the
                 // session we are about to drop.
                 guard remaining > 0 else { throw AuthTransportError.sessionExpired }
                 remaining -= 1
@@ -268,7 +274,8 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         do {
             actions = try await authenticator.receive(message)
         } catch AuthError.sessionNotFound {
-            throw AuthTransportError.sessionExpired
+            // Unlike an unsigned 401, this reply is the peer's answer to the request.
+            throw SignedReplySessionLost()
         }
         guard case .deliver(let delivered)? = actions.first(where: {
             if case .deliver = $0 { return true }
@@ -359,6 +366,10 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     private func randomRequestID() -> [UInt8] {
         (0..<32).map { _ in UInt8.random(in: .min ... .max) }
     }
+
+    /// A signed reply arrived for a session this side no longer holds. The peer has run the
+    /// request, so `send` surfaces ``AuthTransportError/sessionExpired`` without resending it.
+    private struct SignedReplySessionLost: Error {}
 
     private func acquireSend() async {
         if sending {

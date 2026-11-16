@@ -52,7 +52,11 @@ public enum AuthTransportError: Error, Equatable, Sendable, LocalizedError {
     /// A reply arrived for a request other than the one being awaited.
     case requestMismatch
     case transportFailed(String)
-    /// The authenticated session was evicted by the peer. Recoverable by re-handshake.
+    /// The authenticated session was evicted. Before the request reached the peer's application
+    /// (no local session, or an unsigned 401) it is re-handshaken and resent, and this is thrown
+    /// only once that budget is spent. When the peer signed a reply to the request for a session
+    /// this side no longer holds, the request may have run, so it is thrown at once and the
+    /// request is not resent: treat its outcome as unknown.
     case sessionExpired
     /// The peer is not the one expected. Raised only when a caller named the peer up front, which
     /// is the case worth failing loudly for.

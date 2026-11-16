@@ -466,9 +466,15 @@ extension RemoteWallet: MessageBoxPayingWallet {
     func createMessageBoxPayment(recipient: PublicKey, satoshis: UInt64,
         derivationPrefix: String, derivationSuffix: String, description: String,
         beforeBroadcast: @escaping @Sendable (CounterpartyPayment) async throws -> Void) async throws -> CounterpartyPayment {
-        try await payToCounterparty(recipient: recipient, satoshis: satoshis,
-            derivationPrefix: derivationPrefix, derivationSuffix: derivationSuffix,
-            description: description, labels: ["peerpay"], beforeBroadcast: beforeBroadcast)
+        do {
+            return try await payToCounterparty(recipient: recipient, satoshis: satoshis,
+                derivationPrefix: derivationPrefix, derivationSuffix: derivationSuffix,
+                description: description, labels: ["peerpay"], beforeBroadcast: beforeBroadcast)
+        } catch WalletError.broadcastFailed {
+            // As before the wallet threw this: the saved payment stays for Retry, which
+            // rebroadcasts the same signed transaction.
+            throw MessageBoxOutboxError.broadcastUncertain
+        }
     }
 
     func abandonMessageBoxPayment(_ pending: MessageBoxPendingPayment) async throws -> Bool {

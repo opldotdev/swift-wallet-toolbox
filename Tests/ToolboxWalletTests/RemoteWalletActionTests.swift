@@ -150,6 +150,130 @@ final class RemoteWalletActionTests: XCTestCase {
         XCTAssertEqual(delivered, [PaymailHost.beefURL])
     }
 
+    // MARK: - Before broadcast
+
+    /// The hook gets the txid and the paid output's index after signing and before storage sees
+    /// the payment, so a caller knows from then on that the payment may be on chain.
+    func testAnAddressPaymentRunsBeforeBroadcastWithTheTxidBeforeProcessAction() async throws {
+        let fixture = try Fixture(isPayment: true)
+        let transport = fixture.transport
+        let log = HookLog()
+        let sent = try await fixture.wallet.pay(
+            to: try fixture.wallet.receiveAddress(), satoshis: 42, description: "Address payment",
+            beforeBroadcast: { payment in await log.record(payment, methods: await transport.methods) }
+        )
+        let payments = await log.payments
+        XCTAssertEqual(payments.map(\.transactionID), [sent.transactionID])
+        XCTAssertEqual(payments.first?.outputIndex, 0)
+        XCTAssertEqual(payments.first?.reference, sent.reference)
+        let atHook = await log.methodsAtHook
+        XCTAssertEqual(atHook, ["createAction"])
+        let methods = await transport.methods
+        XCTAssertEqual(methods, ["createAction", "processAction"])
+    }
+
+    /// A transport failure on `processAction` comes after the hook, so the caller already holds
+    /// the txid of a payment that may have been broadcast. Nothing is aborted.
+    func testAPaymentWhoseProcessActionFailsWasAnnouncedToTheHookFirst() async throws {
+        let fixture = try Fixture(isPayment: true, processFails: true)
+        let transport = fixture.transport
+        let log = HookLog()
+        do {
+            _ = try await fixture.wallet.pay(
+                to: try fixture.wallet.receiveAddress(), satoshis: 42, description: "Address payment",
+                beforeBroadcast: { payment in await log.record(payment, methods: await transport.methods) }
+            )
+            XCTFail("a failed processAction returned a payment")
+        } catch {}
+        let payments = await log.payments
+        XCTAssertEqual(payments.count, 1)
+        let processed = await transport.processArguments()
+        XCTAssertEqual(processed?["txid"]?.stringValue, payments.first?.transactionID.displayHex)
+        let methods = await transport.methods
+        XCTAssertEqual(methods, ["createAction", "processAction"])
+    }
+
+    /// A hook that throws stops the payment before anything is broadcast, and its inputs are
+    /// released.
+    func testAThrowingBeforeBroadcastHookAbortsAndBroadcastsNothing() async throws {
+        let fixture = try Fixture(isPayment: true)
+        let output = try WalletCreateActionOutput(
+            lockingScript: [0x51], satoshis: 42, outputDescription: "Test recipient"
+        )
+        do {
+            _ = try await fixture.wallet.pay(
+                [output], description: "Plain payment",
+                beforeBroadcast: { _ in throw HookRefusal() }
+            )
+            XCTFail("paid past a refusing hook")
+        } catch {
+            XCTAssertTrue(error is HookRefusal, "expected the hook's error, got \(error)")
+        }
+        let methods = await fixture.transport.methods
+        XCTAssertEqual(methods, ["createAction", "abortAction"])
+    }
+
+    // MARK: - Failed sends
+
+    func testAFailedSendOfAnAddressPaymentThrowsBroadcastFailedWithTheTxid() async throws {
+        let fixture = try Fixture(isPayment: true, processStatus: "failed")
+        let log = HookLog()
+        do {
+            _ = try await fixture.wallet.pay(
+                to: try fixture.wallet.receiveAddress(), satoshis: 42, description: "Address payment",
+                beforeBroadcast: { payment in await log.record(payment, methods: []) }
+            )
+            XCTFail("a failed send returned a payment")
+        } catch {
+            let announced = await log.payments.first?.transactionID.displayHex
+            let txid = try XCTUnwrap(announced)
+            XCTAssertEqual(error as? WalletError, .broadcastFailed(txid: txid))
+        }
+    }
+
+    func testAFailedSendOfAPaymailPaymentThrowsBroadcastFailedAndDeliversNothing() async throws {
+        let fixture = try Fixture(isPayment: true, processStatus: "failed")
+        let host = PaymailHost()
+        do {
+            _ = try await fixture.wallet.pay(
+                to: "alice@example.com", satoshis: 42, description: "Paymail payment",
+                paymail: Paymail(http: host)
+            )
+            XCTFail("a failed send returned a payment")
+        } catch {
+            let processed = await fixture.transport.processArguments()
+            let txid = try XCTUnwrap(processed?["txid"]?.stringValue)
+            XCTAssertEqual(error as? WalletError, .broadcastFailed(txid: txid))
+        }
+        let delivered = await host.delivered
+        XCTAssertTrue(delivered.isEmpty)
+    }
+
+    func testAFailedSendOfACounterpartyPaymentThrowsBroadcastFailedWithTheTxid() async throws {
+        let fixture = try Fixture(isPayment: true, processStatus: "failed")
+        let recipient = try PrivateKey([UInt8](repeating: 2, count: 32)).publicKey
+        do {
+            _ = try await fixture.wallet.payToCounterparty(
+                recipient: recipient, satoshis: 42,
+                derivationPrefix: "cHJlZml4", derivationSuffix: "c3VmZml4",
+                description: "Counterparty payment"
+            )
+            XCTFail("a failed send returned a payment")
+        } catch {
+            let processed = await fixture.transport.processArguments()
+            let txid = try XCTUnwrap(processed?["txid"]?.stringValue)
+            XCTAssertEqual(error as? WalletError, .broadcastFailed(txid: txid))
+        }
+    }
+
+    func testASendingResultIsNotAFailedSend() async throws {
+        let fixture = try Fixture(isPayment: true, processStatus: "sending")
+        let sent = try await fixture.wallet.pay(
+            to: try fixture.wallet.receiveAddress(), satoshis: 42, description: "Address payment"
+        )
+        XCTAssertEqual(sent.results.map(\.status), [.sending])
+    }
+
     private struct Fixture {
         let wallet: RemoteWallet
         let transport: ActionTransport
@@ -157,7 +281,7 @@ final class RemoteWalletActionTests: XCTestCase {
 
         init(
             foreign: Bool = false, wrongAmount: Bool = false, omitsFunding: Bool = false,
-            isPayment: Bool = false
+            isPayment: Bool = false, processStatus: String? = nil, processFails: Bool = false
         ) throws {
             let key = try PrivateKey([UInt8](repeating: 1, count: 32))
             let spending = try BRC29.receivingPrivateKey(recipient: key, sender: key.publicKey, prefix: "Pr==", suffix: "Su==")
@@ -169,7 +293,7 @@ final class RemoteWalletActionTests: XCTestCase {
             )]) : nil
             transport = ActionTransport(
                 funding: funding, foreign: self.foreign, wrongAmount: wrongAmount, omitsFunding: omitsFunding,
-                isPayment: isPayment
+                isPayment: isPayment, processStatus: processStatus, processFails: processFails
             )
             wallet = RemoteWallet(
                 storage: StorageClient(endpoint: URL(string: "https://storage.example")!, transport: transport),
@@ -207,15 +331,20 @@ private actor ActionTransport: AuthenticatedTransport {
     let omitsFunding: Bool
     /// `RemoteWallet.pay` funds through storage directly rather than the BRC-100 `createAction`.
     let isPayment: Bool
+    /// The status `processAction` reports for the new transaction; none reported when nil.
+    let processStatus: String?
+    /// `processAction` fails in transport, after the request has left.
+    let processFails: Bool
     var methods: [String] = []
     private var processed: JSONValue?
 
     init(
         funding: Transaction, foreign: Transaction?, wrongAmount: Bool, omitsFunding: Bool = false,
-        isPayment: Bool = false
+        isPayment: Bool = false, processStatus: String? = nil, processFails: Bool = false
     ) {
         self.funding = funding; self.foreign = foreign; self.wrongAmount = wrongAmount
         self.omitsFunding = omitsFunding; self.isPayment = isPayment
+        self.processStatus = processStatus; self.processFails = processFails
     }
     func processArguments() -> JSONValue? { processed }
 
@@ -258,7 +387,14 @@ private actor ActionTransport: AuthenticatedTransport {
             ])
         case "processAction":
             processed = args
-            result = .object(["sendWithResults": .array([])])
+            if processFails { throw URLError(.networkConnectionLost) }
+            if let processStatus, let txid = args["txid"]?.stringValue {
+                result = .object(["sendWithResults": .array([.object([
+                    "txid": .string(txid), "status": .string(processStatus)
+                ])])])
+            } else {
+                result = .object(["sendWithResults": .array([])])
+            }
         case "abortAction": result = .object(["aborted": .bool(true)])
         default: throw WalletActionLifecycleError.invalidFunding
         }
@@ -267,6 +403,19 @@ private actor ActionTransport: AuthenticatedTransport {
         ]))))
     }
 }
+
+/// What a `beforeBroadcast` hook was handed, and which storage calls had been made by then.
+private actor HookLog {
+    private(set) var payments: [SignedPayment] = []
+    private(set) var methodsAtHook: [String] = []
+
+    func record(_ payment: SignedPayment, methods: [String]) {
+        payments.append(payment)
+        methodsAtHook = methods
+    }
+}
+
+private struct HookRefusal: Error {}
 
 /// A paymail host for `alice@example.com` with destination and receive-BEEF capabilities. It
 /// records the delivery URLs it was posted to.
