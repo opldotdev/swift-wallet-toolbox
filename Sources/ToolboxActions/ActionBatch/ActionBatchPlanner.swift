@@ -278,6 +278,31 @@ struct PlannerState: Sendable {
             || transaction(outpoint.transactionID.displayHex) != nil
     }
 
+    /// Whether the shared graph holds everything needed to prove `txid`: the transaction itself
+    /// and, below each transaction without a merkle path, every parent it spends. A
+    /// transaction-ID-only record or a transaction with a merkle path ends a line.
+    ///
+    /// A reserved output that fails this cannot be funded from: the member's input graph would be
+    /// cut short, and its Atomic BEEF could not be built however often the action is retried.
+    func hasCompleteAncestry(_ txid: TransactionID) -> Bool {
+        let limits = Self.beefLimits.transactionLimits
+        var entries: [TransactionID: BEEFTransaction] = [:]
+        for entry in sharedBeef.transactions {
+            guard let id = try? entry.transactionID(limits: limits) else { return false }
+            entries[id] = entry
+        }
+        var visited = Set<TransactionID>()
+        var stack = [txid]
+        while let next = stack.popLast() {
+            guard visited.insert(next).inserted else { continue }
+            guard let entry = entries[next] else { return false }
+            guard let transaction = entry.transaction,
+                  entry.merklePathIndex == nil, sharedBeef.merklePath(for: next) == nil else { continue }
+            stack.append(contentsOf: transaction.inputs.map(\.previousOutput.transactionID))
+        }
+        return true
+    }
+
     /// `stageTransactionOutputs`: a processed member's outputs become spendable by the next.
     mutating func stage(_ planned: PlannedAction, txid: String, transaction: Transaction) throws {
         for output in planned.outputs {
@@ -474,7 +499,8 @@ enum ActionBatchPlanner {
     ///
     /// `fundFrom` outputs are taken first, last one first as the reference pops its
     /// `noSendChange` list, then unconsumed reservations by the canonical exact / least-over /
-    /// largest-under rule. Inputs are added until the action can pay its fee and a change output
+    /// largest-under rule, skipping any reservation whose ancestry the shared graph cannot prove
+    /// (`PlannerState.hasCompleteAncestry`). Inputs are added until the action can pay its fee and a change output
     /// worth at least the dust floor; failing that, until it can pay its fee with no change.
     ///
     /// The no-change fallback is tried only once every `fundFrom` output and every unconsumed
@@ -494,7 +520,17 @@ enum ActionBatchPlanner {
         let outputLengths = requestedOutputs.map(\.lockingScript.count)
         var queue = fundFrom
         var allocated: [PlannerOutput] = []
-        var candidates = state.reserved.values.filter { !state.consumed.contains($0.outpoint) }
+        // A reservation whose source cannot be proven from the shared graph is passed over, so
+        // the next usable one funds the action instead; a later extension can still supply the
+        // missing ancestry and make it eligible.
+        var provable: [String: Bool] = [:]
+        var candidates = state.reserved.values.filter { output in
+            guard !state.consumed.contains(output.outpoint) else { return false }
+            if let known = provable[output.txid] { return known }
+            let complete = (try? TransactionID(displayHex: output.txid)).map(state.hasCompleteAncestry) ?? false
+            provable[output.txid] = complete
+            return complete
+        }
 
         while true {
             let inputSatoshis = fixedInputSatoshis + allocated.reduce(UInt64(0)) { $0 + $1.satoshis }
@@ -592,8 +628,8 @@ enum ActionBatchPlanner {
     /// `trimInputBeef`: the proof graph the signer needs for exactly these inputs.
     ///
     /// The reference also merges the caller's whole `inputBEEF` back in. Here it was merged into
-    /// the shared graph when planning began, and the result is cut to the inputs' ancestry, because
-    /// `SignedAction` builds BRC-95 Atomic BEEF from it and refuses any unrelated record.
+    /// the shared graph when planning began, and the result is cut to the inputs' ancestry, which
+    /// is all `SignedAction` keeps when it builds BRC-95 Atomic BEEF from it.
     static func trimmedInputBEEF(
         _ state: PlannerState, request: WalletCreateActionRequest, inputs: [PlannedInput]
     ) throws -> [UInt8]? {
@@ -617,8 +653,13 @@ enum ActionBatchBEEF {
     /// transaction with a merkle path. A transaction in `known` is kept as a transaction-ID-only
     /// record and not walked past, so the result is an exact graph `AtomicBEEF` accepts; the
     /// reference instead marks it ID-only and keeps the ancestry below it.
-    static func subgraph(_ source: BEEF, txids: [TransactionID], known: Set<TransactionID> = []) throws -> BEEF {
-        let limits = PlannerState.beefLimits
+    ///
+    /// A transaction missing from `source` is left out rather than reported here; `AtomicBEEF`
+    /// names it as the missing ancestor when the result is used.
+    static func subgraph(
+        _ source: BEEF, txids: [TransactionID], known: Set<TransactionID> = [],
+        limits: BEEFLimits = PlannerState.beefLimits
+    ) throws -> BEEF {
         var entries: [TransactionID: BEEFTransaction] = [:]
         for entry in source.transactions {
             entries[try entry.transactionID(limits: limits.transactionLimits)] = entry

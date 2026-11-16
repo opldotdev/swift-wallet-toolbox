@@ -40,7 +40,7 @@ let package = Package(
         // moves when we mean it to, which is also when we re-run conformance.
         .package(
             url: "https://github.com/opldotdev/swift-sdk.git",
-            revision: "5777efd59c39437db41ced4ea9290c79ac72172d"
+            revision: "ea577be6107c1ac31585cb232add19577b039c27"
         )
     ],
     targets: [

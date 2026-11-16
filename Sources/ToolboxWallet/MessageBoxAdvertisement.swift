@@ -284,7 +284,8 @@ public struct MessageBoxAdvertiser: Sendable {
     ///
     /// Overlay BEEF is written by `@bsv/sdk`, which can list a child before its parents, so it is
     /// read in any order and reordered parents-first; `last` is then a transaction nothing else
-    /// in the graph spends.
+    /// in the graph spends. TS takes the record last on the wire without reordering, so the two
+    /// differ when the writer put a parent last. This keeps the reordered choice.
     static func subject(_ bytes: [UInt8]) throws -> Transaction? {
         if bytes.starts(with: [1, 1, 1, 1]) {
             let atomic = try AtomicBEEF(bytes: bytes, limits: StorageLimits.beef, transactionOrder: .any)

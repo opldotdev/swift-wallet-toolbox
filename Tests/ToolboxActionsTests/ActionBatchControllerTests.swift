@@ -1034,7 +1034,9 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
 
     /// Storage writes the reservation's BEEF with `@bsv/sdk`, whose `sortTxs()` puts a transaction
     /// with an input missing from the graph ahead of everything proven, its own parent included.
-    /// One unusable reserved output must not stop the batch funding from the others.
+    /// The reserved output on that transaction cannot be proven, so funding passes over it and
+    /// takes the usable one, whichever storage listed first. Listed first with the lower output
+    /// ID, it would otherwise win the canonical tie and fail the action on every retry.
     func test_aReservationWrittenChildFirstStillFunds() async throws {
         let auth = try auth
         let limits = WalletTransactionLimits.standard
@@ -1078,22 +1080,26 @@ final class ActionBatchControllerTests: XCTestCase, @unchecked Sendable {
             }
         }
 
-        let storage = FakeBatchStorage(capabilities: capabilities()) {
-            try self.begin($0, funding: [usable, unusable], inputBeef: reservationBEEF)
+        XCTAssertEqual(usable.outputs.map(\.satoshis), unusable.outputs.map(\.satoshis))
+
+        for funding in [[usable, unusable], [unusable, usable]] {
+            let storage = FakeBatchStorage(capabilities: capabilities()) {
+                try self.begin($0, funding: funding, inputBeef: reservationBEEF)
+            }
+            let batch = controller(storage)
+            let request = try anchorRequest()
+            let funded = try await XCTUnwrapAsync(await batch.plan(auth, request))
+            XCTAssertEqual(funded.inputs.map(\.sourceTXID), [try txid(usable)])
+            let graph = try BEEF(bytes: try XCTUnwrap(funded.inputBEEF), limits: WalletBEEFLimits.standard)
+            XCTAssertEqual(
+                try graph.transactions.map { try $0.transactionID(limits: limits).displayHex },
+                [parentID.displayHex, try txid(usable)]
+            )
+            let anchor = try sign(funded, request)
+            try verifyScripts(anchor.transaction)
+            let envelope = try AtomicBEEF(bytes: try anchor.atomicBEEF(), limits: WalletBEEFLimits.standard)
+            XCTAssertEqual(envelope.subjectTransactionID, anchor.transactionID)
         }
-        let batch = controller(storage)
-        let request = try anchorRequest()
-        let funded = try await XCTUnwrapAsync(await batch.plan(auth, request))
-        XCTAssertEqual(funded.inputs.map(\.sourceTXID), [try txid(usable)])
-        let graph = try BEEF(bytes: try XCTUnwrap(funded.inputBEEF), limits: WalletBEEFLimits.standard)
-        XCTAssertEqual(
-            try graph.transactions.map { try $0.transactionID(limits: limits).displayHex },
-            [parentID.displayHex, try txid(usable)]
-        )
-        let anchor = try sign(funded, request)
-        try verifyScripts(anchor.transaction)
-        let envelope = try AtomicBEEF(bytes: try anchor.atomicBEEF(), limits: WalletBEEFLimits.standard)
-        XCTAssertEqual(envelope.subjectTransactionID, anchor.transactionID)
     }
 }
 

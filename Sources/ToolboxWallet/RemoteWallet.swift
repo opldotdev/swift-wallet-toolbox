@@ -359,11 +359,21 @@ public struct RemoteWallet: Sendable {
             throw BRC29PaymentError.outputNotUniquelyIdentified(matches: matches.count)
         }
 
+        // The counterparty verifies the payment from its Atomic BEEF, so a funded graph that
+        // cannot prove the transaction stops the payment here, before anything is broadcast, and
+        // the funded inputs are released.
+        let atomicBEEF: [UInt8]
+        do {
+            atomicBEEF = try signed.atomicBEEF()
+        } catch {
+            try await release(funded.reference)
+            throw error
+        }
         if let beforeBroadcast {
             do {
                 try await beforeBroadcast(CounterpartyPayment(
                     transactionID: signed.transactionID, outputIndex: index,
-                    atomicBEEF: try signed.atomicBEEF(), reference: funded.reference, results: []))
+                    atomicBEEF: atomicBEEF, reference: funded.reference, results: []))
             } catch {
                 try await release(funded.reference)
                 throw error
@@ -374,7 +384,7 @@ public struct RemoteWallet: Sendable {
         return CounterpartyPayment(
             transactionID: signed.transactionID,
             outputIndex: index,
-            atomicBEEF: try signed.atomicBEEF(),
+            atomicBEEF: atomicBEEF,
             reference: funded.reference,
             results: processed.sendWithResults
         )
