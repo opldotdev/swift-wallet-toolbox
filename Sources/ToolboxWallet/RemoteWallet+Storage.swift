@@ -115,11 +115,16 @@ extension RemoteWallet {
     /// Checking the untrimmed remainder would let that spelling reach storage as `p color abc`.
     static func balanceBasketRequest(_ request: WalletListOutputsRequest) throws -> WalletListOutputsRequest {
         let basket = try ActionBatchWire.identifier(request.basket, name: "basket")
-        guard basket.hasPrefix(ListOutputsSpecOp.balanceBasketPrefix) else { return request }
+        // Prefixes are matched on UTF-8 bytes, as TS `startsWith` matches code units: `balance `
+        // followed by a combining mark is still a balance request, which `hasPrefix` would miss
+        // because it compares whole characters. Both prefixes are ASCII, so cutting their bytes
+        // leaves valid UTF-8.
+        let balancePrefix = ListOutputsSpecOp.balanceBasketPrefix.utf8
+        guard basket.utf8.starts(with: balancePrefix) else { return request }
         let target = try ActionBatchWire.identifier(
-            String(basket.dropFirst(ListOutputsSpecOp.balanceBasketPrefix.count)), name: "basket"
+            String(decoding: basket.utf8.dropFirst(balancePrefix.count), as: UTF8.self), name: "basket"
         )
-        if target.hasPrefix(ListOutputsSpecOp.moduleBasketPrefix) {
+        if target.utf8.starts(with: ListOutputsSpecOp.moduleBasketPrefix.utf8) {
             throw WireError.invalidParameter(name: "basket", message: balanceOfModuleBasketRefusal)
         }
         // TS appends the tag after validation and never counts again, so a caller's legal maximum

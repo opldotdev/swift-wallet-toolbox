@@ -10,7 +10,8 @@ public enum ListOutputsSpecOp {
 
     /// The BRC-112 basket prefix: `listOutputs` of `balance <basket>` asks for `<basket>`'s balance,
     /// sent to storage as that basket with the ``walletBalance`` tag (TS `Wallet.ts`
-    /// `validateListOutputsArgs`). Paired with swift-sdk `walletIsBalanceBasket`.
+    /// `validateListOutputsArgs`). Paired with swift-sdk `walletIsBalanceBasket`: both match it on
+    /// UTF-8 bytes after normalisation, as TS `startsWith` does.
     public static let balanceBasketPrefix = "balance "
 
     /// The BRC-99 module basket prefix, `p <module> <basket>`. BRC-112 refuses

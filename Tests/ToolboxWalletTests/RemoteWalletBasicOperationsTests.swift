@@ -325,6 +325,20 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         XCTAssertEqual(arguments?["tagQueryMode"]?.stringValue, "all")
     }
 
+    /// The prefix is matched on UTF-8 bytes, as TS `startsWith` matches code units: a combining
+    /// mark right after `balance ` joins the space into one character, which `hasPrefix` would miss.
+    func test_aBalancePrefixFollowedByACombiningMarkIsStillABalanceRequest() async throws {
+        let (wallet, transport) = try wallet(answers: [#"{"result":{"totalOutputs":9,"outputs":[]}}"#])
+
+        let result = try await wallet.listOutputs(try WalletListOutputsRequest(basket: "balance \u{301}tickets"))
+
+        XCTAssertEqual(result.totalOutputs, 9)
+        let arguments = try await transport.envelopes()[0]["params"]?.arrayValue?[1]
+        XCTAssertEqual(arguments?["basket"]?.stringValue?.unicodeScalars.map(\.value),
+                       "\u{301}tickets".unicodeScalars.map(\.value))
+        XCTAssertEqual(arguments?["tags"]?.arrayValue?.compactMap(\.stringValue), [ListOutputsSpecOp.walletBalance])
+    }
+
     /// `balance p <module> <basket>` is refused before storage is asked, with the TS wording.
     /// Whitespace after `balance ` does not get round it: storage trims the basket it receives,
     /// so the remainder is trimmed before the check (stricter than TS, which answers 0).
@@ -333,6 +347,7 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         let baskets = [
             "balance p color abc", "balance p color balance abc", "balance p btms",
             "balance  p color abc", "balance \tp color abc", "balance \u{00A0}p color abc", "Balance P Color ABC",
+            "balance p \u{301}color abc",
         ]
         for basket in baskets {
             do {
