@@ -169,10 +169,10 @@ package enum ErrorDetail {
     /// Text with the query and fragment cut from every URL in it: a word with `://`, or one whose
     /// `?` is followed by a `name=value`.
     package static func withoutQueries(_ text: String) -> String {
-        text.split(separator: " ", omittingEmptySubsequences: false).map { word in
+        text.split(separator: " ", omittingEmptySubsequences: false).map { (word: Substring) -> String in
             guard let cut = word.firstIndex(where: { $0 == "?" || $0 == "#" }),
-                  word.contains("://") || word[cut...].contains("=") else { return String(word) }
-            return String(word[..<cut])
+                  word.contains("://") || word.suffix(from: cut).contains("=") else { return String(word) }
+            return String(word.prefix(upTo: cut))
         }.joined(separator: " ")
     }
 }
