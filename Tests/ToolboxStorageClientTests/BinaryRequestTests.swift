@@ -1,6 +1,7 @@
 import XCTest
 import BSVScript
 import BSVTransaction
+import BSVWallet
 import ToolboxAuth
 import ToolboxCore
 import ToolboxStorage
@@ -133,6 +134,54 @@ final class BinaryRequestTests: XCTestCase {
         XCTAssertLessThan(valueCount(request), Self.authValueLimit)
         let blob = try XCTUnwrap(request["params"]?.arrayValue?[1]["inlineBlobs"]?["d1"])
         XCTAssertEqual(blob["data"]?.stringValue, Data(raw).base64EncodedString())
+    }
+
+    /// A received payment over ~100 KB: `internalizeAction` carries its Atomic BEEF as bytes.
+    func test_aLargeReceivedTransactionIsInternalizedWithinTheAuthLayersValueLimit() async throws {
+        let storage = Storage(echoesBinary: true)
+        let transaction = try Transaction(bytes: try largeTransaction(), limits: StorageLimits.transaction)
+        let atomic = try AtomicBEEF(
+            subjectTransactionID: try transaction.transactionID(limits: StorageLimits.transaction),
+            beef: try BEEF(merklePaths: [], transactions: [.raw(transaction)], limits: StorageLimits.beef),
+            limits: StorageLimits.beef
+        )
+        let request = try WalletInternalizeActionRequest(
+            transaction: atomic, description: "incoming photo", labels: [],
+            outputs: [WalletInternalizeOutput(
+                outputIndex: 0,
+                remittance: .basketInsertion(try WalletBasketInsertion(basket: "photos", tags: []))
+            )]
+        )
+
+        _ = try await client(storage).internalizeAction(auth, request)
+
+        let sent = try await storage.request("internalizeAction")
+        XCTAssertEqual(sent.headers["X-BSV-Binary-Request-Encoding"], "base64")
+        let body = try body(sent.body)
+        XCTAssertLessThan(valueCount(body), Self.authValueLimit)
+        let tx = try XCTUnwrap(body["params"]?.arrayValue?[1]["tx"])
+        XCTAssertEqual(tx["$bsvBinary"]?.stringValue, "base64")
+        XCTAssertEqual(
+            tx["data"]?.stringValue,
+            Data(try atomic.serialized(limits: StorageLimits.beef)).base64EncodedString()
+        )
+    }
+
+    func test_theReclaimTransactionIsArmedAsBytes() async throws {
+        let storage = Storage(echoesBinary: true)
+        let raw = try largeTransaction()
+
+        try await client(storage).armNoSendExpiry(auth, NoSendExpiryArm(
+            reference: "cmVm", reclaimTxid: String(repeating: "ab", count: 32), reclaimRawTx: raw,
+            reclaimDerivationPrefix: "UA==", reclaimDerivationSuffix: "Uw==", reclaimSatoshis: 950
+        ))
+
+        let sent = try await storage.request("armNoSendExpiry")
+        XCTAssertEqual(sent.headers["X-BSV-Binary-Request-Encoding"], "base64")
+        let arguments = try XCTUnwrap(try body(sent.body)["params"]?.arrayValue?[1])
+        XCTAssertLessThan(valueCount(arguments), Self.authValueLimit)
+        XCTAssertEqual(arguments["reclaimRawTx"]?["data"]?.stringValue, Data(raw).base64EncodedString())
+        XCTAssertEqual(arguments["reclaimSatoshis"], .number(950))
     }
 
     func test_theSettingsReadAsksWhetherStorageReadsBinary() async throws {
