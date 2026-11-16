@@ -191,11 +191,11 @@ final class AuthenticatedSessionTests: XCTestCase {
         let peer = TestPeer(key: keys.server)
         let session = session(with: peer, client: keys.client)
 
-        let response = try await session.send(method: "GET", path: "/list", query: "?q=a b[1]&k=%2B")
+        let response = try await session.send(method: "GET", path: "/list", query: "?q=a b[1]&k=%2B&n='x'")
 
         XCTAssertEqual(response.statusCode, 200)
         let seen = await peer.queriesSeen.last ?? nil
-        XCTAssertEqual(seen, "q=a%20b%5B1%5D&k=%2B")
+        XCTAssertEqual(seen, "q=a%20b%5B1%5D&k=%2B&n=%27x%27")
     }
 
     /// A `%` that is not an escape cannot be put on a URL; it is refused before any request.

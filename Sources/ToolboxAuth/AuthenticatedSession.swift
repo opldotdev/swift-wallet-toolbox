@@ -321,6 +321,8 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     static func wireQuery(_ query: String?) throws -> String? {
         guard let query, !query.isEmpty else { return query }
         let raw = query.hasPrefix("?") ? String(query.dropFirst()) : query
+        // A bare `?` is an empty search to a TS peer, so it is signed as none.
+        if raw.isEmpty { return nil }
         guard let encoded = raw.addingPercentEncoding(withAllowedCharacters: wireQueryCharacters) else {
             throw AuthTransportError.invalidQuery(query)
         }
@@ -346,8 +348,9 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     }
 
     /// The characters a query may carry on the wire as they are: those a URL query allows, and
-    /// `%` because the caller has already done the encoding.
-    private static let wireQueryCharacters = CharacterSet.urlQueryAllowed.union(["%"])
+    /// `%` because the caller has already done the encoding, less `'`, which a WHATWG `URL` (what
+    /// a TS peer verifies against) rewrites to `%27`.
+    private static let wireQueryCharacters = CharacterSet.urlQueryAllowed.union(["%"]).subtracting(["'"])
 
     /// Thirty-two bytes, which is the length the framing requires.
     ///
