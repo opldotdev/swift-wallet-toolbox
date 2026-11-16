@@ -29,14 +29,15 @@ public actor StorageClient {
     /// The user's record as last read, which says whether this store is the active one.
     private var user: StorageUser?
     /// Whether requests carry bytes as base64 (`X-BSV-Binary-Request-Encoding: base64`), which
-    /// storage said it reads by echoing `X-BSV-Binary-Encoding` on the settings read.
+    /// storage said it reads by echoing `X-BSV-Binary-Encoding` on a response.
     ///
     /// Bytes written as a JSON array of numbers cost one JSON value each, and storage's
     /// authentication layer (`@bsv/auth-express-middleware`) refuses any request with more than
     /// 100,000 values, or an array longer than that, with an unsigned `400 ERR_AUTH_MALFORMED`.
     /// A transaction over ~100 KB, such as an inscription carrying a photo, then never reaches
     /// storage. The reference client sends bytes as base64 for the same reason (`binaryRequests:
-    /// true` in every 1Sat wallet) once a response has carried that header.
+    /// true` in every 1Sat wallet) once a response has carried that header: its
+    /// `serverSupportsBinary` turns on with the first one and stays on.
     private var binaryRequests = false
 
     public init(endpoint: URL, transport: any AuthenticatedTransport) {
@@ -90,21 +91,14 @@ public actor StorageClient {
     /// key. That is fine for every argument a server reads by name, and wrong for one it hashes:
     /// the action-batch manifest's digest is recomputed by storage from the key order it receives.
     /// Parameters passed here are written with `JSON.stringify`'s rules and in their own order.
+    ///
+    /// Every call asks for binary responses with `X-BSV-Binary-Encoding: base64`, as the
+    /// reference `StorageClient.rpcCall` does on every call. A store that reads it writes the
+    /// response's bytes as base64 and echoes the header; one that does not answers in plain JSON.
+    /// Without it, storage writes every byte of a response as a JSON number: a 180 KB image
+    /// inscription's `createAction` and `beginActionBatch` replies came back at 1.33 MB each,
+    /// past the authenticated transport's payload cap, and the next action failed.
     public func call(_ method: String, rawParams params: [OrderedJSON]) async throws -> JSONValue {
-        try await call(method, rawParams: params, negotiatingBinary: false)
-    }
-
-    /// The header naming a binary request body, and the one asking for (and confirming) binary.
-    static let binaryRequestHeader = "X-BSV-Binary-Request-Encoding"
-    static let binaryHeader = "X-BSV-Binary-Encoding"
-
-    /// `negotiatingBinary` asks storage, with `X-BSV-Binary-Encoding: base64`, whether it reads
-    /// binary requests; its echo of that header turns `binaryRequests` on. Only the settings read
-    /// asks, because storage then writes the response's own bytes as base64 too, and a settings
-    /// record has none.
-    private func call(
-        _ method: String, rawParams params: [OrderedJSON], negotiatingBinary: Bool
-    ) async throws -> JSONValue {
         if Self.writerMethods.contains(method) {
             try await requireActive(params.first)
         }
@@ -118,18 +112,17 @@ public actor StorageClient {
             .init("id", .integer(Int64(id))),
         ])
         let binary = binaryRequests
-        var headers = ["Content-Type": "application/json"]
+        var headers = ["Content-Type": "application/json", Self.binaryHeader: "base64"]
         if binary { headers[Self.binaryRequestHeader] = "base64" }
-        if negotiatingBinary { headers[Self.binaryHeader] = "base64" }
-        return try await send(
-            method, id: id, body: request.utf8Bytes(binary: binary), headers: headers,
-            negotiatingBinary: negotiatingBinary
-        )
+        return try await send(method, id: id, body: request.utf8Bytes(binary: binary), headers: headers)
     }
 
+    /// The header naming a binary request body, and the one asking for (and confirming) binary.
+    static let binaryRequestHeader = "X-BSV-Binary-Request-Encoding"
+    static let binaryHeader = "X-BSV-Binary-Encoding"
+
     private func send(
-        _ method: String, id: Int, body: [UInt8], headers: [String: String],
-        negotiatingBinary: Bool
+        _ method: String, id: Int, body: [UInt8], headers: [String: String]
     ) async throws -> JSONValue {
         let response: AuthenticatedResponse
         do {
@@ -147,17 +140,32 @@ public actor StorageClient {
             Self.log("storage \(method) on \(ErrorDetail.hostPath(endpoint)) failed: \(ErrorDetail.describe(error))")
             throw error
         }
-        if negotiatingBinary {
-            binaryRequests = response.headers.contains {
-                $0.key.lowercased() == Self.binaryHeader.lowercased() && $0.value == "base64"
-            }
+        // `response.headers.get(BINARY_ENCODING_HEADER) === BINARY_ENCODING`. The reference reads
+        // the header only on a 2xx reply, and a store that sent it once supports binary for good.
+        let binaryResponse = response.headers.contains {
+            $0.key.lowercased() == Self.binaryHeader.lowercased() && $0.value == "base64"
+        }
+        if binaryResponse, (200..<300).contains(response.statusCode) {
+            binaryRequests = true
         }
 
-        let envelope: JSONValue
+        var envelope: JSONValue
         do {
             envelope = try JSONDecoder().decode(JSONValue.self, from: Data(response.body))
         } catch {
             throw logged(.unreadableResponse(method: method), response, "not JSON: \(ErrorDetail.describe(error))")
+        }
+        // `parseJsonRpc(text, responseUsesBinary)`: the whole reply, error member included, has
+        // its base64 bytes and escaped objects read back before anything reads it.
+        if binaryResponse {
+            do {
+                envelope = try envelope.decodingBinary()
+            } catch {
+                throw logged(
+                    .unreadableResponse(method: method), response,
+                    "binary JSON: \(ErrorDetail.describe(error))"
+                )
+            }
         }
 
         // A well-formed JSON-RPC reply names its version and echoes the request's id. The
@@ -285,10 +293,7 @@ public actor StorageClient {
     }
 
     private func readSettings(_ auth: AuthID) async throws -> StorageSettings {
-        let result = try await call(
-            "makeAvailable", rawParams: [OrderedJSON(.object(auth.jsonObject))],
-            negotiatingBinary: true
-        )
+        let result = try await call("makeAvailable", rawParams: [OrderedJSON(.object(auth.jsonObject))])
         guard let identityKey = result["storageIdentityKey"]?.stringValue,
               let name = result["storageName"]?.stringValue,
               let chainName = result["chain"]?.stringValue,
