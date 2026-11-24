@@ -18,13 +18,18 @@ import ToolboxStorageClient
 /// A PeerPay payment waiting in `payment_inbox`, as `@bsv/message-box-client` `PeerPayClient`
 /// reads one: the message it came in, the sender's identity key (compressed, lowercase hex) and
 /// the payment token.
+///
+/// `createdAt` is when the message box filed the message: the stamp `/listMessages` sends with
+/// it (``MessageBoxMessage/createdAt``), as the server sent it, or nil when it sent none. TS
+/// `IncomingPayment` drops it; its `PeerMessage` keeps it as `created_at`.
 public struct MessageBoxIncomingPayment: Sendable, Equatable {
     public let messageId: String
     public let sender: String
     public let token: MessageBoxPaymentToken
+    public let createdAt: String?
 
-    public init(messageId: String, sender: String, token: MessageBoxPaymentToken) {
-        self.messageId = messageId; self.sender = sender; self.token = token
+    public init(messageId: String, sender: String, token: MessageBoxPaymentToken, createdAt: String? = nil) {
+        self.messageId = messageId; self.sender = sender; self.token = token; self.createdAt = createdAt
     }
 }
 
@@ -664,7 +669,10 @@ extension MessageBoxClient {
             unopened.add(row, error)
             return nil
         }
-        return MessageBoxIncomingPayment.decode(messageId: row.message.messageId, sender: row.rawSender, plaintext: plaintext)
+        return MessageBoxIncomingPayment.decode(
+            messageId: row.message.messageId, sender: row.rawSender, plaintext: plaintext,
+            createdAt: row.message.createdAt
+        )
     }
 
     /// TS `Brc29RemittanceModule.acceptSettlement` as PeerPay configures it. Any failure is the
@@ -748,7 +756,9 @@ extension MessageBoxIncomingPayment {
     /// TS `paymentFromMessage` over an opened message: the plaintext is parsed as JSON when it
     /// is JSON (a JSON string is parsed once more), must be an object, may name only the message
     /// sender as its own, and must carry a valid token. Anything else is nil.
-    public static func decode(messageId: String, sender: String, plaintext: String) -> MessageBoxIncomingPayment? {
+    public static func decode(
+        messageId: String, sender: String, plaintext: String, createdAt: String? = nil
+    ) -> MessageBoxIncomingPayment? {
         var body = parseJSON(plaintext) ?? .string(plaintext)
         if case .string(let text) = body {
             guard let parsed = parseJSON(text) else { return nil }
@@ -758,7 +768,7 @@ extension MessageBoxIncomingPayment {
         if let claimed = payment["sender"], claimed != .null, claimed != .string(sender) { return nil }
         guard let boundedID = try? boundedMessageID(messageId), isCanonicalIdentityKey(sender),
               let token = paymentToken(payment) else { return nil }
-        return MessageBoxIncomingPayment(messageId: boundedID, sender: sender, token: token)
+        return MessageBoxIncomingPayment(messageId: boundedID, sender: sender, token: token, createdAt: createdAt)
     }
 
     /// TS `boundedMessageId`.

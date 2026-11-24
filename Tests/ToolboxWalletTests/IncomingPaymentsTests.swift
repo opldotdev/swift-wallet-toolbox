@@ -253,6 +253,24 @@ final class IncomingPaymentsTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(payments, MessageBoxPaymentListing(payments: [f.payment], truncated: false, nextOffset: 1))
     }
 
+    func test_aListedPaymentKeepsWhenTheMessageBoxFiledIt() async throws {
+        // The servers (`@bsv/message-box-server`, `@bopen-io/messagebox-server`) send
+        // `createdAt`; TS `PeerMessage` names it `created_at`. Either is kept, as sent.
+        let f = try await fixture()
+        var camel = f.row, snake = f.row, none = f.row
+        camel["createdAt"] = "2026-11-24T15:04:05.123Z"
+        snake["messageId"] = "p2"; snake["created_at"] = "2026-11-24T15:04:06Z"
+        none["messageId"] = "p3"
+        let client = try MessageBoxClient(host: host, wallet: ProtoWallet(rootKey: f.receiver),
+            transport: LoggingTransport(log: EventLog(), [(200, try listing([camel, snake, none]))]))
+
+        let payments = try await client.incomingPayments().payments
+
+        XCTAssertEqual(payments.map(\.messageId), ["p1", "p2", "p3"])
+        XCTAssertEqual(payments.map(\.createdAt), ["2026-11-24T15:04:05.123Z", "2026-11-24T15:04:06Z", nil])
+        XCTAssertEqual(payments.map(\.token), [f.token, f.token, f.token])
+    }
+
     func test_incomingPaymentsReadPlainAndWrappedBodiesAndSkipTheRest() async throws {
         let receiver = try key(1), sender = try key(2), other = try key(4)
         let token = MessageBoxPaymentToken(derivationPrefix: prefix, derivationSuffix: suffix,
