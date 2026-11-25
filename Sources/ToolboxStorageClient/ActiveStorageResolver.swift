@@ -115,9 +115,10 @@ public enum ActiveStorageResolver {
         return .unsettled(reason: "the records lead through more stores than any real chain of moves")
     }
 
-    /// An address compared without its trailing slash or letter case of the host, so the same
-    /// store written two ways is connected once.
-    static func endpointKey(_ url: URL) -> String {
+    /// An address compared without its trailing slash or the letter case of its scheme and host,
+    /// so the same store written two ways is one store. Callers compare a resolved store to an
+    /// address with it.
+    public static func endpointKey(_ url: URL) -> String {
         var text = url.absoluteString
         while text.hasSuffix("/") { text.removeLast() }
         guard var parts = URLComponents(string: text) else { return text }
