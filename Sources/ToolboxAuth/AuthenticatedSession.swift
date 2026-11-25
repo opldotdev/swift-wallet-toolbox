@@ -1,5 +1,6 @@
 import Foundation
 import BSVAuth
+import BSVCore
 import BSVKeys
 import ToolboxCore
 
@@ -20,7 +21,7 @@ import ToolboxCore
 /// Step 5 is the one worth stating plainly: a response that does not authenticate is discarded,
 /// never returned with a warning. A caller cannot be expected to check.
 public actor AuthenticatedSession: AuthenticatedTransport {
-    private let baseURL: URL
+    let baseURL: URL
     private let transport: any HTTPTransport
     private let authenticator: PeerAuthenticator
     private let expectedPeer: PublicKey?
@@ -410,13 +411,14 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             throw error
         }
 
-        return AuthenticatedResponse(
-            statusCode: inner.status,
-            headers: Dictionary(
-                inner.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
-            ),
-            body: inner.body ?? []
+        var headers = Dictionary(
+            inner.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
         )
+        // AuthFetch adds the identity that signed the reply back as a header
+        // (`AuthFetch.ts:211`), over anything the peer sent under that name. BRC-105 reads the
+        // payee from it.
+        headers[BRC104HTTPHeaderName.identityKey] = Hex.encode(delivered.peer.compressedBytes)
+        return AuthenticatedResponse(statusCode: inner.status, headers: headers, body: inner.body ?? [])
     }
 
     // MARK: - Helpers
@@ -427,7 +429,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// precise about both halves and `URL` quietly is not: a path of `/` leaves `URL.path` empty,
     /// and `URL.query` drops the leading `?` the frame requires. Either loss makes a peer reject
     /// a frame that was correct when we built it.
-    private func url(forPath path: String, query: String?) -> URL {
+    func url(forPath path: String, query: String?) -> URL {
         guard var parts = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             return baseURL
         }

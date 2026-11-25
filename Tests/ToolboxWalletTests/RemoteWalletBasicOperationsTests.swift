@@ -114,6 +114,18 @@ final class RemoteWalletBasicOperationsTests: XCTestCase {
         acceptsChainInformation(wallet)
     }
 
+    /// `AuthenticatedSession.sendPaid` takes a `PayingWallet`; a remote wallet pays its 402s.
+    func test_aRemoteWalletCanPayForAPaidRequest() throws {
+        func acceptsPayer(_ wallet: any PayingWallet) {}
+        func acceptsKeys<T: WalletKeyOperations>(_ wallet: T) {}
+        func acceptsActions<T: WalletActionOperations>(_ wallet: T) {}
+        let (wallet, _) = try wallet()
+
+        acceptsPayer(wallet)
+        acceptsKeys(wallet)
+        acceptsActions(wallet)
+    }
+
     func test_chainInformationForwardsHeightAndExactHeaderBytes() async throws {
         let bytes = [UInt8](repeating: 0, count: 80)
         let header = try ChainBlockHeader(height: 42, serializedBytes: bytes)

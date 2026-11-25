@@ -291,3 +291,7 @@ extension RemoteWallet {
         }
     }
 }
+
+/// With ``WalletKeyOperations`` this makes the wallet a ToolboxAuth `PayingWallet`, so it can
+/// pay for a BRC-105 request.
+extension RemoteWallet: WalletActionOperations {}

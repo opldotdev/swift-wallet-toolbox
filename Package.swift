@@ -61,11 +61,18 @@ let package = Package(
 
         // BRC-103 mutual authentication over HTTP. The SDK carries the protocol and its value
         // types; this drives them over a real transport, which is what remote storage requires.
+        // BRC-105 paid requests ride on it too: a 402 is answered with a BRC-29 payment, whose
+        // Atomic BEEF is written within the shared storage bounds.
         .target(
             name: "ToolboxAuth",
             dependencies: [
                 "ToolboxCore",
+                "ToolboxBRC29",
+                "ToolboxStorage",
                 .product(name: "BSVAuth", package: "swift-sdk"),
+                .product(name: "BSVCore", package: "swift-sdk"),
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
                 .product(name: "BSVWallet", package: "swift-sdk"),
             ]
         ),
@@ -204,8 +211,12 @@ let package = Package(
             name: "ToolboxAuthTests",
             dependencies: [
                 "ToolboxAuth",
+                "ToolboxStorage",
                 .product(name: "BSVWallet", package: "swift-sdk"),
                 .product(name: "BSVAuth", package: "swift-sdk"),
+                .product(name: "BSVCore", package: "swift-sdk"),
+                .product(name: "BSVKeys", package: "swift-sdk"),
+                .product(name: "BSVTransaction", package: "swift-sdk"),
             ]
         ),
         .testTarget(

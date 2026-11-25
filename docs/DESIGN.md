@@ -39,7 +39,7 @@ list is the answer to "what belongs where".
 | Go toolbox | This library | Responsibility |
 |---|---|---|
 | `pkg/wdk`, `pkg/errors`, `pkg/defs` | `ToolboxCore` | Shared vocabulary: the wire error taxonomy, decode limits |
-| — | `ToolboxAuth` | BRC-103 mutual authentication over HTTP |
+| — | `ToolboxAuth` | BRC-103 mutual authentication over HTTP, and BRC-105 paid requests |
 | `pkg/brc29` | `ToolboxBRC29` | BRC-29 payment derivation |
 | `storage/portable` | `ToolboxPortable` | BRC-38 canonical documents and BRC-39 envelope validation |
 | `pkg/storage`, `pkg/entity` | `ToolboxStorage` | The storage contract and its record types — no implementation |

@@ -50,3 +50,5 @@ extension RemoteWallet {
         try await protoWallet.verifyHMAC(request)
     }
 }
+
+extension RemoteWallet: WalletKeyOperations {}

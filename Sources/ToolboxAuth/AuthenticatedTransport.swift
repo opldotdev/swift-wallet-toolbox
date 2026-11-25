@@ -36,6 +36,13 @@ public struct AuthenticatedResponse: Equatable, Sendable {
         self.headers = headers
         self.body = body
     }
+
+    /// Header lookup is case-insensitive, as `Headers.get` is in TypeScript: a peer signs its
+    /// header names lowercased, and a caller may ask for `X-BSV-Payment-Version`.
+    public func header(_ name: String) -> String? {
+        let wanted = name.lowercased()
+        return headers.first { $0.key.lowercased() == wanted }?.value
+    }
 }
 
 /// Which call an error belongs to: enough to find it in a server's log, and nothing that could
