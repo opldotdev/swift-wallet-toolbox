@@ -4,6 +4,7 @@ import BSVKeys
 import BSVOverlay
 import BSVTransaction
 import BSVWallet
+import ToolboxAuth
 import ToolboxCore
 import ToolboxStorage
 
@@ -113,8 +114,8 @@ public actor MessageBoxOutbox {
         let client = try makeClient(host, wallet.protoWallet)
         try await client.requireFreeDelivery(to: recipient)
         try Task.checkCancellation()
-        let prefix = try await Self.nonce(wallet.protoWallet)
-        let suffix = try await Self.nonce(wallet.protoWallet)
+        let prefix = try await AuthNonce.create(wallet.protoWallet)
+        let suffix = try await AuthNonce.create(wallet.protoWallet)
         let attempt = SendAttempt()
         do {
             let payment = try await wallet.createMessageBoxPayment(recipient: recipient, satoshis: satoshis,
@@ -434,15 +435,6 @@ public actor MessageBoxOutbox {
 
     private func remove(_ sender: String, _ recipient: String) throws {
         try FileManager.default.removeItem(at: file(sender, recipient))
-    }
-
-    /// SDK createNonce: 16 random bytes followed by the wallet's server HMAC.
-    private static func nonce(_ wallet: ProtoWallet) async throws -> String {
-        let random = (0..<16).map { _ in UInt8.random(in: .min ... .max) }
-        let hmac = try await wallet.createHMAC(WalletCreateHMACRequest(
-            protocolID: WalletProtocolID(securityLevel: .everyAppAndCounterparty, name: "server hmac"),
-            keyID: WalletKeyID(String(decoding: random, as: UTF8.self)), data: random))
-        return Data(random + hmac.hmac.bytes).base64EncodedString()
     }
 }
 

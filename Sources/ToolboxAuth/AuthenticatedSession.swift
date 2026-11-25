@@ -1,5 +1,6 @@
 import Foundation
 import BSVAuth
+import BSVCore
 import BSVKeys
 import ToolboxCore
 
@@ -20,10 +21,12 @@ import ToolboxCore
 /// Step 5 is the one worth stating plainly: a response that does not authenticate is discarded,
 /// never returned with a warning. A caller cannot be expected to check.
 public actor AuthenticatedSession: AuthenticatedTransport {
-    private let baseURL: URL
+    let baseURL: URL
     private let transport: any HTTPTransport
     private let authenticator: PeerAuthenticator
     private let expectedPeer: PublicKey?
+    /// The wallet the session signs with. BRC-105 compares a payer's identity with it.
+    let wallet: any AuthenticationWallet
 
     private var sessionID: AuthSessionID?
     /// Set while a handshake is running, so a second caller waits for the first rather than
@@ -68,6 +71,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
         self.transport = transport
         self.authenticator = PeerAuthenticator(wallet: wallet, limits: authenticatorLimits)
         self.expectedPeer = expectedPeer
+        self.wallet = wallet
     }
 
     // MARK: - Sending
@@ -75,6 +79,22 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     public func send(
         method: String, path: String, query: String? = nil,
         headers: [String: String] = [:], body: [UInt8]? = nil
+    ) async throws -> AuthenticatedResponse {
+        do {
+            return try await sendTrackingDelivery(
+                method: method, path: path, query: query, headers: headers, body: body
+            )
+        } catch let error as RequestMayHaveRun {
+            throw error.underlying
+        }
+    }
+
+    /// ``send(method:path:query:headers:body:)``, but a failure after the request may have reached
+    /// the peer's application comes wrapped in ``RequestMayHaveRun``. Any other error means the
+    /// peer provably did not run the request, so a caller that must not run it twice may resend.
+    func sendTrackingDelivery(
+        method: String, path: String, query: String?,
+        headers: [String: String], body: [UInt8]?
     ) async throws -> AuthenticatedResponse {
         await acquireSend()
         defer { releaseSend() }
@@ -93,7 +113,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
                     "\(Self.describe(requestContext(method: method, path: path))): the peer signed a "
                         + "reply for a session this side no longer holds; not resent, outcome unknown"
                 )
-                throw AuthTransportError.sessionExpired
+                throw RequestMayHaveRun(underlying: AuthTransportError.sessionExpired)
             } catch AuthTransportError.sessionExpired {
                 // AuthFetch retries `Session not found for nonce` and unsigned 401. Both reach
                 // here only from before the peer ran the request. The send lock stays held so a sibling cannot receive against the
@@ -181,10 +201,56 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             throw CancellationError()
         } catch {
             Self.log("\(Self.describe(context)) did not get a reply: \(ErrorDetail.describe(error))")
-            throw error
+            throw Self.neverLeft(error) ? error : RequestMayHaveRun(underlying: error)
         }
 
-        return try await unwrap(response, expecting: requestID, for: context)
+        do {
+            return try await unwrap(response, expecting: requestID, for: context)
+        } catch AuthTransportError.sessionExpired {
+            // An unsigned 401: the peer's auth refused the request before its application ran.
+            throw AuthTransportError.sessionExpired
+        } catch let error as AuthTransportError {
+            // An unsigned 4xx is a gate in front of the peer's auth refusing it; any other status
+            // (a proxy's 502 or 504, a server error) may come after the application ran.
+            if case .unauthenticatedReply(let status, _, _) = error, (400..<500).contains(status) {
+                throw error
+            }
+            throw RequestMayHaveRun(underlying: error)
+        } catch let error as SignedReplySessionLost {
+            throw error
+        } catch {
+            throw RequestMayHaveRun(underlying: error)
+        }
+    }
+
+    /// True for a transport failure that happens before any byte of the request is sent: the
+    /// host could not be found or reached, there is no network, or TLS refused the connection.
+    /// A connection lost or timed out later leaves open whether the peer ran the request.
+    static func neverLeft(_ error: any Error) -> Bool {
+        guard let error = error as? URLError else { return false }
+        switch error.code {
+        case .badURL, .unsupportedURL, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .notConnectedToInternet, .internationalRoamingOff, .callIsActive, .dataNotAllowed,
+             .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+             .clientCertificateRejected, .clientCertificateRequired,
+             .appTransportSecurityRequiresSecureConnection:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The identity key of the peer this session is authenticated with, running the handshake
+    /// if there is no session yet.
+    func peerIdentityKey() async throws -> PublicKey {
+        await acquireSend()
+        defer { releaseSend() }
+        let session = try await establishedSession()
+        guard let peer = await authenticator.session(session)?.peer else {
+            throw Self.logged(.handshakeFailed("the authenticated session names no peer"))
+        }
+        return peer
     }
 
     /// The call as the log and ``AuthTransportError/unauthenticatedReply(status:body:request:)``
@@ -410,13 +476,14 @@ public actor AuthenticatedSession: AuthenticatedTransport {
             throw error
         }
 
-        return AuthenticatedResponse(
-            statusCode: inner.status,
-            headers: Dictionary(
-                inner.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
-            ),
-            body: inner.body ?? []
+        var headers = Dictionary(
+            inner.headers.map { ($0.name, $0.value) }, uniquingKeysWith: { _, last in last }
         )
+        // AuthFetch adds the identity that signed the reply back as a header
+        // (`AuthFetch.ts:211`), over anything the peer sent under that name. BRC-105 reads the
+        // payee from it.
+        headers[BRC104HTTPHeaderName.identityKey] = Hex.encode(delivered.peer.compressedBytes)
+        return AuthenticatedResponse(statusCode: inner.status, headers: headers, body: inner.body ?? [])
     }
 
     // MARK: - Helpers
@@ -427,7 +494,7 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// precise about both halves and `URL` quietly is not: a path of `/` leaves `URL.path` empty,
     /// and `URL.query` drops the leading `?` the frame requires. Either loss makes a peer reject
     /// a frame that was correct when we built it.
-    private func url(forPath path: String, query: String?) -> URL {
+    func url(forPath path: String, query: String?) -> URL {
         guard var parts = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             return baseURL
         }
@@ -499,6 +566,14 @@ public actor AuthenticatedSession: AuthenticatedTransport {
     /// A signed reply arrived for a session this side no longer holds. The peer has run the
     /// request, so `send` surfaces ``AuthTransportError/sessionExpired`` without resending it.
     private struct SignedReplySessionLost: Error {}
+
+    /// A send failed after the request was handed to the transport, in a way that leaves open
+    /// whether the peer's application ran it: a lost or unreadable reply, or a signed reply for a
+    /// session this side no longer holds. `underlying` is what ``send(method:path:query:headers:body:)``
+    /// throws for it.
+    struct RequestMayHaveRun: Error {
+        let underlying: any Error
+    }
 
     private func acquireSend() async {
         if sending {

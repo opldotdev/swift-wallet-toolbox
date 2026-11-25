@@ -64,7 +64,7 @@ reference toolboxes; wallet results and PeerPay delivery continue to use Atomic 
 | Module | Responsibility |
 |---|---|
 | `ToolboxCore` | Shared vocabulary: the wire error taxonomy, decode limits |
-| `ToolboxAuth` | BRC-103 mutual authentication over HTTP |
+| `ToolboxAuth` | BRC-103 mutual authentication over HTTP, and BRC-105 paid requests |
 | `ToolboxPortable` | BRC-38 canonical wallet data and BRC-39 envelope validation |
 | `ToolboxStorage` | The storage contract and its record types |
 | `ToolboxStorageClient` | Remote storage over JSON-RPC |
