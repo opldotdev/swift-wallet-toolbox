@@ -86,8 +86,13 @@ final class ActiveStorageResolverTests: XCTestCase {
     }
 
     private func movedKey(_ resolution: ActiveStorageResolution) -> String? {
-        if case .moved(let key) = resolution { return key }
+        if case .moved(let key, _) = resolution { return key }
         return nil
+    }
+
+    private func isUnsettled(_ resolution: ActiveStorageResolution) -> Bool {
+        if case .unsettled = resolution { return true }
+        return false
     }
 
     func test_unmovedStoreIsActiveWithoutTryingCandidates() async throws {
@@ -143,11 +148,81 @@ final class ActiveStorageResolverTests: XCTestCase {
 
     func test_moveToAnUnknownStoreIsReportedNotWrittenTo() async throws {
         let start = StoreTransport(key: "0a", activeStorage: "0d")
-        let network = Network([b: StoreTransport(key: "0b", activeStorage: "0b")])
+        let other = StoreTransport(key: "0b", activeStorage: "0b")
+        let network = Network([b: other])
 
         let resolution = try await resolve(network, from: start, at: a, candidates: [b])
 
-        XCTAssertEqual(movedKey(resolution), "0d")
+        guard case .moved(let key, let unreachable) = resolution else {
+            return XCTFail("\(resolution)")
+        }
+        XCTAssertEqual(key, "0d")
+        XCTAssertEqual(unreachable, [])
+        // A candidate that isn't the moved-to store is only asked who it is: no user record is
+        // read or inserted there.
+        let methods = await other.methods
+        XCTAssertEqual(methods, ["makeAvailable"])
+    }
+
+    func test_unreachableCandidateIsListedWhenTheMoveIsNotFound() async throws {
+        let start = StoreTransport(key: "0a", activeStorage: "0c")
+        let network = Network([
+            c: StoreTransport(key: "0c", activeStorage: "0c", reachable: false),
+        ])
+
+        let resolution = try await resolve(network, from: start, at: a, candidates: [c])
+
+        guard case .moved(let key, let unreachable) = resolution else {
+            return XCTFail("\(resolution)")
+        }
+        XCTAssertEqual(key, "0c")
+        XCTAssertEqual(unreachable, [c])
+    }
+
+    func test_emptyRecordNamesNoStore() async throws {
+        let start = StoreTransport(key: "0a", activeStorage: "")
+        let network = Network([:])
+
+        let resolution = try await resolve(network, from: start, at: a, candidates: [b])
+
+        XCTAssertEqual(activeEndpoint(resolution), a)
+        let connected = await network.connected
+        XCTAssertEqual(connected, [])
+    }
+
+    func test_followedStoreThatNamesNoStoreIsUnsettled() async throws {
+        // The configured store names B, but B's record names nothing, so B takes no writes and
+        // must not be accepted as the wallet's store.
+        let start = StoreTransport(key: "0a", activeStorage: "0b")
+        let network = Network([b: StoreTransport(key: "0b", activeStorage: nil)])
+
+        let resolution = try await resolve(network, from: start, at: a, candidates: [b])
+
+        XCTAssertTrue(isUnsettled(resolution), "\(resolution)")
+    }
+
+    func test_sameAddressWrittenTwoWaysIsConnectedOnce() async throws {
+        let start = StoreTransport(key: "0a", activeStorage: "0d")
+        let network = Network([b: StoreTransport(key: "0b", activeStorage: "0b")])
+        let bWithoutSlash = URL(string: "https://B.example")!
+
+        _ = try await resolve(network, from: start, at: a, candidates: [b, bWithoutSlash])
+
+        let connected = await network.connected
+        XCTAssertEqual(connected, [b])
+    }
+
+    func test_cancelledOpenIsNotReportedAsAMove() async throws {
+        let start = StoreTransport(key: "0a", activeStorage: "0c")
+        do {
+            _ = try await ActiveStorageResolver.resolve(
+                from: StorageClient(endpoint: a, transport: start),
+                candidates: [c],
+                identityKey: identityKey,
+                connect: { _ in throw CancellationError() }
+            )
+            XCTFail("a cancelled open resolved")
+        } catch is CancellationError {}
     }
 
     func test_unreachableCandidateIsSkipped() async throws {
@@ -182,17 +257,30 @@ final class ActiveStorageResolverTests: XCTestCase {
 
         let resolution = try await resolve(network, from: start, at: a, candidates: [a, b])
 
-        XCTAssertEqual(movedKey(resolution), "0a")
+        XCTAssertTrue(isUnsettled(resolution), "\(resolution)")
     }
 
     func test_newStoreThatNamesItselfIsNotTheWalletsStore() async throws {
-        // A fresh store creates a record naming itself, but the configured store names another:
-        // the entered address is only followed when the record leads there.
-        let start = StoreTransport(key: "0a", activeStorage: "0a")
-        let network = Network([b: StoreTransport(key: "0b", activeStorage: "0b")])
+        // A fresh store creates a record naming itself, but the configured store's record names
+        // another: an entered address is only followed when the records lead there.
+        let start = StoreTransport(key: "0a", activeStorage: "0d")
+        let fresh = StoreTransport(key: "0b", activeStorage: "0b")
+        let network = Network([b: fresh])
 
         let resolution = try await resolve(network, from: start, at: a, candidates: [b])
 
-        XCTAssertNotEqual(activeEndpoint(resolution), b)
+        XCTAssertEqual(movedKey(resolution), "0d")
+        XCTAssertNil(activeEndpoint(resolution))
+    }
+
+    func test_endpointKeyIgnoresTrailingSlashAndHostCase() {
+        XCTAssertEqual(
+            ActiveStorageResolver.endpointKey(URL(string: "https://Wallet.1sat.app/")!),
+            ActiveStorageResolver.endpointKey(URL(string: "https://wallet.1sat.app")!)
+        )
+        XCTAssertNotEqual(
+            ActiveStorageResolver.endpointKey(URL(string: "https://wallet.1sat.app/a")!),
+            ActiveStorageResolver.endpointKey(URL(string: "https://wallet.1sat.app/b")!)
+        )
     }
 }
