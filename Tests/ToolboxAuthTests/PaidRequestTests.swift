@@ -63,10 +63,25 @@ final class PaidRequestTests: XCTestCase {
     /// Keys from a real `ProtoWallet`; `createAction` is recorded and answered with a fixed
     /// Atomic BEEF.
     private actor FakePayer: WalletPublicKeyProviding, WalletHMACOperations, WalletActionOperations {
+        /// What `createAction` answers with.
+        enum Result {
+            /// The signed payment, as Atomic BEEF.
+            case signed
+            /// The same transaction left unsigned, under ``reference``.
+            case unsigned
+            /// Only the transaction ID.
+            case transactionIDOnly
+        }
+
+        static let reference: [UInt8] = Array("payment-action".utf8)
+
         let keys: ProtoWallet
         var transaction: [UInt8]
         var createActionError: (any Error)?
+        var result = Result.signed
+        var abortAnswer = true
         private(set) var createActions: [WalletCreateActionRequest] = []
+        private(set) var aborted: [WalletAbortActionRequest] = []
 
         init(key: PrivateKey, transaction: [UInt8]) {
             self.keys = ProtoWallet(rootKey: key)
@@ -74,6 +89,8 @@ final class PaidRequestTests: XCTestCase {
         }
 
         func setCreateActionError(_ error: (any Error)?) { createActionError = error }
+        func setResult(_ result: Result) { self.result = result }
+        func setAbortAnswer(_ aborted: Bool) { abortAnswer = aborted }
 
         func getPublicKey(_ request: WalletGetPublicKeyRequest) async throws -> WalletGetPublicKeyResult {
             try await keys.getPublicKey(request)
@@ -87,15 +104,24 @@ final class PaidRequestTests: XCTestCase {
         func createAction(_ request: WalletCreateActionRequest) async throws -> WalletCreateActionResult {
             createActions.append(request)
             if let createActionError { throw createActionError }
-            return try WalletCreateActionResult(
-                transaction: try AtomicBEEF(bytes: transaction, limits: StorageLimits.beef)
-            )
+            let atomic = try AtomicBEEF(bytes: transaction, limits: StorageLimits.beef)
+            switch result {
+            case .signed:
+                return try WalletCreateActionResult(transaction: atomic)
+            case .unsigned:
+                return try WalletCreateActionResult(signableTransaction: WalletSignableTransaction(
+                    transaction: atomic, reference: try WalletBase64Data(Self.reference)
+                ))
+            case .transactionIDOnly:
+                return try WalletCreateActionResult(transactionID: atomic.subjectTransactionID)
+            }
         }
         func signAction(_ request: WalletSignActionRequest) async throws -> WalletSignActionResult {
             throw NotUsed()
         }
         func abortAction(_ request: WalletAbortActionRequest) async throws -> WalletAbortActionResult {
-            throw NotUsed()
+            aborted.append(request)
+            return WalletAbortActionResult(aborted: abortAnswer)
         }
         func listActions(_ request: WalletListActionsRequest) async throws -> WalletListActionsResult {
             throw NotUsed()
@@ -114,8 +140,11 @@ final class PaidRequestTests: XCTestCase {
             case paymentRequired(version: String? = "1.0", satoshis: String? = "1000",
                 prefix: String? = TS.prefix)
             case status(Int, body: String = "{\"ok\":true}")
-            /// No reply reaches the client.
+            /// The request reached the server, but no reply reached the client.
             case dropped
+            /// The transport could not connect, so the request never left. The server's record of
+            /// it stands in for the attempt.
+            case unreachable
         }
 
         private var answers: [Answer]
@@ -141,6 +170,8 @@ final class PaidRequestTests: XCTestCase {
                 return TestPeerReply(status: status, body: Array(body.utf8))
             case .dropped:
                 throw URLError(.networkConnectionLost)
+            case .unreachable:
+                throw URLError(.cannotConnectToHost)
             }
         }
     }
@@ -170,11 +201,11 @@ final class PaidRequestTests: XCTestCase {
         let log: PaymentLog
     }
 
-    private func fixture(_ answers: [PaymentServer.Answer]) throws -> Fixture {
+    private func fixture(_ answers: [PaymentServer.Answer], payerKey: PrivateKey? = nil) throws -> Fixture {
         let keys = try keys()
         let peer = TestPeer(key: keys.server)
         let server = PaymentServer(answers)
-        let payer = FakePayer(key: keys.client, transaction: try Hex.decode(TS.atomicHex, maximumDecodedByteCount: 1_000))
+        let payer = FakePayer(key: payerKey ?? keys.client, transaction: try Hex.decode(TS.atomicHex, maximumDecodedByteCount: 1_000))
         let session = AuthenticatedSession(baseURL: baseURL, wallet: ProtoWallet(rootKey: keys.client), transport: peer)
         return Fixture(session: session, peer: peer, server: server, payer: payer, log: PaymentLog())
     }
@@ -424,7 +455,7 @@ final class PaidRequestTests: XCTestCase {
     // MARK: - Retries
 
     func test_aPaidSendThatFailsIsRetriedWithTheSamePayment() async throws {
-        let fixture = try fixture([.paymentRequired(), .dropped, .status(201)])
+        let fixture = try fixture([.paymentRequired(), .unreachable, .status(201)])
         await start(fixture)
 
         let response = try await sendPaid(fixture)
@@ -439,7 +470,7 @@ final class PaidRequestTests: XCTestCase {
     }
 
     func test_paidSendsStopAfterThreeAttemptsWithTypeScriptsMessage() async throws {
-        let fixture = try fixture([.paymentRequired(), .dropped, .dropped, .dropped, .status(201)])
+        let fixture = try fixture([.paymentRequired(), .unreachable, .unreachable, .unreachable, .status(201)])
         await start(fixture)
 
         do {
@@ -466,7 +497,7 @@ final class PaidRequestTests: XCTestCase {
     }
 
     func test_theCallerSetsHowManyPaidSendsAreMade() async throws {
-        let two = try fixture([.paymentRequired(), .dropped, .dropped, .status(201)])
+        let two = try fixture([.paymentRequired(), .unreachable, .unreachable, .status(201)])
         await start(two)
         do {
             _ = try await sendPaid(two, attempts: 2)
@@ -479,7 +510,7 @@ final class PaidRequestTests: XCTestCase {
         XCTAssertEqual(twoPayments.count, 3)
 
         // Not positive is AuthFetch's default of three.
-        let fallback = try fixture([.paymentRequired(), .dropped, .dropped, .status(201)])
+        let fallback = try fixture([.paymentRequired(), .unreachable, .unreachable, .status(201)])
         await start(fallback)
         let response = try await sendPaid(fallback, attempts: 0)
         XCTAssertEqual(response.statusCode, 201)
@@ -555,8 +586,9 @@ final class PaidRequestTests: XCTestCase {
         do {
             _ = try await sendPaid(fixture, onPayment: { _ in throw SaveFailed() })
             XCTFail("the paid request was sent")
-        } catch let error as SaveFailed {
-            XCTAssertEqual(error, SaveFailed())
+        } catch BRC105Error.paymentNotSaved(let payment, let reason) {
+            XCTAssertEqual(payment, try vectorPayment(), "the payment is not lost with the save")
+            XCTAssertTrue(reason.contains("SaveFailed"), reason)
         }
         let payments = await fixture.server.payments
         XCTAssertEqual(payments, [nil])
@@ -598,7 +630,7 @@ final class PaidRequestTests: XCTestCase {
     }
 
     func test_aSavedPaymentThatFailsIsRetriedAsItIs() async throws {
-        let fixture = try fixture([.dropped, .status(201)])
+        let fixture = try fixture([.unreachable, .status(201)])
         await start(fixture)
 
         let response = try await sendPaid(fixture, payment: try vectorPayment())
@@ -608,6 +640,243 @@ final class PaidRequestTests: XCTestCase {
         XCTAssertEqual(payments, [TS.header, TS.header])
         let actions = await fixture.payer.createActions
         XCTAssertTrue(actions.isEmpty)
+    }
+
+    func test_aPaidSendThatMayHaveRunIsNotResent() async throws {
+        let fixture = try fixture([.paymentRequired(), .dropped, .status(201)])
+        await start(fixture)
+
+        do {
+            _ = try await sendPaid(fixture)
+            XCTFail("the paid request succeeded")
+        } catch let error as BRC105Error {
+            guard case .outcomeUnknown(let url, let attempts, let payment, let lastError) = error else {
+                return XCTFail("\(error)")
+            }
+            XCTAssertEqual(url, "https://Wallet.Example:443/jobs?x=1")
+            XCTAssertEqual(attempts, 1)
+            XCTAssertEqual(payment, try vectorPayment())
+            XCTAssertFalse(lastError.isEmpty)
+            XCTAssertNotNil(error.errorDescription)
+        }
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil, TS.header], "the paid request is sent once")
+        let actions = await fixture.payer.createActions
+        XCTAssertEqual(actions.count, 1)
+    }
+
+    /// The server ran the paid request and signed its reply for a session this side lost: the
+    /// session does not resend it, and neither does sendPaid.
+    func test_aSignedReplyForALostSessionIsNotResent() async throws {
+        let fixture = try fixture([.status(201), .status(201)])
+        await start(fixture)
+        await fixture.peer.setUnknownSessionNonceRemaining(1)
+
+        do {
+            _ = try await sendPaid(fixture, payment: try vectorPayment())
+            XCTFail("the paid request succeeded")
+        } catch BRC105Error.outcomeUnknown(_, let attempts, let payment, _) {
+            XCTAssertEqual(attempts, 1)
+            XCTAssertEqual(payment, try vectorPayment())
+        }
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [TS.header])
+    }
+
+    /// An unsigned 5xx may come from a proxy after the server ran the request.
+    func test_anUnsignedServerErrorToAPaidSendIsNotResent() async throws {
+        let fixture = try fixture([])
+        await start(fixture)
+        await fixture.peer.setUnsignedReplies(true, status: 503)
+
+        do {
+            _ = try await sendPaid(fixture, payment: try vectorPayment())
+            XCTFail("the paid request succeeded")
+        } catch BRC105Error.outcomeUnknown(_, let attempts, _, _) {
+            XCTAssertEqual(attempts, 1)
+        }
+        let general = await fixture.peer.pathsSeen.filter { $0 == "/jobs" }
+        XCTAssertEqual(general.count, 1)
+    }
+
+    /// An unsigned 401 is the server's auth refusing the request before it ran, so the paid send
+    /// is resent once the session's own recovery is spent.
+    func test_aPaidSendTheServerRefusedBeforeRunningItIsResent() async throws {
+        let fixture = try fixture([.status(201)])
+        await start(fixture)
+        await fixture.peer.setUnauthorizedRemaining(AuthenticatedSession.sessionRecoveryRetries + 1)
+
+        let response = try await sendPaid(fixture, payment: try vectorPayment())
+
+        XCTAssertEqual(response.statusCode, 201)
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [TS.header])
+        let general = await fixture.peer.pathsSeen.filter { $0 == "/jobs" }
+        XCTAssertEqual(general.count, AuthenticatedSession.sessionRecoveryRetries + 2)
+    }
+
+    func test_onlyAFailureBeforeAnyByteIsSentCountsAsNeverLeft() {
+        XCTAssertTrue(AuthenticatedSession.neverLeft(URLError(.cannotConnectToHost)))
+        XCTAssertTrue(AuthenticatedSession.neverLeft(URLError(.cannotFindHost)))
+        XCTAssertTrue(AuthenticatedSession.neverLeft(URLError(.notConnectedToInternet)))
+        XCTAssertTrue(AuthenticatedSession.neverLeft(URLError(.secureConnectionFailed)))
+        XCTAssertFalse(AuthenticatedSession.neverLeft(URLError(.networkConnectionLost)))
+        XCTAssertFalse(AuthenticatedSession.neverLeft(URLError(.timedOut)))
+        XCTAssertFalse(AuthenticatedSession.neverLeft(AuthTransportError.transportFailed("x")))
+    }
+
+    // MARK: - Who pays whom
+
+    func test_aPayerOtherThanTheSessionIdentityPaysNothing() async throws {
+        let other = try PrivateKey(Array(repeating: 0x33, count: 32))
+        let fixture = try fixture([.paymentRequired(), .status(201)], payerKey: other)
+        await start(fixture)
+
+        do {
+            _ = try await sendPaid(fixture)
+            XCTFail("the paid request was sent")
+        } catch let error as BRC105Error {
+            guard case .payerMismatch(let payer, let session) = error else { return XCTFail("\(error)") }
+            XCTAssertEqual(payer, Hex.encode(other.publicKey.compressedBytes))
+            XCTAssertEqual(session, Hex.encode(try keys().client.publicKey.compressedBytes))
+            XCTAssertNotNil(error.errorDescription)
+        }
+        let actions = await fixture.payer.createActions
+        XCTAssertTrue(actions.isEmpty, "no payment is built")
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil])
+        let logged = await fixture.log.entries
+        XCTAssertTrue(logged.isEmpty)
+    }
+
+    /// A mismatched payer is not retried as an attempt's failure when a changed 402 asks for a
+    /// new payment.
+    func test_aMismatchedPayerEndsTheCallWhenTheServerAsksAgain() async throws {
+        let other = try PrivateKey(Array(repeating: 0x33, count: 32))
+        let fixture = try fixture([.paymentRequired(prefix: TS.nonces[0].nonce), .status(201)], payerKey: other)
+        await start(fixture)
+
+        do {
+            _ = try await sendPaid(fixture, payment: try vectorPayment())
+            XCTFail("the paid request succeeded")
+        } catch BRC105Error.payerMismatch {}
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [TS.header])
+        let actions = await fixture.payer.createActions
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func test_aResumedPaymentForAnotherPeerIsNotSent() async throws {
+        let fixture = try fixture([.status(201)])
+        await start(fixture)
+        let elsewhere = Hex.encode(try PrivateKey(Array(repeating: 0x33, count: 32)).publicKey.compressedBytes)
+        let payment = try BRC105Payment(
+            derivationPrefix: TS.prefix, derivationSuffix: TS.suffix, serverIdentityKey: elsewhere,
+            satoshisRequired: 1000, transaction: try Hex.decode(TS.atomicHex, maximumDecodedByteCount: 1_000)
+        )
+
+        do {
+            _ = try await sendPaid(fixture, payment: payment)
+            XCTFail("the payment was sent")
+        } catch let error as BRC105Error {
+            XCTAssertEqual(error, .paymentPeerMismatch(payee: elsewhere, peer: TS.serverKey))
+            XCTAssertNotNil(error.errorDescription)
+        }
+        let requests = await fixture.server.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    // MARK: - A funded payment is never dropped
+
+    func test_anUnsignedPaymentIsAbortedAndReported() async throws {
+        let fixture = try fixture([.paymentRequired(), .status(201)])
+        await start(fixture)
+        await fixture.payer.setResult(.unsigned)
+
+        do {
+            _ = try await sendPaid(fixture)
+            XCTFail("the paid request was sent")
+        } catch BRC105Error.paymentUnusable(let txid, let aborted, _) {
+            XCTAssertEqual(txid, TS.txid)
+            XCTAssertTrue(aborted)
+        }
+        let aborts = await fixture.payer.aborted
+        XCTAssertEqual(aborts.map(\.reference), [try WalletBase64Data(FakePayer.reference)])
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil])
+    }
+
+    func test_anAbortTheWalletRefusesIsReported() async throws {
+        let fixture = try fixture([.paymentRequired(), .status(201)])
+        await start(fixture)
+        await fixture.payer.setResult(.unsigned)
+        await fixture.payer.setAbortAnswer(false)
+
+        do {
+            _ = try await sendPaid(fixture)
+            XCTFail("the paid request was sent")
+        } catch let error as BRC105Error {
+            XCTAssertEqual(error, .paymentUnusable(transactionID: TS.txid, aborted: false,
+                reason: "the wallet returned it unsigned"))
+            XCTAssertTrue(error.message.contains(TS.txid), error.message)
+        }
+    }
+
+    func test_aPaymentWithNoTransactionIsReportedWithItsTransactionID() async throws {
+        let fixture = try fixture([.paymentRequired(), .status(201)])
+        await start(fixture)
+        await fixture.payer.setResult(.transactionIDOnly)
+
+        do {
+            _ = try await sendPaid(fixture)
+            XCTFail("the paid request was sent")
+        } catch BRC105Error.paymentUnusable(let txid, let aborted, _) {
+            XCTAssertEqual(txid, TS.txid)
+            XCTAssertFalse(aborted)
+        }
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil])
+    }
+
+    /// A new payment the wallet funds but can't hand back ends the call: it is not swallowed as a
+    /// failed attempt and the old payment resent.
+    func test_anUnusableNewPaymentIsNotSwallowed() async throws {
+        let otherPrefix = TS.nonces[0].nonce
+        let fixture = try fixture([.paymentRequired(), .paymentRequired(prefix: otherPrefix), .status(201)])
+        await start(fixture)
+        let payer = fixture.payer
+
+        do {
+            _ = try await sendPaid(fixture, onPayment: { _ in await payer.setResult(.transactionIDOnly) })
+            XCTFail("the paid request succeeded")
+        } catch BRC105Error.paymentUnusable(let txid, _, _) {
+            XCTAssertEqual(txid, TS.txid)
+        }
+        let actions = await fixture.payer.createActions
+        XCTAssertEqual(actions.count, 2)
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil, TS.header], "the old payment is not resent")
+    }
+
+    func test_aNewPaymentThatCannotBeSavedIsThrownWithThePayment() async throws {
+        struct SaveFailed: Error {}
+        let otherPrefix = TS.nonces[0].nonce
+        let fixture = try fixture([.paymentRequired(), .paymentRequired(prefix: otherPrefix), .status(201)])
+        await start(fixture)
+        let log = fixture.log
+
+        do {
+            _ = try await sendPaid(fixture, onPayment: { payment in
+                await log.record(payment, requestsSent: 0)
+                if await log.entries.count == 2 { throw SaveFailed() }
+            })
+            XCTFail("the paid request succeeded")
+        } catch BRC105Error.paymentNotSaved(let payment, _) {
+            XCTAssertEqual(payment.derivationPrefix, otherPrefix)
+            XCTAssertEqual(payment.transactionID, TS.txid)
+        }
+        let payments = await fixture.server.payments
+        XCTAssertEqual(payments, [nil, TS.header], "the unsaved payment is not sent")
     }
 
     // MARK: - The payment value

@@ -116,7 +116,7 @@ public enum BRC105Error: Error, Equatable, Sendable {
     case invalidSatoshisRequired(String)
     case missingServerIdentityKey
     case missingDerivationPrefix
-    /// The wallet's payment was not an Atomic BEEF, or it returned none.
+    /// The payment's bytes are not an Atomic BEEF envelope.
     case invalidTransaction
     /// Every paid send failed. The payment was sent to the network when it was built, so the
     /// coins are with the server's key: keep the payment and resend it.
@@ -124,6 +124,26 @@ public enum BRC105Error: Error, Equatable, Sendable {
         url: String, attempts: Int, maxAttempts: Int, satoshis: UInt64,
         serverIdentityKey: String, transactionID: String, lastError: String
     )
+    /// `payer` pays from the identity `payer`, but the session authenticates as `session`. The
+    /// server derives the payment's output from the session's identity, so it could never accept
+    /// the payment: nothing was paid.
+    case payerMismatch(payer: String, session: String)
+    /// A payment passed back to resume pays `payee`, but the session's peer is `peer`. Nothing was
+    /// sent.
+    case paymentPeerMismatch(payee: String, peer: String)
+    /// The wallet funded the payment, but returned nothing that can be sent: no transaction, an
+    /// unsigned one, or one that is not Atomic BEEF. The paid request was not sent. `aborted` is
+    /// true when the wallet released the action; otherwise `transactionID` (nil when the wallet
+    /// named none) is the action to look for in the wallet.
+    case paymentUnusable(transactionID: String?, aborted: Bool, reason: String)
+    /// `onPayment` failed for this payment, so the paid request was not sent. The payment was
+    /// built: save it and resume with it rather than paying again.
+    case paymentNotSaved(payment: BRC105Payment, reason: String)
+    /// A paid send failed after the request may have reached the server's application: the reply
+    /// was lost or could not be read, or the server signed it for a session this side no longer
+    /// holds. It is not sent again, since a paid request need not be idempotent. Check whether it
+    /// took effect before resuming with `payment`.
+    case outcomeUnknown(url: String, attempts: Int, payment: BRC105Payment, lastError: String)
 
     /// The message `AuthFetch.handlePaymentAndRetry` throws for the same case.
     public var message: String {
@@ -144,6 +164,28 @@ public enum BRC105Error: Error, Equatable, Sendable {
         case .paymentFailed(let url, let attempts, let maxAttempts, let satoshis, let payee, _, _):
             "Paid request to \(url) failed after \(attempts)/\(maxAttempts) attempts. "
                 + "Sent \(satoshis) satoshis to \(payee)."
+        case .payerMismatch(let payer, let session):
+            "The payer's identity key \(payer) is not the session's identity key \(session)."
+        case .paymentPeerMismatch(let payee, let peer):
+            "The payment pays \(payee), but the session's peer is \(peer)."
+        case .paymentUnusable(let txid, let aborted, let reason):
+            "The wallet's payment \(txid ?? "(no transaction ID)") can't be sent: \(reason). "
+                + (aborted ? "The wallet released it." : "The wallet did not release it.")
+        case .paymentNotSaved(let payment, let reason):
+            "Payment \(payment.transactionID) of \(payment.satoshisRequired) satoshis to "
+                + "\(payment.serverIdentityKey) was not saved: \(reason)"
+        case .outcomeUnknown(let url, let attempts, let payment, _):
+            "Paid request to \(url) may have run on attempt \(attempts); not resent. "
+                + "Sent \(payment.satoshisRequired) satoshis to \(payment.serverIdentityKey)."
+        }
+    }
+
+    /// True for a failure that must end the call even within a paid attempt: the request may
+    /// have run, the payer can never pay, or the wallet funded a payment that can't be sent.
+    var endsPaidRequest: Bool {
+        switch self {
+        case .outcomeUnknown, .payerMismatch, .paymentUnusable: true
+        default: false
         }
     }
 }
@@ -159,6 +201,19 @@ extension BRC105Error: LocalizedError {
         case .paymentFailed(_, _, _, let satoshis, _, _, _):
             "The payment of \(satoshis) satoshis was sent, but the server didn't accept the "
                 + "request. Try again to resend the same payment."
+        case .payerMismatch:
+            "The paying wallet isn't the one signed in to this server."
+        case .paymentPeerMismatch:
+            "That payment is for a different server."
+        case .paymentUnusable(_, let aborted, _):
+            aborted ? "The wallet couldn't build the payment. Nothing was spent."
+                : "The wallet couldn't build the payment. Check the wallet's pending actions."
+        case .paymentNotSaved(let payment, _):
+            "The payment of \(payment.satoshisRequired) satoshis was made but couldn't be saved, "
+                + "so the request wasn't sent."
+        case .outcomeUnknown(_, _, let payment, _):
+            "The paid request may have gone through (\(payment.satoshisRequired) satoshis sent). "
+                + "Check before trying again."
         }
     }
 }
@@ -171,6 +226,13 @@ extension BRC105Error: CustomDebugStringConvertible {
         case .paymentFailed(_, _, _, _, _, let txid, let lastError):
             "BRC105Error.paymentFailed: \(ErrorDetail.withoutQueries(message)) payment \(txid); "
                 + "last error: \(lastError)"
+        case .outcomeUnknown(_, _, let payment, let lastError):
+            "BRC105Error.outcomeUnknown: \(ErrorDetail.withoutQueries(message)) payment "
+                + "\(payment.transactionID); last error: \(lastError)"
+        case .paymentUnusable:
+            "BRC105Error.paymentUnusable: \(message)"
+        case .paymentNotSaved:
+            "BRC105Error.paymentNotSaved: \(message)"
         default:
             "BRC105Error: \(message)"
         }
@@ -255,18 +317,33 @@ extension AuthenticatedSession {
     /// the satoshis it asks for to the peer that signed it, under the server's derivation prefix
     /// and a fresh suffix, in one P2PKH output; `onPayment` gets the payment; then the request is
     /// sent again with an `x-bsv-payment` header. An unsigned 402 is refused like any unsigned
-    /// error status and is never paid.
+    /// error status and is never paid. `payer` must hold the identity this session signs with,
+    /// since the server derives the payment's output from it; otherwise
+    /// ``BRC105Error/payerMismatch(payer:session:)`` is thrown before anything is paid.
     ///
-    /// A paid send that throws is retried with the same payment after 250 ms, 500 ms and so on.
+    /// A paid send that fails before the request could reach the server's application (no
+    /// connection, a refused handshake, an expired session the server refused before running the
+    /// request, a gate's unsigned 4xx) is retried with the same payment after 250 ms, 500 ms and
+    /// so on. Unlike AuthFetch, which retries every failure, a paid send that may have reached the
+    /// application (a lost or unreadable reply, a signed reply for a session this side no longer
+    /// holds) is not sent again, since a paid request such as a claim need not be idempotent:
+    /// ``BRC105Error/outcomeUnknown(url:attempts:payment:lastError:)`` carries the payment, to
+    /// resume with once the caller knows the first send did not take effect.
+    ///
     /// A paid send answered with another 402 is sent again at once: with the same payment while
     /// the 402 asks for the same amount, payee and prefix, and with a new payment (passed to
     /// `onPayment`) when it changes any of them. At most `paymentRetryAttempts` paid sends are
     /// made in all (3 when it is not positive); after that ``BRC105Error/paymentFailed`` is thrown.
     ///
-    /// `onPayment` runs after the payment is built and before it is first sent. The payment is
+    /// `onPayment` runs after each payment is built and before it is first sent. The payment is
     /// already on the network then, so persist it there: if the reply is lost, pass it back as
     /// `payment` and the request is sent with it straight away, with no unpaid request first and
-    /// no second payment. An error from `onPayment` stops the call before the paid send.
+    /// no second payment. A resumed payment must pay this session's peer, or
+    /// ``BRC105Error/paymentPeerMismatch(payee:peer:)`` is thrown before it is sent. An error from
+    /// `onPayment` stops the call before the paid send, as
+    /// ``BRC105Error/paymentNotSaved(payment:reason:)`` carrying the payment. A payment the wallet
+    /// funds but that can't be sent is aborted where the wallet allows and thrown as
+    /// ``BRC105Error/paymentUnusable(transactionID:aborted:reason:)``, never dropped.
     public func sendPaid(
         method: String, path: String, query: String? = nil,
         headers: [String: String] = [:], body: [UInt8]? = nil,
@@ -297,6 +374,16 @@ extension AuthenticatedSession {
 
         var payment: BRC105Payment
         if let resumed {
+            let peer = try await peerIdentityKey()
+            let payee = try? PublicKey(Hex.decode(resumed.serverIdentityKey, maximumDecodedByteCount: 65))
+            guard payee == peer else {
+                let error = BRC105Error.paymentPeerMismatch(
+                    payee: resumed.serverIdentityKey, peer: Hex.encode(peer.compressedBytes)
+                )
+                ToolboxLog.error("ToolboxAuth", "\(call): resumed payment \(resumed.transactionID) "
+                    + "not sent: \(ErrorDetail.describe(error))")
+                throw error
+            }
             payment = resumed
         } else {
             let response = try await send(
@@ -312,7 +399,7 @@ extension AuthenticatedSession {
                 throw error
             }
             payment = try await pay(requirement, payer: payer, makeSuffix: makeSuffix)
-            try await onPayment?(payment)
+            try await save(payment, call: call, onPayment: onPayment)
         }
 
         var attempts = 0
@@ -324,10 +411,21 @@ extension AuthenticatedSession {
             attempts += 1
             var regenerated: BRC105Payment?
             do {
-                let response = try await send(
-                    method: method, path: path, query: query,
-                    headers: Self.headers(headers, paying: payment), body: body
-                )
+                let response: AuthenticatedResponse
+                do {
+                    response = try await sendTrackingDelivery(
+                        method: method, path: path, query: query,
+                        headers: Self.headers(headers, paying: payment), body: body
+                    )
+                } catch let sent as RequestMayHaveRun {
+                    let error = BRC105Error.outcomeUnknown(url: url, attempts: attempts,
+                        payment: payment, lastError: ErrorDetail.describe(sent.underlying))
+                    ToolboxLog.error("ToolboxAuth", "\(call): \(ErrorDetail.describe(error)); "
+                        + "derivation prefix \(payment.derivationPrefix), suffix \(payment.derivationSuffix)")
+                    throw error
+                }
+                // A signed 402 is the server's payment check refusing the request before running
+                // it, so sending it again is safe.
                 guard response.statusCode == 402 else { return response }
                 // AuthFetch reads a 402 to a paid send in a nested call, so a fault in it (or in
                 // building a new payment) is this attempt's failure, retried with this payment.
@@ -342,6 +440,8 @@ extension AuthenticatedSession {
                 }
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let error as BRC105Error where error.endsPaidRequest {
+                throw error
             } catch {
                 ToolboxLog.error("ToolboxAuth", "\(call): paid attempt \(attempts)/\(maxAttempts) "
                     + "with payment \(payment.transactionID) failed: \(ErrorDetail.describe(error))")
@@ -354,8 +454,24 @@ extension AuthenticatedSession {
             }
             if let regenerated {
                 payment = regenerated
-                try await onPayment?(regenerated)
+                try await save(regenerated, call: call, onPayment: onPayment)
             }
+        }
+    }
+
+    /// Hands a new payment to `onPayment`. Its failure is thrown with the payment, which is on the
+    /// network by now and would otherwise be lost to the caller.
+    private func save(
+        _ payment: BRC105Payment, call: String,
+        onPayment: (@Sendable (BRC105Payment) async throws -> Void)?
+    ) async throws {
+        do {
+            try await onPayment?(payment)
+        } catch {
+            let error = BRC105Error.paymentNotSaved(payment: payment, reason: ErrorDetail.describe(error))
+            ToolboxLog.error("ToolboxAuth", "\(call): \(ErrorDetail.describe(error)); derivation "
+                + "prefix \(payment.derivationPrefix), suffix \(payment.derivationSuffix)")
+            throw error
         }
     }
 
@@ -377,6 +493,7 @@ extension AuthenticatedSession {
         _ requirement: BRC105Requirement, payer: any PayingWallet,
         makeSuffix: @Sendable (any PayingWallet) async throws -> String
     ) async throws -> BRC105Payment {
+        try await requirePayer(payer)
         let suffix = try await makeSuffix(payer)
         let payee = try PublicKey(Hex.decode(requirement.serverIdentityKey, maximumDecodedByteCount: 65))
         let derived = try await payer.getPublicKey(WalletGetPublicKeyRequest(selection: .derived(
@@ -400,16 +517,69 @@ extension AuthenticatedSession {
             outputs: [output],
             options: WalletCreateActionOptions(randomizeOutputs: false)
         ))
-        guard let transaction = result.transaction else {
-            ToolboxLog.error("ToolboxAuth", "the wallet funded the payment for \(origin) but "
-                + "returned no transaction")
-            throw BRC105Error.invalidTransaction
+        // From here the wallet holds a funded action, so no failure may drop it: each is thrown
+        // naming it, and an unsigned one is released.
+        if let signable = result.signableTransaction {
+            // Asked for a signed, processed action, the wallet left it unsigned, so nothing of it
+            // was sent and its inputs can be released.
+            let txid = signable.transaction.subjectTransactionID.displayHex
+            let aborted = await abort(signable.reference, payer: payer, transactionID: txid)
+            throw unusable(txid, aborted: aborted, "the wallet returned it unsigned")
         }
-        return try BRC105Payment(
-            derivationPrefix: requirement.derivationPrefix, derivationSuffix: suffix,
-            serverIdentityKey: requirement.serverIdentityKey, satoshisRequired: requirement.satoshis,
-            transaction: try transaction.serialized(limits: StorageLimits.beef)
-        )
+        guard let transaction = result.transaction else {
+            throw unusable(result.transactionID?.displayHex, aborted: false, "the wallet returned no transaction")
+        }
+        let txid = transaction.subjectTransactionID.displayHex
+        do {
+            return try BRC105Payment(
+                derivationPrefix: requirement.derivationPrefix, derivationSuffix: suffix,
+                serverIdentityKey: requirement.serverIdentityKey, satoshisRequired: requirement.satoshis,
+                transaction: try transaction.serialized(limits: StorageLimits.beef)
+            )
+        } catch {
+            throw unusable(txid, aborted: false,
+                "it could not be written as Atomic BEEF (\(ErrorDetail.describe(error)))")
+        }
+    }
+
+    /// Refuses a payer whose identity is not the one this session authenticates with: the server
+    /// derives the payment's output from the session's identity and would refuse the payment.
+    private func requirePayer(_ payer: any PayingWallet) async throws {
+        let request = WalletGetPublicKeyRequest(selection: .identity)
+        let payerKey = try await payer.getPublicKey(request).publicKey
+        let sessionKey = try await wallet.getPublicKey(request).publicKey
+        guard payerKey == sessionKey else {
+            let error = BRC105Error.payerMismatch(
+                payer: Hex.encode(payerKey.compressedBytes), session: Hex.encode(sessionKey.compressedBytes)
+            )
+            ToolboxLog.error("ToolboxAuth", "paying \(origin): \(ErrorDetail.describe(error))")
+            throw error
+        }
+    }
+
+    /// Releases an unsigned payment action. Best effort: false, logged, when the wallet keeps it.
+    private func abort(
+        _ reference: WalletBase64Data, payer: any PayingWallet, transactionID: String
+    ) async -> Bool {
+        do {
+            let aborted = try await payer.abortAction(WalletAbortActionRequest(reference: reference)).aborted
+            if !aborted {
+                ToolboxLog.error("ToolboxAuth", "the wallet did not release payment action "
+                    + "\(transactionID) for \(origin)")
+            }
+            return aborted
+        } catch {
+            ToolboxLog.error("ToolboxAuth", "abortAction did not release payment action "
+                + "\(transactionID) for \(origin): \(ErrorDetail.describe(error))")
+            return false
+        }
+    }
+
+    private func unusable(_ transactionID: String?, aborted: Bool, _ reason: String) -> BRC105Error {
+        let error = BRC105Error.paymentUnusable(transactionID: transactionID, aborted: aborted, reason: reason)
+        ToolboxLog.error("ToolboxAuth", "the wallet funded the payment for \(origin): "
+            + ErrorDetail.describe(error))
+        return error
     }
 
     /// `new URL(url).origin`: scheme, host and a port other than the scheme's default.
